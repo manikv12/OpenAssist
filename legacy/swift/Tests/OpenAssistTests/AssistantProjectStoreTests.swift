@@ -134,8 +134,8 @@ final class AssistantProjectStoreTests: XCTestCase {
         let directory = try makeTemporaryDirectory(named: "assistant-project-folder-roundtrip")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
 
-        let folder = try store.createFolder(name: "Amwins")
-        let childProject = try store.createProject(name: "NLS", parentID: folder.id)
+        let folder = try store.createFolder(name: "Example Group")
+        let childProject = try store.createProject(name: "Project Alpha", parentID: folder.id)
         let rootProject = try store.createProject(name: "OpenAssist")
 
         let reloadedStore = AssistantProjectStore(baseDirectoryURL: directory)
@@ -159,15 +159,15 @@ final class AssistantProjectStoreTests: XCTestCase {
         let directory = try makeTemporaryDirectory(named: "assistant-project-sibling-names")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
 
-        let folderA = try store.createFolder(name: "Amwins")
+        let folderA = try store.createFolder(name: "Example Group")
         let folderB = try store.createFolder(name: "Rapid")
-        _ = try store.createProject(name: "NLS", parentID: folderA.id)
-        _ = try store.createProject(name: "NLS", parentID: folderB.id)
+        _ = try store.createProject(name: "Project Alpha", parentID: folderA.id)
+        _ = try store.createProject(name: "Project Alpha", parentID: folderB.id)
 
-        XCTAssertThrowsError(try store.createProject(name: "NLS", parentID: folderA.id)) { error in
+        XCTAssertThrowsError(try store.createProject(name: "Project Alpha", parentID: folderA.id)) { error in
             XCTAssertTrue(error.localizedDescription.contains("already exists"))
         }
-        XCTAssertThrowsError(try store.createFolder(name: "amwins")) { error in
+        XCTAssertThrowsError(try store.createFolder(name: "example group")) { error in
             XCTAssertTrue(error.localizedDescription.contains("already exists"))
         }
     }
@@ -175,7 +175,7 @@ final class AssistantProjectStoreTests: XCTestCase {
     func testAssignThreadRejectsFolders() throws {
         let directory = try makeTemporaryDirectory(named: "assistant-project-folder-assignment")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
-        let folder = try store.createFolder(name: "Amwins")
+        let folder = try store.createFolder(name: "Example Group")
 
         XCTAssertThrowsError(try store.assignThread("thread-1", toProjectID: folder.id)) { error in
             guard let storeError = error as? AssistantProjectStoreError else {
@@ -193,8 +193,8 @@ final class AssistantProjectStoreTests: XCTestCase {
         let directory = try makeTemporaryDirectory(named: "assistant-project-delete-folder")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
 
-        let folder = try store.createFolder(name: "Amwins")
-        let project = try store.createProject(name: "NLS", parentID: folder.id)
+        let folder = try store.createFolder(name: "Example Group")
+        let project = try store.createProject(name: "Project Alpha", parentID: folder.id)
         try store.assignThread("thread-1", toProjectID: project.id)
 
         let deletion = try store.deleteProjectResult(id: folder.id)
@@ -213,9 +213,9 @@ final class AssistantProjectStoreTests: XCTestCase {
         let directory = try makeTemporaryDirectory(named: "assistant-project-delete-folder-duplicate")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
 
-        let folder = try store.createFolder(name: "Amwins")
-        _ = try store.createProject(name: "NLS")
-        let childProject = try store.createProject(name: "NLS", parentID: folder.id)
+        let folder = try store.createFolder(name: "Example Group")
+        _ = try store.createProject(name: "Project Alpha")
+        let childProject = try store.createProject(name: "Project Alpha", parentID: folder.id)
 
         XCTAssertThrowsError(try store.deleteProjectResult(id: folder.id)) { error in
             XCTAssertTrue(error.localizedDescription.contains("already exists"))
@@ -229,8 +229,8 @@ final class AssistantProjectStoreTests: XCTestCase {
         let directory = try makeTemporaryDirectory(named: "assistant-project-hidden-folder")
         let store = AssistantProjectStore(baseDirectoryURL: directory)
 
-        let folder = try store.createFolder(name: "Amwins")
-        let project = try store.createProject(name: "NLS", parentID: folder.id)
+        let folder = try store.createFolder(name: "Example Group")
+        let project = try store.createProject(name: "Project Alpha", parentID: folder.id)
         try store.assignThread("thread-1", toProjectID: project.id)
 
         _ = try store.hideProject(id: folder.id)

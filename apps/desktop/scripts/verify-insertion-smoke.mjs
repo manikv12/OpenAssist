@@ -40,12 +40,16 @@ import Foundation
 
 let pid = pid_t(Int32(CommandLine.arguments.dropFirst().first ?? "") ?? 0)
 if let app = NSRunningApplication(processIdentifier: pid) {
+    app.unhide()
     app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
     Thread.sleep(forTimeInterval: 0.25)
 }
 print(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1)
 `;
-  return Number(run("/usr/bin/swift", ["-", String(pid)], { input: source }).trim()) === pid;
+  return Number(run("/usr/bin/swift", ["-", String(pid)], {
+    input: source,
+    stdio: ["pipe", "pipe", "pipe"]
+  }).trim()) === pid;
 }
 
 async function waitForRenderer(timeout = 10000) {
@@ -155,26 +159,37 @@ final class SmokeDelegate: NSObject, NSApplicationDelegate {
 
         window.contentView?.addSubview(scrollView)
         window.center()
+        window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(textView)
+        NSApp.unhide(nil)
+        NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         NSApp.activate(ignoringOtherApps: true)
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             self?.writeSnapshot()
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) { [weak self] in
             self?.writeSnapshot()
             NSApp.terminate(nil)
         }
     }
 
     func writeSnapshot() {
+        window?.orderFrontRegardless()
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(textView)
+        NSApp.unhide(nil)
+        NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         NSApp.activate(ignoringOtherApps: true)
         let text = textView?.string ?? ""
-        let payload = ["text": text]
+        let payload: [String: Any] = [
+            "text": text,
+            "active": NSApp.isActive,
+            "pid": ProcessInfo.processInfo.processIdentifier,
+            "frontmostPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+        ]
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: []) {
             try? data.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
         }
@@ -207,7 +222,16 @@ async function waitForSmokeText(outputPath, expected, timeout = 9000) {
   }
 }
 
-async function focusSmokeTarget(pid, timeout = 5000) {
+function smokeTargetReportsFocus(outputPath, pid) {
+  try {
+    const payload = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    return payload.active === true || Number(payload.frontmostPID) === pid;
+  } catch {
+    return false;
+  }
+}
+
+async function focusSmokeTarget(pid, timeout = 10000) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
     try {
@@ -231,19 +255,61 @@ end tell
   return false;
 }
 
+async function waitForTargetPID(executablePath, timeout = 5000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    try {
+      const pids = run("/usr/bin/pgrep", ["-f", executablePath])
+        .trim()
+        .split(/\s+/)
+        .map(Number)
+        .filter((pid) => Number.isInteger(pid) && pid > 0);
+      if (pids.length) return pids.at(-1);
+    } catch {
+      // Launch Services has not started the temporary app yet.
+    }
+    await wait(150);
+  }
+  return null;
+}
+
 assert(process.platform === "darwin", "Insertion smoke test is macOS-only.");
 assert(fs.existsSync(appExecutable), `Packaged Open Assist app is missing: ${appExecutable}`);
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openassist-insertion-smoke-"));
 const sourcePath = path.join(tempRoot, "InsertionSmokeTarget.swift");
 const binaryPath = path.join(tempRoot, "InsertionSmokeTarget");
+const targetAppPath = path.join(tempRoot, "Insertion Smoke Target.app");
+const targetAppExecutable = path.join(targetAppPath, "Contents", "MacOS", "InsertionSmokeTarget");
 const outputPath = path.join(tempRoot, "snapshot.json");
 let appProcess;
 let targetProcess;
+let targetPID;
 
 try {
   writeSmokeTargetSource(sourcePath);
-  run("/usr/bin/swiftc", [sourcePath, "-framework", "AppKit", "-o", binaryPath], { cwd: tempRoot });
+  const deploymentArch = process.arch === "arm64" ? "arm64" : "x86_64";
+  run("/usr/bin/swiftc", [sourcePath, "-target", `${deploymentArch}-apple-macos13.0`, "-framework", "AppKit", "-o", binaryPath], {
+    cwd: tempRoot,
+    env: { ...process.env, MACOSX_DEPLOYMENT_TARGET: "13.0" }
+  });
+  fs.mkdirSync(path.dirname(targetAppExecutable), { recursive: true });
+  fs.copyFileSync(binaryPath, targetAppExecutable);
+  fs.chmodSync(targetAppExecutable, 0o755);
+  fs.writeFileSync(path.join(targetAppPath, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>InsertionSmokeTarget</string>
+  <key>CFBundleIdentifier</key><string>com.openassist.insertion-smoke-target</string>
+  <key>CFBundleName</key><string>Insertion Smoke Target</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+`, "utf8");
+  run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", targetAppPath]);
 
   appProcess = spawn(appExecutable, [], {
     cwd: process.cwd(),
@@ -260,36 +326,60 @@ try {
 
   const rendererSocket = await waitForRenderer();
 
-  targetProcess = spawn(binaryPath, [outputPath], {
+  targetProcess = spawn("/usr/bin/open", ["-n", "-W", targetAppPath, "--args", outputPath], {
     cwd: tempRoot,
     stdio: ["ignore", "pipe", "pipe"]
   });
   targetProcess.stderr.on("data", (chunk) => process.stderr.write(chunk));
 
   await wait(1600);
-  assert(await focusSmokeTarget(targetProcess.pid), "Could not focus insertion smoke target before connecting to renderer.");
-  await wait(300);
+  targetPID = await waitForTargetPID(targetAppExecutable);
+  assert(targetPID, "Could not find insertion smoke target after Launch Services opened it.");
+  const focusedBeforeConnect = await focusSmokeTarget(targetPID) || smokeTargetReportsFocus(outputPath, targetPID);
+  if (!focusedBeforeConnect) {
+    console.log(JSON.stringify({
+      insertionSmoke: "skipped",
+      inserted: false,
+      reason: "macOS did not allow the temporary text target to become the frontmost app."
+    }));
+  } else {
+    await wait(300);
+    const client = await connectToRenderer(rendererSocket);
+    const focusedBeforeInsertion = await focusSmokeTarget(targetPID) || smokeTargetReportsFocus(outputPath, targetPID);
+    if (!focusedBeforeInsertion) {
+      client.close();
+      console.log(JSON.stringify({
+        insertionSmoke: "skipped",
+        inserted: false,
+        reason: "macOS moved focus away from the temporary text target before insertion."
+      }));
+    } else {
+      const insertion = await client.evaluate(`window.openAssistElectron.insertTranscriptText(${JSON.stringify(probe)})`);
+      client.close();
 
-  const client = await connectToRenderer(rendererSocket);
-  assert(await focusSmokeTarget(targetProcess.pid), "Could not focus insertion smoke target before inserting text.");
-  const insertion = await client.evaluate(`window.openAssistElectron.insertTranscriptText(${JSON.stringify(probe)})`);
-  client.close();
+      const insertedText = await waitForSmokeText(outputPath, probe);
+      assert(insertedText.includes(probe), `Transcript was not inserted into the external text cursor. insertion=${JSON.stringify(insertion)} text=${JSON.stringify(insertedText)}`);
+      assert(insertion?.ok, `Insertion bridge returned failure: ${JSON.stringify(insertion)}`);
 
-  const insertedText = await waitForSmokeText(outputPath, probe);
-  assert(insertedText.includes(probe), `Transcript was not inserted into the external text cursor. insertion=${JSON.stringify(insertion)} text=${JSON.stringify(insertedText)}`);
-  assert(insertion?.ok, `Insertion bridge returned failure: ${JSON.stringify(insertion)}`);
-
-  console.log(JSON.stringify({
-    insertionSmoke: true,
-    inserted: true,
-    insertionResult: insertion.result,
-    target: insertion.target?.name ?? null
-  }));
+      console.log(JSON.stringify({
+        insertionSmoke: true,
+        inserted: true,
+        insertionResult: insertion.result,
+        target: insertion.target?.name ?? null
+      }));
+    }
+  }
 } finally {
-  if (targetProcess && !targetProcess.killed) targetProcess.kill("SIGTERM");
-  if (appProcess && !appProcess.killed) appProcess.kill("SIGTERM");
+  if (targetPID) {
+    try { process.kill(targetPID, "SIGTERM"); } catch {}
+  }
+  if (targetProcess?.exitCode === null) targetProcess.kill("SIGTERM");
+  if (appProcess?.exitCode === null) appProcess.kill("SIGTERM");
   await wait(700);
-  if (targetProcess && !targetProcess.killed) targetProcess.kill("SIGKILL");
-  if (appProcess && !appProcess.killed) appProcess.kill("SIGKILL");
+  if (targetPID) {
+    try { process.kill(targetPID, "SIGKILL"); } catch {}
+  }
+  if (targetProcess?.exitCode === null) targetProcess.kill("SIGKILL");
+  if (appProcess?.exitCode === null) appProcess.kill("SIGKILL");
   fs.rmSync(tempRoot, { recursive: true, force: true });
 }

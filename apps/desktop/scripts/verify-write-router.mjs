@@ -70,8 +70,16 @@ assertIncludes(realtime, "not as the note name", "realtime guidance separates li
 assertIncludes(phoneTools, "not as the note name", "phone guidance separates linked note title from list scope");
 assertIncludes(bridge, "OpenAssist notes are not append-only", "MCP guidance advertises note replacement previews");
 assertIncludes(bridge, "Do not answer that the MCP cannot reorganize a note", "MCP organize tool prevents append-only refusal");
-assertIncludes(realtime, "OpenAssist notes are not append-only", "realtime guidance advertises note replacement previews");
-assertIncludes(realtime, "do not say the MCP can only append", "realtime prevents append-only refusal");
+assertRegex(
+  realtime,
+  /name:\s*"knowledge_request_organize"[\s\S]{0,2600}itemID[\s\S]{0,1200}markdown/,
+  "realtime organize capability requires an existing note id and replacement markdown"
+);
+assertRegex(
+  realtime,
+  /name:\s*"knowledge_note_style_guide"[\s\S]{0,2600}name:\s*"knowledge_request_organize"/,
+  "realtime note organization exposes style discovery before replacement"
+);
 assertIncludes(phoneTools, "OpenAssist notes are not append-only", "phone guidance advertises note replacement previews");
 assertIncludes(phoneTools, "Do not say the MCP/app API cannot reorganize a note", "phone prevents append-only refusal");
 assertIncludes(types, "reference_note_create", "frontend type supports new reference note preview");

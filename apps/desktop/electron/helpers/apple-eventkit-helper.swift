@@ -1,3 +1,4 @@
+import AppKit
 import EventKit
 import Foundation
 
@@ -7,6 +8,7 @@ private enum HelperError: Error, CustomStringConvertible {
     case invalidCommand
     case missingField(String)
     case invalidDate(String)
+    case invalidRecurrence(String)
     case accessDenied(String)
     case notFound(String)
     case saveFailed(String)
@@ -19,6 +21,8 @@ private enum HelperError: Error, CustomStringConvertible {
             return "Missing required field: \(field)."
         case .invalidDate(let value):
             return "Could not parse date: \(value)."
+        case .invalidRecurrence(let value):
+            return value
         case .accessDenied(let service):
             return "Open Assist does not have access to Apple \(service). Grant access in Settings."
         case .notFound(let value):
@@ -40,6 +44,61 @@ private let isoFormatterNoFraction: ISO8601DateFormatter = {
     formatter.formatOptions = [.withInternetDateTime]
     return formatter
 }()
+
+/*
+ TCC responsibility disclaim.
+
+ When Electron spawns this helper directly, macOS attributes EventKit
+ permission checks and prompts to the parent ("responsible") process. The
+ stock development Electron binary ships without Reminders/Calendar usage
+ strings, so requests are denied instantly and no dialog ever appears; a
+ packaged app works, but its grant then belongs to the app identity and
+ resets whenever that identity changes. Re-spawning ourselves with
+ responsibility disclaimed makes the helper its own TCC subject: the dialog
+ appears (attributed to this signed helper bundle, which carries the usage
+ strings), and a single grant covers both dev and packaged runs.
+ */
+private var disclaimedChildPid: pid_t = -1
+
+private func reexecDisclaimedIfNeeded() {
+    if ProcessInfo.processInfo.environment["OPENASSIST_EVENTKIT_DISCLAIMED"] == "1" { return }
+    typealias SetDisclaimFunction = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>?, Int32) -> Int32
+    guard let disclaimSymbol = dlsym(dlopen(nil, RTLD_NOW), "responsibility_spawnattrs_setdisclaim") else { return }
+    let setDisclaim = unsafeBitCast(disclaimSymbol, to: SetDisclaimFunction.self)
+    let executablePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+
+    var attributes: posix_spawnattr_t? = nil
+    guard posix_spawnattr_init(&attributes) == 0 else { return }
+    defer { posix_spawnattr_destroy(&attributes) }
+    guard setDisclaim(&attributes, 1) == 0 else { return }
+
+    setenv("OPENASSIST_EVENTKIT_DISCLAIMED", "1", 1)
+    var argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
+    argv.append(nil)
+    var childPid: pid_t = 0
+    let spawnStatus = posix_spawn(&childPid, executablePath, nil, &attributes, argv, environ)
+    for argument in argv where argument != nil { free(argument) }
+    // If the disclaimed spawn fails for any reason, keep running un-disclaimed
+    // so commands still work (with parent-attributed TCC) instead of breaking.
+    guard spawnStatus == 0 else { return }
+
+    disclaimedChildPid = childPid
+    signal(SIGTERM) { _ in
+        if disclaimedChildPid > 0 { kill(disclaimedChildPid, SIGTERM) }
+        exit(1)
+    }
+    signal(SIGINT) { _ in
+        if disclaimedChildPid > 0 { kill(disclaimedChildPid, SIGINT) }
+        exit(1)
+    }
+
+    var status: Int32 = 0
+    while waitpid(childPid, &status, 0) == -1 && errno == EINTR {}
+    if (status & 0x7f) == 0 {
+        exit((status >> 8) & 0xff)
+    }
+    exit(1)
+}
 
 private func emit(_ payload: [String: Any]) -> Never {
     let safePayload: [String: Any]
@@ -144,8 +203,10 @@ private func statusLabel(_ status: EKAuthorizationStatus) -> String {
 
 private func hasReadableAccess(_ type: EKEntityType) -> Bool {
     let status = EKEventStore.authorizationStatus(for: type)
-    if status == .authorized || status == .fullAccess { return true }
-    return false
+    if #available(macOS 14.0, *) {
+        return status == .authorized || status == .fullAccess
+    }
+    return status == .authorized
 }
 
 private func requireAccess(_ type: EKEntityType) throws {
@@ -153,45 +214,67 @@ private func requireAccess(_ type: EKEntityType) throws {
     throw HelperError.accessDenied(type == .reminder ? "Reminders" : "Calendar")
 }
 
+private final class AccessRequestState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private var granted = false
+    private var errorMessage: String?
+
+    func complete(granted: Bool, error: Error?) {
+        lock.lock()
+        self.granted = granted
+        self.errorMessage = error?.localizedDescription
+        self.finished = true
+        lock.unlock()
+    }
+
+    func snapshot() -> (finished: Bool, granted: Bool, errorMessage: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (finished, granted, errorMessage)
+    }
+}
+
 private func requestAccess(_ type: EKEntityType) -> [String: Any] {
-    let semaphore = DispatchSemaphore(value: 0)
-    var granted = false
-    var errorMessage: String?
+    let application = NSApplication.shared
+    application.setActivationPolicy(.accessory)
+    application.activate(ignoringOtherApps: true)
+    let state = AccessRequestState()
     if type == .reminder {
         if #available(macOS 14.0, *) {
             eventStore.requestFullAccessToReminders { value, error in
-                granted = value
-                errorMessage = error?.localizedDescription
-                semaphore.signal()
+                state.complete(granted: value, error: error)
             }
         } else {
             eventStore.requestAccess(to: .reminder) { value, error in
-                granted = value
-                errorMessage = error?.localizedDescription
-                semaphore.signal()
+                state.complete(granted: value, error: error)
             }
         }
     } else {
         if #available(macOS 14.0, *) {
             eventStore.requestFullAccessToEvents { value, error in
-                granted = value
-                errorMessage = error?.localizedDescription
-                semaphore.signal()
+                state.complete(granted: value, error: error)
             }
         } else {
             eventStore.requestAccess(to: .event) { value, error in
-                granted = value
-                errorMessage = error?.localizedDescription
-                semaphore.signal()
+                state.complete(granted: value, error: error)
             }
         }
     }
-    _ = semaphore.wait(timeout: .now() + 60)
+
+    let deadline = Date().addingTimeInterval(60)
+    while !state.snapshot().finished && Date() < deadline {
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    let result = state.snapshot()
+    let timedOut = !result.finished
     var payload: [String: Any] = [
-        "granted": granted,
-        "status": statusLabel(EKEventStore.authorizationStatus(for: type))
+        "granted": result.granted,
+        "status": statusLabel(EKEventStore.authorizationStatus(for: type)),
+        "timedOut": timedOut
     ]
-    if let errorMessage { payload["error"] = errorMessage }
+    if let errorMessage = result.errorMessage { payload["error"] = errorMessage }
+    if timedOut { payload["error"] = "macOS did not finish the permission request." }
     return payload
 }
 
@@ -209,6 +292,53 @@ private func calendar(forName name: String?, type: EKEntityType) -> EKCalendar? 
         ?? (type == .reminder ? eventStore.defaultCalendarForNewReminders() : eventStore.defaultCalendarForNewEvents)
 }
 
+private func frequencyLabel(_ frequency: EKRecurrenceFrequency) -> String {
+    switch frequency {
+    case .daily: return "daily"
+    case .weekly: return "weekly"
+    case .monthly: return "monthly"
+    case .yearly: return "yearly"
+    @unknown default: return "unknown"
+    }
+}
+
+private func recurrenceFrequency(_ raw: String) throws -> EKRecurrenceFrequency {
+    switch raw.lowercased() {
+    case "daily": return .daily
+    case "weekly": return .weekly
+    case "monthly": return .monthly
+    case "yearly", "annually": return .yearly
+    default: throw HelperError.invalidRecurrence("Unsupported recurrence frequency: \(raw). Use daily, weekly, monthly, or yearly.")
+    }
+}
+
+// Builds a rule from input["recurrence"]. `fallback` (the reminder's existing first
+// rule) supplies frequency/interval/end when omitted, so an update with only
+// {recurrence: {endDate}} extends the existing series instead of failing.
+private func recurrenceRule(from input: [String: Any], fallback: EKRecurrenceRule? = nil) throws -> EKRecurrenceRule? {
+    guard let spec = input["recurrence"] as? [String: Any] else { return nil }
+    let frequencyRaw = try stringField(spec, "frequency")
+    let frequency: EKRecurrenceFrequency
+    if let frequencyRaw {
+        frequency = try recurrenceFrequency(frequencyRaw)
+    } else if let fallback {
+        frequency = fallback.frequency
+    } else {
+        throw HelperError.missingField("recurrence.frequency")
+    }
+    let interval = max(1, intField(spec, "interval", fallback: fallback.map { $0.interval } ?? 1))
+    var end: EKRecurrenceEnd?
+    if let endDate = try parseDate(stringField(spec, "endDate")) {
+        end = EKRecurrenceEnd(end: endDate)
+    } else if intField(spec, "occurrenceCount", fallback: 0) > 0 {
+        end = EKRecurrenceEnd(occurrenceCount: intField(spec, "occurrenceCount", fallback: 0))
+    } else if let fallbackEnd = fallback?.recurrenceEnd, frequencyRaw == nil {
+        // Only interval/nothing changed: keep the existing end.
+        end = fallbackEnd
+    }
+    return EKRecurrenceRule(recurrenceWith: frequency, interval: interval, end: end)
+}
+
 private func reminderPayload(_ reminder: EKReminder) -> [String: Any] {
     var payload: [String: Any] = [
         "id": reminder.calendarItemIdentifier,
@@ -222,6 +352,17 @@ private func reminderPayload(_ reminder: EKReminder) -> [String: Any] {
         payload["dueDate"] = isoString(dueDate)
     }
     if let completionDate = reminder.completionDate { payload["completionDate"] = isoString(completionDate) }
+    if let rule = reminder.recurrenceRules?.first {
+        var recurrence: [String: Any] = [
+            "frequency": frequencyLabel(rule.frequency),
+            "interval": rule.interval
+        ]
+        if let end = rule.recurrenceEnd {
+            if let endDate = end.endDate { recurrence["endDate"] = isoString(endDate) ?? "" }
+            if end.occurrenceCount > 0 { recurrence["occurrenceCount"] = end.occurrenceCount }
+        }
+        payload["recurrence"] = recurrence
+    }
     return payload
 }
 
@@ -282,6 +423,62 @@ private func addReminder(_ input: [String: Any]) throws -> [String: Any] {
     if let due = try dateComponents(stringField(input, "dueDate") ?? stringField(input, "due")) {
         reminder.dueDateComponents = due
     }
+    if let rule = try recurrenceRule(from: input) {
+        guard reminder.dueDateComponents != nil else {
+            throw HelperError.missingField("dueDate (required for a recurring reminder)")
+        }
+        reminder.addRecurrenceRule(rule)
+    }
+    do {
+        try eventStore.save(reminder, commit: true)
+        return ["reminder": reminderPayload(reminder)]
+    } catch {
+        throw HelperError.saveFailed(error.localizedDescription)
+    }
+}
+
+private func updateReminder(_ input: [String: Any]) throws -> [String: Any] {
+    try requireAccess(.reminder)
+    let id = try stringField(input, "id", required: true)!
+    guard let reminder = eventStore.calendarItem(withIdentifier: id) as? EKReminder else {
+        throw HelperError.notFound("Apple Reminder was not found.")
+    }
+
+    let title = try stringField(input, "title")
+    let notesProvided = input.keys.contains("notes") || input.keys.contains("details") || boolField(input, "clearNotes")
+    let dueDateProvided = input.keys.contains("dueDate") || input.keys.contains("due") || boolField(input, "clearDueDate")
+    let recurrenceProvided = input["recurrence"] is [String: Any]
+    let clearRecurrence = boolField(input, "clearRecurrence")
+    if title == nil && !notesProvided && !dueDateProvided && !recurrenceProvided && !clearRecurrence {
+        throw HelperError.missingField("title, notes, dueDate, or recurrence")
+    }
+
+    if let title { reminder.title = title }
+    if notesProvided {
+        reminder.notes = boolField(input, "clearNotes")
+            ? nil
+            : (try stringField(input, "notes") ?? stringField(input, "details"))
+    }
+    if dueDateProvided {
+        reminder.dueDateComponents = boolField(input, "clearDueDate")
+            ? nil
+            : try dateComponents(stringField(input, "dueDate") ?? stringField(input, "due"))
+    }
+    if clearRecurrence {
+        (reminder.recurrenceRules ?? []).forEach { reminder.removeRecurrenceRule($0) }
+    } else if recurrenceProvided {
+        // Replace semantics: EKRecurrenceRule is rebuilt (with the existing first
+        // rule as fallback for omitted fields) rather than mutated in place.
+        let existing = reminder.recurrenceRules?.first
+        if let rule = try recurrenceRule(from: input, fallback: existing) {
+            guard reminder.dueDateComponents != nil else {
+                throw HelperError.missingField("dueDate (required for a recurring reminder)")
+            }
+            (reminder.recurrenceRules ?? []).forEach { reminder.removeRecurrenceRule($0) }
+            reminder.addRecurrenceRule(rule)
+        }
+    }
+
     do {
         try eventStore.save(reminder, commit: true)
         return ["reminder": reminderPayload(reminder)]
@@ -305,6 +502,62 @@ private func completeReminder(_ input: [String: Any]) throws -> [String: Any] {
     do {
         try eventStore.save(reminder, commit: true)
         return ["reminder": reminderPayload(reminder)]
+    } catch {
+        throw HelperError.saveFailed(error.localizedDescription)
+    }
+}
+
+private func searchReminders(_ input: [String: Any]) throws -> [String: Any] {
+    try requireAccess(.reminder)
+    let query = try stringField(input, "query", required: true)!
+    let terms = query.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    let calendarFilter = try stringField(input, "calendar")
+    // Match ALL lists with the requested name: list names can repeat (two "Costco"
+    // lists), and calendar(forName:) would silently search only the first one.
+    let calendars: [EKCalendar]? = calendarFilter.flatMap { name in
+        let all = eventStore.calendars(for: .reminder)
+        let exact = all.filter { $0.title.caseInsensitiveCompare(name) == .orderedSame }
+        let matched = exact.isEmpty ? all.filter { $0.title.localizedCaseInsensitiveContains(name) } : exact
+        return matched.isEmpty ? nil : matched
+    }
+    let includeCompleted = boolField(input, "includeCompleted", fallback: true)
+    let completedOnly = boolField(input, "completedOnly")
+    let limit = max(1, min(intField(input, "limit", fallback: 25), 100))
+
+    // Title filter runs over the FULL store before any limit, so matches can never
+    // be pushed out by unrelated reminders the way the sorted list-reminders cap can.
+    let matches = fetchReminders(matching: eventStore.predicateForReminders(in: calendars))
+        .filter { reminder in
+            let title = (reminder.title ?? "").lowercased()
+            guard terms.allSatisfy({ title.contains($0) }) else { return false }
+            if completedOnly { return reminder.isCompleted }
+            if !includeCompleted { return !reminder.isCompleted }
+            return true
+        }
+    let completedCount = matches.filter { $0.isCompleted }.count
+    let sorted = matches.sorted { left, right in
+        if left.isCompleted != right.isCompleted { return !left.isCompleted }
+        let leftDate = left.completionDate ?? left.dueDateComponents.flatMap { Calendar.current.date(from: $0) } ?? Date.distantPast
+        let rightDate = right.completionDate ?? right.dueDateComponents.flatMap { Calendar.current.date(from: $0) } ?? Date.distantPast
+        return leftDate > rightDate
+    }
+    return [
+        "reminders": Array(sorted.prefix(limit).map(reminderPayload)),
+        "totalMatches": matches.count,
+        "completedMatches": completedCount,
+        "incompleteMatches": matches.count - completedCount
+    ]
+}
+
+private func deleteReminder(_ input: [String: Any]) throws -> [String: Any] {
+    try requireAccess(.reminder)
+    let id = try stringField(input, "id", required: true)!
+    guard let reminder = eventStore.calendarItem(withIdentifier: id) as? EKReminder else {
+        throw HelperError.notFound("Apple Reminder was not found.")
+    }
+    do {
+        try eventStore.remove(reminder, commit: true)
+        return ["deleted": true, "id": id]
     } catch {
         throw HelperError.saveFailed(error.localizedDescription)
     }
@@ -350,6 +603,8 @@ private func addEvent(_ input: [String: Any]) throws -> [String: Any] {
     }
 }
 
+reexecDisclaimedIfNeeded()
+
 do {
     let input = try inputJSON()
     let command = try stringField(input, "command", required: true)!
@@ -365,10 +620,16 @@ do {
         data = requestAccess(service.lowercased().contains("calendar") || service.lowercased().contains("event") ? .event : .reminder)
     case "list-reminders":
         data = try listReminders(input)
+    case "search-reminders":
+        data = try searchReminders(input)
     case "add-reminder":
         data = try addReminder(input)
+    case "update-reminder":
+        data = try updateReminder(input)
     case "complete-reminder":
         data = try completeReminder(input)
+    case "delete-reminder":
+        data = try deleteReminder(input)
     case "list-events":
         data = try listEvents(input)
     case "add-event":

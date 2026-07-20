@@ -13,6 +13,26 @@ APP_VERSION="${OPENASSIST_VERSION:-$(node -p "require('./package.json').version"
 BUILD_VERSION="${OPENASSIST_BUILD_VERSION:-$(git -C "${PROJECT_ROOT}/../.." rev-list --count HEAD 2>/dev/null || echo 1)}"
 APP_PATH="${OUT_DIR}/${APP_NAME}-darwin-arm64/${APP_NAME}.app"
 DMG_FINAL="${DIST_DIR}/${APP_NAME}.dmg"
+SKIP_DMG="${OPENASSIST_SKIP_DMG:-0}"
+
+SIGN_ID="${OPENASSIST_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_ID" ] && [ -n "${DEVELOPER_ID:-}" ]; then
+  SIGN_ID="Developer ID Application: ${DEVELOPER_ID}"
+fi
+if [ -z "$SIGN_ID" ]; then
+  SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
+    | head -n 1)"
+fi
+if [ -z "$SIGN_ID" ] && [ "${OPENASSIST_ALLOW_ADHOC_SIGNING:-0}" != "1" ]; then
+  echo "Error: no Developer ID Application certificate was found."
+  echo "Refusing an ad-hoc build because replacing Open Assist with it resets macOS permissions."
+  echo "Use OPENASSIST_ALLOW_ADHOC_SIGNING=1 only for isolated verification builds."
+  exit 1
+fi
+if [ -z "$SIGN_ID" ]; then
+  SIGN_ID="-"
+fi
 
 cd "$PROJECT_ROOT"
 
@@ -40,11 +60,10 @@ PACKAGER_ARGS=(
   --ignore='^/(out|out-unpacked|dist|verification|\.vite|\.playwright-mcp|dist-renderer/assets/.*\.map)$'
 )
 
-if [ -n "${DEVELOPER_ID:-}" ]; then
-  SIGN_ID="Developer ID Application: ${DEVELOPER_ID}"
+if [ "$SIGN_ID" != "-" ]; then
   echo "Packaging without automatic Electron signing; signing final app with ${SIGN_ID}..."
 else
-  echo "Packaging without Developer ID; applying local ad-hoc signature after packaging."
+  echo "Warning: packaging with an ad-hoc signature for isolated verification only."
 fi
 
 npx electron-packager "${PACKAGER_ARGS[@]}"
@@ -54,9 +73,13 @@ if [ ! -d "$APP_PATH" ]; then
   exit 1
 fi
 
+bash "${PROJECT_ROOT}/scripts/build-native-helpers.sh" \
+  "${APP_PATH}/Contents/Resources/native-helpers" \
+  "$SIGN_ID"
+
 sign_target() {
   local target="$1"
-  if [ -n "${DEVELOPER_ID:-}" ]; then
+  if [ "$SIGN_ID" != "-" ]; then
     codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$target"
   else
     codesign --force --options runtime --sign - "$target"
@@ -108,13 +131,18 @@ if [ -d "$APP_PATH" ]; then
   done < <(find "$APP_PATH" -depth -type d -name "*.framework" -print0)
 fi
 
-if [ -n "${DEVELOPER_ID:-}" ]; then
+if [ "$SIGN_ID" != "-" ]; then
   codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_PATH"
 else
   codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign - "$APP_PATH"
 fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+if [ "$SKIP_DMG" = "1" ]; then
+  echo "Signed Electron app ready at ${APP_PATH}"
+  exit 0
+fi
 
 echo "Creating ${DMG_FINAL}..."
 npx -y create-dmg "$APP_PATH" "$DIST_DIR/" --overwrite --no-version-in-filename --icon-size 128

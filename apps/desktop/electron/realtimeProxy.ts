@@ -1,6 +1,8 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import os from "node:os";
+import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import {
   buildLiveVoiceBootstrapContext,
@@ -15,25 +17,50 @@ import {
   RealtimeTaskCoordinator,
   type RealtimeTaskRecord
 } from "./realtimeTaskCoordinator.js";
-import { classifyVoiceRoute } from "./voiceRouting.js";
+import {
+  buildOpenAIRealtimeURL,
+  defaultOpenAIRealtimeModel,
+  readableOpenAIRealtimeConnectionError,
+  requireOpenAIRealtimeConversationModel,
+  validateOpenAIRealtimeConversationModel
+} from "./openAIRealtimeModels.js";
+import {
+  OpenAIInterruptedResponseTracker,
+  playedOpenAIAudioMs,
+  planOpenAIInterruption,
+  type OpenAIInterruptionReason
+} from "./realtimeInterruption.js";
+import { LiveVoiceCapabilityRegistry } from "./liveVoice/capabilityRegistry.js";
+import { LiveVoiceCoordinator } from "./liveVoice/coordinator.js";
+import {
+  liveVoicePublicToolSpecs,
+  providerAudioStarted,
+  providerConnectionClosed,
+  providerConnectionRestored,
+  providerInterrupted,
+  providerResponseCompleted,
+  providerToolRequested
+} from "./liveVoice/providerAdapters.js";
+import { LiveVoiceTrace } from "./liveVoice/trace.js";
+import { normalizeDelegatedWorkExecutionProfile } from "./liveVoice/workerModelPolicy.js";
+import type {
+  AssistantCapabilityArguments,
+  AssistantDelegateArguments,
+  CapabilityContextBinding,
+  CapabilityDescriptor,
+  CapabilityOutputResourceMapping,
+  CapabilityRequest,
+  DelegatedWorkExecutionProfile,
+  LiveVoiceContextResource,
+  RealtimeWorkerPolicy as SharedRealtimeWorkerPolicy,
+  WorkerModelMetadata
+} from "./liveVoice/contracts.js";
+import { nativePermissionBroker } from "./nativeAccess.js";
 
 type JsonObject = Record<string, unknown>;
 export type RealtimeHandoffReplyMode = "function" | "message";
 export type RealtimeCloudProvider = "openaiRealtime" | "geminiLive";
-export type RealtimeDelegationRouteDecision = "delegate" | "answer_direct" | "clarify" | "ignore" | "control";
-export type RealtimeDelegationRouteSource = "tool_call" | "auto_transcript";
-export type RealtimeDelegationMode = "autoHardTasksOnly" | "alwaysDelegate" | "neverDelegate";
-export type RealtimeDelegationRouteInput = {
-  source: RealtimeDelegationRouteSource;
-  provider: RealtimeCloudProvider;
-  agentLabel: string;
-  prompt: string;
-  proposedTaskText: string;
-  lastDelegationPrompt: string;
-  lastDelegationResult: string;
-  hasActiveHandoff: boolean;
-  voiceState: "listening" | "speaking" | "delegating" | "quiet";
-};
+export type RealtimeWorkerPolicy = SharedRealtimeWorkerPolicy;
 export type RealtimeSessionState = "idle" | "listening" | "speaking" | "toolPending" | "delegating" | "narrating" | "quiet";
 export type RealtimeSessionStateSnapshot = {
   state: RealtimeSessionState;
@@ -47,6 +74,7 @@ export type RealtimeSessionStateSnapshot = {
   voicePhase: "connecting" | "listening" | "speaking" | "quiet" | "closed" | "error";
   foregroundWork?: "knowledge" | "tool";
   voiceProvider: RealtimeCloudProvider;
+  voiceModel: string;
   workerProvider: string;
   tasks: Array<{
     taskID: string;
@@ -59,17 +87,15 @@ export type RealtimeSessionStateSnapshot = {
     result: string;
     error: string;
     deliveryState: RealtimeTaskRecord["deliveryState"];
+    workerModelRole?: RealtimeTaskRecord["workerModelRole"];
+    workerModelID?: string;
+    workerReasoningEffort?: RealtimeTaskRecord["workerReasoningEffort"];
+    workerSelectionReason?: string;
+    workerModelExplicit?: boolean;
     startedAt: number;
     updatedAt: number;
     finishedAt?: number;
   }>;
-};
-export type RealtimeDelegationRouteResult = {
-  decision: RealtimeDelegationRouteDecision;
-  taskText?: string;
-  responseText?: string;
-  confidence?: number;
-  reason?: string;
 };
 export type RealtimeVisualContextImage = {
   dataURL: string;
@@ -90,6 +116,7 @@ export type RealtimeProxyConfig = {
   organizationID?: string;
   projectID?: string;
   safetyIdentifier?: string;
+  contextResources?: LiveVoiceContextResource[];
   handoff?: {
     agentLabel: string;
     run: (request: {
@@ -97,9 +124,14 @@ export type RealtimeProxyConfig = {
       sourceTurnID: string;
       callID: string;
       prompt: string;
+      userText: string;
+      executionProfile?: DelegatedWorkExecutionProfile;
+      freshThread?: boolean;
+      contextResources?: LiveVoiceContextResource[];
       replyMode: RealtimeHandoffReplyMode;
       signal: AbortSignal;
       onProgress: (detail: string) => void;
+      onWorkerResolved: (metadata: WorkerModelMetadata) => void;
     }) => Promise<{ output: string; workerProvider?: string } | string>;
     cancel?: (taskID: string) => Promise<void> | void;
   };
@@ -110,7 +142,8 @@ export type RealtimeProxyConfig = {
     maxTasks: number;
     run: (request: {
       callID: string;
-      tasks: Array<{ prompt: string; provider?: string; project?: string }>;
+      tasks: Array<{ prompt: string; provider?: string; project?: string; executionProfile?: DelegatedWorkExecutionProfile }>;
+      onTaskWorkerResolved: (index: number, metadata: WorkerModelMetadata) => void;
       reportTaskResult: (result: {
         index: number;
         label: string;
@@ -135,8 +168,10 @@ export type RealtimeProxyConfig = {
 	  codexImageGeneration?: {
 	    run: (request: { callID: string; args: JsonObject; prompt: string }) => Promise<unknown>;
 	  };
-	  directKnowledgeRequest?: {
-	    run: (request: { callID: string; prompt: string; replyMode: RealtimeHandoffReplyMode }) => Promise<string | undefined | null>;
+	  localMCP?: {
+	    enabled: boolean;
+	    findTools: (args: JsonObject) => Promise<unknown>;
+	    callTool: (args: JsonObject) => Promise<unknown>;
 	  };
   directWork?: {
     onEvent: (event: {
@@ -162,10 +197,8 @@ export type RealtimeProxyConfig = {
 	      snapshot?: RealtimeSessionStateSnapshot;
 	    }) => void;
 	  };
-  delegationRouter?: {
-    route: (input: RealtimeDelegationRouteInput) => Promise<RealtimeDelegationRouteResult>;
-  };
-  delegationMode?: RealtimeDelegationMode;
+  workerPolicy?: RealtimeWorkerPolicy;
+  traceDirectory?: string;
   continuity?: {
     threadKey: string;
     bootstrap: LiveVoiceBootstrapContext;
@@ -177,6 +210,11 @@ export type RealtimeProxyConfig = {
       taskStartedAt?: number;
       taskFinishedAt?: number;
       progressEntries?: Array<{ id: string; text: string; createdAt: number }>;
+      workerModelRole?: RealtimeTaskRecord["workerModelRole"];
+      workerModelID?: string;
+      workerReasoningEffort?: RealtimeTaskRecord["workerReasoningEffort"];
+      workerSelectionReason?: string;
+      workerModelExplicit?: boolean;
     }) => Promise<void> | void;
     onStatus?: (event: { status: "restored" | "restore_failed" | "persist_failed"; message?: string }) => void;
   };
@@ -197,15 +235,10 @@ type GeminiLiveSession = {
   close: () => void;
 };
 
-type DelegationDecision =
-  | { allow: true; prompt: string; normalizedPrompt: string }
-  | { allow: false; output: string; createResponse: boolean; reason: string };
-
-const defaultRealtimeModel = "gpt-realtime-mini";
+const defaultRealtimeModel = defaultOpenAIRealtimeModel;
 const defaultRealtimeVoice = "marin";
 const defaultGeminiLiveModel = "gemini-3.1-flash-live-preview";
 const defaultGeminiLiveVoice = "Aoede";
-const autoHandoffDelayMs = 900;
 // Reliability tuning for the OpenAI realtime upstream socket.
 const upstreamKeepAliveIntervalMs = 15_000;
 const upstreamReconnectBaseDelayMs = 400;
@@ -246,6 +279,47 @@ function stringValue(...values: unknown[]) {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return "";
+}
+
+function openAIRealtimeEventIdentity(event: JsonObject, fallbackResponseID = "", fallbackItemID = "") {
+  const response = jsonObject(event.response);
+  const item = jsonObject(event.item);
+  return {
+    responseID: stringValue(event.response_id, response?.id, item?.response_id, fallbackResponseID),
+    itemID: stringValue(event.item_id, event.output_item_id, item?.id, item?.item_id, fallbackItemID)
+  };
+}
+
+// OpenAssist owns the realtime tools it adds to the upstream session. Codex is
+// only the audio transport client, so exposing those function calls to Codex
+// makes app-server wait for tool outputs it can never produce. Keep normal
+// audio/transcript events visible while removing proxy-owned tool bookkeeping.
+function codexVisibleOpenAIEvent(event: JsonObject): JsonObject | undefined {
+  const type = stringValue(event.type);
+  const item = jsonObject(event.item);
+  if (type.includes("function_call_arguments")) return undefined;
+  if (
+    (type === "response.output_item.added" || type === "response.output_item.done" || type === "conversation.item.created")
+    && (item?.type === "function_call" || item?.type === "function_call_output")
+  ) {
+    return undefined;
+  }
+  if (type !== "response.done") return event;
+  const response = jsonObject(event.response);
+  if (!response) return event;
+  const output = Array.isArray(response.output)
+    ? response.output.filter((rawItem) => {
+        const outputItem = jsonObject(rawItem);
+        return outputItem?.type !== "function_call" && outputItem?.type !== "function_call_output";
+      })
+    : [];
+  return {
+    ...event,
+    response: {
+      ...response,
+      output
+    }
+  };
 }
 
 function parseJSON(value: string) {
@@ -306,442 +380,33 @@ function normalizeRealtimeIntent(text: string) {
     .trim();
 }
 
-function stripAssistantEchoFragments(text: string) {
-  return String(text || "")
-    .replace(/\bhey there[,.]?\s*what'?s on your mind today[?]?\s*anything i can help you with[?]?/gi, " ")
-    .replace(/\bhello there[!.]?\s*what can i do for you today[?]?/gi, " ")
-    .replace(/\byep[,.]?\s*i'?m here[!.]?\s*what'?s on your mind[?]?/gi, " ")
-    .replace(/\bi understand you'?re asking about notifications from x on brave browser[.]?\s*i'?m checking for that now[.]?\s*just a moment[.]?/gi, " ")
-    .replace(/\byes[,.]?\s*i'?m still working on checking those notifications for you[.]?\s*it'?s taking a little longer than expected[.]?\s*i'?ll let you know as soon as i have an update[.]?/gi, " ")
-    .replace(/\bi'?ll let you know as soon as i have an update[.]?/gi, " ")
-    .replace(/\bnotifications for you[.]?\s*one moment[.]?/gi, " ")
-    .replace(/\bi'?m still waiting for the results from that check on your notifications[.]?\s*i'?ll let you know the moment i have any new information[.]?/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+const realtimeRequestStopWords = new Set([
+  "a", "an", "and", "are", "can", "could", "for", "from", "i", "if", "in", "is", "it",
+  "me", "my", "of", "on", "or", "please", "the", "to", "we", "with", "would", "you"
+]);
 
-function repairRealtimeDelegationText(text: string) {
-  const stripped = stripAssistantEchoFragments(text);
-  const normalized = normalizeRealtimeIntent(stripped || text);
-  if (/^codebase about$/.test(normalized) || /\bcodebase\b.*\babout\b/.test(normalized)) {
-    return "Summarize what this codebase is about.";
-  }
-  return stripped || text;
-}
-
-function isStopOrDismissal(text: string) {
-  // Phrases that should match as the whole utterance or at its start.
-  const prefixPhrases = [
-    "stop",
-    "cancel",
-    "never mind",
-    "nevermind",
-    "that's all",
-    "that is all",
-    "you're done",
-    "you are done",
-    "done",
-    "quit",
-    "exit",
-    // Natural ways people interrupt the assistant while it is talking.
-    "can you stop",
-    "could you stop",
-    "would you stop",
-    "please stop",
-    "stop please",
-    "wait",
-    "wait wait",
-    "hold on",
-    "hold up",
-    "hang on",
-    "one second",
-    "one sec",
-    "one moment",
-    "just a second",
-    "just a moment",
-    "give me a second",
-    "give me a moment"
-  ];
-  if (prefixPhrases.some((phrase) => text === phrase || text.startsWith(`${phrase} `))) {
-    return true;
-  }
-  // Clear interruptions that count even if they appear mid-utterance.
-  return /\b(stop talking|stop speaking|be quiet|shut up|shush|that'?s enough|enough enough)\b/.test(text);
-}
-
-function isShortAcknowledgement(text: string) {
-  return /^(mhm+|mm+hmm+|hmm+|hm+|ok|okay|yes|yeah|yep|yup|no|nope|uh|um|thanks|thank you|cool|nice|sure|alright|all right)(\s+(thanks|thank you))?$/i.test(text)
-    || /^(thanks|thank you)\s+(ok|okay|yes|yeah|yep|yup|sure)$/i.test(text);
-}
-
-function isVagueRealtimeFollowupTask(text: string) {
-  if (!/\b(it|that|this|same|again|previous|last|yesterday|tomorrow)\b/.test(text)) return false;
-  if (!/\b(check|inspect|open|read|find|search|look|use|do|run|get|show|compare)\b/.test(text)) return false;
-  return !/\b(browser|brave|chrome|square|calendar|notes|mail|finder|repo|repository|codebase|terminal|file|website|webpage|notification|notifications)\b/.test(text);
-}
-
-function isVagueRealtimeHelpRequest(text: string) {
-  return /^(hey\s+)?(open assist|openassist|assistant|codex)?\s*(can|could|would|will)\s+you\s+help(\s+me)?(\s+with\s+(something|this|that))?$/.test(text)
-    || /^(hey\s+)?(open assist|openassist|assistant|codex)?\s*i\s+(need|want)\s+help(\s+with\s+(something|this|that))?$/.test(text)
-    || /^(hey\s+)?(open assist|openassist|assistant|codex)?\s*(are you there|hello|hi|hey)$/.test(text);
-}
-
-function isCasualRealtimeGreeting(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  return /^(hey|hi|hello|hallo|hej|ei|good morning|good afternoon|good evening|how are you|are you there|open assist|openassist|assistant|codex)$/.test(normalized)
-    || /^(hey|hi|hello|hallo|hej|ei)\s+(open assist|openassist|assistant|codex)$/.test(normalized);
-}
-
-function looksIncompleteForDelegation(text: string) {
-  const raw = String(text || "").trim();
-  const normalized = normalizeRealtimeIntent(raw);
-  if (!normalized) return true;
-  const words = normalized.split(/\s+/).filter(Boolean);
-  if (words.length <= 3 && !/\b(open|check|inspect|search|find|read|fix|add|run|test)\b/.test(normalized)) {
-    return true;
-  }
-  if (/\b(and|or|then|to|for|with|using|about|because|so|if|when|while)$/i.test(normalized)) {
-    return true;
-  }
-  if (/^(if|whether|when|while|because|so|and|also|then)\b/.test(normalized)) {
-    return !/\b(check|find|search|look up|open|inspect|tell me|let me know|report|answer|summarize|explain)\b/.test(normalized);
-  }
-  return /[,;:]$/.test(raw);
-}
-
-function looksLikeMissingReferenceFollowup(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return false;
-  const asksWhichThing = /\b(which|what|where)\b.{0,45}\b(node|step|item|file|screen|workflow|one)\b/.test(normalized);
-  const refersToUnspecifiedChange = /\b(updated|changed|modified|added|removed|created|done|fixed)\b/.test(normalized);
-  const reportsMissingContext = /\b(i\s+(do not|don't|cannot|can't)\s+(see|find|tell|know)|not\s+sure|which\s+one)\b/.test(normalized);
-  const namesAConcreteTarget = /\b(repo|repository|project|path|file\s+named|node\s+named|workflow\s+named|called)\b/.test(normalized);
-  return asksWhichThing && refersToUnspecifiedChange && reportsMissingContext && !namesAConcreteTarget;
-}
-
-function isConversationFollowupQuestion(text: string) {
-  return (
-    /\b(tell|say|read|repeat)\b.*\b(it|that|this|the answer|the result|what you said)\b.*\bagain\b/.test(text) ||
-    /\b(tell|say|read|repeat)\b.*\bagain\b/.test(text) ||
-    /\bwhat (were|was) (we|you) (talking about|discussing|saying|working on)\b/.test(text) ||
-    /\bwhat did (we|you) (talk about|discuss|say)\b/.test(text) ||
-    /\bcan you tell it to me again\b/.test(text)
+function realtimeRequestTerms(text: string) {
+  return new Set(
+    normalizeRealtimeIntent(text)
+      .split(/\s+/)
+      .map((term) => term.replace(/^[-/]+|[-/]+$/g, ""))
+      .filter((term) => term.length > 1 && !realtimeRequestStopWords.has(term))
   );
 }
 
-function isExplicitRealtimeRerunRequest(text: string) {
-  return /\b(recheck|rerun|redo|retry|start over)\b/.test(text)
-    || /\b(check|search|find|run|do|try|look|scan|open|inspect)\b.{0,80}\b(again|one more time|another time)\b/.test(text)
-    || /\b(again|one more time|another time)\b.{0,80}\b(check|search|find|run|do|try|look|scan|open|inspect)\b/.test(text);
-}
-
-type ConversationRecallRoute = "none" | "personal" | "current" | "clarify";
-
-// "Save this to memory" / "forget that memory" are write tasks, not recall.
-function isMemoryWriteRequest(normalized: string) {
-  return /\b(add|save|store|create|write|put|update|edit|delete|remove|clear|forget)\b.{0,50}\b(memory|memories)\b/.test(normalized)
-    || /\b(memory|memories)\b.{0,30}\b(add|save|store|create|write|update|edit|delete|remove|clear|forget)\b/.test(normalized);
-}
-
-// Possessive/state memory questions ("what memory do I have from codex",
-// "list my saved memories", "what's in my memory") have no check/search verb,
-// so the verb-based recall patterns miss them. Catch them explicitly.
-function asksAboutStoredMemories(normalized: string) {
-  if (!/\b(memory|memories)\b/.test(normalized)) return false;
-  if (isMemoryWriteRequest(normalized)) return false;
-  return /\b(what|which|any|how many)\b.{0,60}\b(memory|memories)\b/.test(normalized)
-    || /\b(list|show|read|tell me)\b.{0,60}\b(memory|memories)\b/.test(normalized)
-    || /\b(do|does|did)\b.{0,25}\b(i|you|we|it|codex|claude|spark|gemini|chatgpt)\b.{0,40}\bhave\b.{0,50}\b(memory|memories)\b/.test(normalized)
-    || /\b(memory|memories)\b.{0,50}\b(do|does|did)\b.{0,25}\b(i|you|we|it|codex|claude|spark|gemini|chatgpt)\b.{0,25}\bhave\b/.test(normalized)
-    || /\b(memory|memories)\b.{0,40}\b(have been|has been|are|is|were|was)\b.{0,25}\b(saved|stored)\b/.test(normalized)
-    || /\bin\b.{0,20}\b(my|the|your)\b.{0,25}\b(memory|memories)\b/.test(normalized)
-    || /\b(know|knows)\b.{0,25}\babout\b.{0,12}\b(me|us)\b.{0,30}\b(memory|memories)\b/.test(normalized);
-}
-
-// "What does Codex remember about me" — recall even without the word memory.
-function asksWhatAgentRemembers(normalized: string) {
-  return /\b(you|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,30}\b(remember|remembers|know|knows)\b.{0,25}\babout\b.{0,12}\b(me|us)\b/.test(normalized);
-}
-
-function currentConversationRecallText() {
-  return "Answer from this current thread or live conversation only. Do not search saved memory or start a background task.";
-}
-
-function recallScopeClarificationText() {
-  return "Do you mean this thread, or should I search all saved memory?";
-}
-
-function notPersonalRecallToolText() {
-  return "This is not a memory recall request. Use the correct realtime tool or background_agent for the user's actual task instead of knowledge_personal_recall.";
-}
-
-function realtimePromptWantsImageGeneration(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  const asksForCreation = /\b(generate|create|make|draw|render|design|illustrate|paint|mock up|mockup|turn|convert)\b/.test(normalized);
-  const asksForImage = /\b(image|picture|photo|logo|icon|illustration|mockup|poster|banner|cover|thumbnail|wallpaper|avatar|sticker|graphic|visual)\b/.test(normalized);
-  const editsReferenceImage = /\b(use|edit|change|update|improve|build on|work on)\b.{0,80}\b(latest|attached|this|that)\b.{0,80}\b(image|photo|picture|poster|banner|logo|mockup|graphic)\b/.test(normalized);
-  return (asksForCreation && asksForImage) || editsReferenceImage;
-}
-
-function hasCurrentConversationScope(normalized: string) {
-  return /\b(this|current|same)\s+(thread|chat|conversation|session|live)\b/.test(normalized)
-    || /\b(in|from|inside)\s+(this|current)\s+(thread|chat|conversation|session|live)\b/.test(normalized)
-    || /\bthis thread itself\b/.test(normalized)
-    || /\bin here\b/.test(normalized);
-}
-
-function hasPersonalRecallSourceScope(normalized: string) {
-  return /\b(memory|memories|saved|history|timeline|previous|earlier|last time|old conversation|past conversation|conversation we had|conversations we had|chat we had|chat that we had|saved chats?|saved conversations?|all chats?|all threads?|all sessions?|codex thread|claude code|sessions?|transcript)\b/.test(normalized);
-}
-
-function hasAgentRecallSubject(normalized: string) {
-  if (!/\b(codex|claude|spark|gemini|chatgpt|agent|assistant)\b/.test(normalized)) return false;
-  return /\b(what did|where did|when did|did we|did you|have we|have you)\b.{0,90}\b(say|answer|respond|tell|find|decide|talk|discuss|work|do|check)\b/.test(normalized)
-    || /\b(said|answered|responded|told|found|decided|talked|discussed|worked on|previous|earlier|last time|memory|remember)\b/.test(normalized);
-}
-
-function looksLikeExternalLookupTask(normalized: string) {
-  return /\b(prompt|ask|tell)?\b.{0,30}\b(check|search|find|look up|look|browse|open|inspect)\b.{0,80}\b(online|on ine|web|internet|website|site|google|current|latest|live)\b/.test(normalized)
-    || /\b(check|search|find|look up|look|browse|open|inspect)\b.{0,80}\b(online|on ine|web|internet|website|site|google|current|latest|live)\b/.test(normalized);
-}
-
-function requiresAgentExecution(normalized: string) {
-  const asksForWork = /\b(check|inspect|run|query|read|search|find|debug|open|use|calculate|verify|review|investigate|pull|fetch|download|trace|diagnose|what happened|why)\b/.test(normalized);
-  if (!asksForWork) return false;
-  const asksForPastResult = /\bwhat did\b.{0,60}\b(we|you|the agent|codex|claude)\b.{0,80}\b(find|see|say|answer|conclude|discover)\b/.test(normalized)
-    || /\b(previous|earlier|last)\b.{0,60}\b(result|answer|finding|conclusion)\b/.test(normalized);
-  if (asksForPastResult) return false;
-  const explicitAgent = /\b(agent|codex|claude|coding assistant)\b/.test(normalized);
-  const namedToolRequest = /\b(using|via|through|with)\b.{0,60}\b(cli|tool|app|service|system|api|console|dashboard)\b/.test(normalized);
-  const executionContext = /\b(cli|terminal|shell|command line|logs?|database|sql|server|deployment|deploy|build|tests?|repo|repository|codebase|package manager|runtime|debugger|admin console)\b/.test(normalized);
-  const savedRecallContext = /\b(memory|memories|saved chats?|saved conversations?|all chats?|all threads?|all sessions?|conversation history|chat history)\b/.test(normalized);
-  if (savedRecallContext && !namedToolRequest && !executionContext) return false;
-  return explicitAgent || namedToolRequest || executionContext;
-}
-
-function asksForPastLookupResult(normalized: string) {
-  return /\b(previous|earlier|last|old|saved)\b.{0,90}\b(search|searched|lookup|looked up|online|web|internet|result|answer|response)\b/.test(normalized)
-    || /\bwhat did\b.{0,80}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,80}\b(find|say|answer|respond)\b.{0,80}\b(online|web|internet|search|searched|lookup)\b/.test(normalized);
-}
-
-function hasExplicitRecallSubject(normalized: string) {
-  const blockedFirstWords = new Set([
-    "this",
-    "current",
-    "same",
-    "that",
-    "it",
-    "here",
-    "today",
-    "yesterday",
-    "tomorrow",
-    "last",
-    "earlier",
-    "previous",
-    "the",
-    "a",
-    "an",
-    "my",
-    "your",
-    "our"
-  ]);
-  const subjectPattern = /\b(on|about|for|with|inside)\s+((?:the\s+)?[a-z0-9][a-z0-9'/-]+(?:\s+(?!on\b|about\b|for\b|with\b|inside\b|today\b|yesterday\b|tomorrow\b|last\b|earlier\b|previous\b)[a-z0-9][a-z0-9'/-]+){0,5})/g;
-  for (const match of normalized.matchAll(subjectPattern)) {
-    const phrase = String(match[2] || "").replace(/^the\s+/, "").trim();
-    const words = phrase.split(/\s+/).filter(Boolean);
-    if (!words.length || blockedFirstWords.has(words[0])) continue;
-    if (words.length >= 2) return true;
-    if (/\b(openassist|atoms|rapid|widgtimator|tax-claim-it|taxclaim|amwins|qualitynails)\b/.test(phrase)) return true;
+function isSameRealtimeRequest(left: string, right: string) {
+  const normalizedLeft = normalizeRealtimeIntent(left);
+  const normalizedRight = normalizeRealtimeIntent(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+  const leftTerms = realtimeRequestTerms(normalizedLeft);
+  const rightTerms = realtimeRequestTerms(normalizedRight);
+  if (!leftTerms.size || !rightTerms.size) return false;
+  let shared = 0;
+  for (const term of leftTerms) {
+    if (rightTerms.has(term)) shared += 1;
   }
-  return false;
-}
-
-function isBroadWorkHistoryQuestion(normalized: string) {
-  return /\bwhat did\b.{0,30}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,60}\b(work|worked|working|do|doing)\b.{0,50}\b(today|yesterday|tomorrow|last night|last week|this week|earlier|previously)\b/.test(normalized)
-    || /\bwhat (are|were)\b.{0,30}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,60}\b(work|worked|working|do|doing)\b.{0,50}\b(today|yesterday|tomorrow|last night|last week|this week|earlier|previously)\b/.test(normalized)
-    || /\b(did|have|had)\b.{0,30}\b(you|we|i|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,70}\b(work|worked|working|do|done|doing|anything)\b/.test(normalized);
-}
-
-function conversationRecallRoute(text: string): ConversationRecallRoute {
-  const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return "none";
-  if (hasCurrentConversationScope(normalized)) return "current";
-  if (requiresAgentExecution(normalized)) return "none";
-
-  const hasRecallSource = hasPersonalRecallSourceScope(normalized);
-  if (looksLikeExternalLookupTask(normalized) && !asksForPastLookupResult(normalized)) return "none";
-
-  const asksWhetherAlready =
-    /\b(wants?|asked|asks?|wondering)\b.{0,80}\b(if|whether)\b.{0,80}\balready\b/.test(normalized)
-    || /\b(did|have|had|were|was)\b.{0,20}\b(you|we|the agent|codex|claude|assistant)\b.{0,100}\balready\b/.test(normalized);
-  if (asksWhetherAlready) return "personal";
-  if (asksAboutStoredMemories(normalized) || asksWhatAgentRemembers(normalized)) return "personal";
-  if (isExplicitRealtimeRerunRequest(normalized)) return "none";
-
-  if (isBroadWorkHistoryQuestion(normalized)) {
-    if (hasPersonalRecallSourceScope(normalized) || hasAgentRecallSubject(normalized) || hasExplicitRecallSubject(normalized)) return "personal";
-    return "clarify";
-  }
-
-  if (hasRecallSource && (
-    /\b(check|search|look|look into|find|read|scan)\b.{0,50}\b(memory|memories|saved|history|timeline|previous|earlier|all chats?|all threads?|all sessions?)\b/.test(normalized)
-    || /\b(memory|memories|saved|history|timeline|previous|earlier|all chats?|all threads?|all sessions?|chat|conversation|thread|session|transcript)\b.{0,70}\b(check|search|look|look into|find|read|scan|had|talked|discussed)\b/.test(normalized)
-    || /\b(check|search|look|look into|find|read|scan)\b.{0,70}\b(chat|conversation|thread|session|transcript)\b.{0,50}\b(had|talked|discussed|yesterday|today|earlier|previous)\b/.test(normalized)
-    || /\b(do you|can you)\b.{0,30}\bremember\b/.test(normalized)
-  )) return "personal";
-  if (/\bwhere (are|were)\b.{0,80}\b(we|i|you)\b.{0,80}\b(on|with|in|at)\b/.test(normalized)) {
-    return hasExplicitRecallSubject(normalized) ? "personal" : "clarify";
-  }
-
-  const isRecall = /\balready\b.{0,60}\b(found|find|figured|figure|checked|searched|ran|did|done|finished|answered|responded|looked)\b/.test(normalized)
-    || /\b(previous|last|earlier)\b.{0,80}\b(turn|message|answer|response|task|result|conversation|thing)\b/.test(normalized)
-    || /\bwhat\b.{0,30}\b(note|task|item|reminder|file|document|project)\b.{0,80}\b(added|created|saved|updated|edited|made|worked on)\b.{0,40}\b(last time|previously|earlier)\b/.test(normalized)
-    || /\b(last time|previously|earlier)\b.{0,60}\bwhat\b.{0,30}\b(note|task|item|reminder|file|document|project)\b/.test(normalized)
-    || /\bwhat did\b.{0,30}\b(you|we|the agent|codex|claude|spark|gemini|chatgpt|assistant)\b.{0,60}\b(find|say|do|answer|respond|figure out|check)\b/.test(normalized)
-    || /\bwhat (was|were)\b.{0,70}\b(result|answer|plan|decision|status|state|process|last thing|previous thing)\b/.test(normalized)
-    || /\bdid (we|i|you)\b.{0,80}\b(talk|discuss|decide|plan|ask|mention)\b/.test(normalized)
-    || /\b(do you|can you)\b.{0,30}\bremember\b/.test(normalized);
-  return isRecall ? "personal" : "none";
-}
-
-function isConversationRecallQuestion(text: string) {
-  return conversationRecallRoute(text) !== "none";
-}
-
-// Route guard for a model-initiated knowledge_personal_recall call. The model
-// may rephrase the user's question into wording the regexes miss, so check the
-// model's query AND the raw utterance and take the most permissive result.
-// A user-stated "this thread" scope still wins over everything else.
-function recallRouteForToolCall(query: string, utterance: string): ConversationRecallRoute {
-  const texts = [query, utterance].map((text) => String(text || "").trim()).filter(Boolean);
-  const normalizedUtterance = normalizeRealtimeIntent(utterance);
-  // The raw user request wins over a model-rephrased recall query. A request
-  // that requires real tool execution is current agent work, never memory.
-  if (requiresAgentExecution(normalizedUtterance)) return "none";
-  const routes = texts.map((text) => conversationRecallRoute(text));
-  if (routes.includes("current")) return "current";
-  if (routes.includes("personal")) return "personal";
-  if (routes.includes("clarify")) return "clarify";
-  // The model already chose the recall tool. If the text plainly talks about
-  // memory/remembering and is not a memory write or a new external lookup,
-  // trust that choice instead of vetoing it.
-  for (const text of texts) {
-    const normalized = normalizeRealtimeIntent(text);
-    if (!normalized) continue;
-    if (!/\b(memory|memories|remember|remembers)\b/.test(normalized)) continue;
-    if (isMemoryWriteRequest(normalized)) continue;
-    if (looksLikeExternalLookupTask(normalized)) continue;
-    return "personal";
-  }
-  return "none";
-}
-
-function isCasualRealtimeQuestion(text: string) {
-  if (isConversationRecallQuestion(text)) return true;
-
-  const explicitToolRequest =
-    /\b(browser|brave|chrome|computer|desktop app|website|webpage|codex|repo|repository|codebase|terminal|file)\b/.test(text)
-    && /\b(open|check|inspect|use|search|find|read|look)\b/.test(text);
-  if (explicitToolRequest) return false;
-
-  return /\b(joke|funny|laugh|story|weather|time|date|who are you|how are you|what can you do|tell me about yourself|sing|poem)\b/.test(text)
-    || /\b(are you|is it)\s+ready\b/.test(text)
-    || isConversationFollowupQuestion(text);
-}
-
-function looksLikeRealtimeKnowledgeTask(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return false;
-  if (/\b(codebase|repo|repository|terminal|logs?|debug|build|test|install|package|browser|chrome|brave|computer|desktop|downloads|file system|folder)\b/.test(normalized)) {
-    return false;
-  }
-  const knowledgeSubject = /\b(my notes?|notes?|today|tomorrow|yesterday|planner|journal|to-?do|tasks?|items?|reminders?|backlog|follow-?ups?|later)\b/.test(normalized);
-  if (!knowledgeSubject) return false;
-  return /\b(what|which|list|show|read|open|unfinished|done|complete|mark|add|create|move|carry|schedule|reschedule|remove|delete|check|do we have|any|how many)\b/.test(normalized)
-    || /\b(on|for)\s+(today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(normalized);
-}
-
-function looksLikeNoteOrganizeTask(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return false;
-  if (/\b(codebase|repo|repository|terminal|logs?|debug|build|test|install|package|browser|chrome|brave|computer|desktop|downloads|file system|folder)\b/.test(normalized)) {
-    return false;
-  }
-  const noteSubject = /\b(my notes?|notes?|this note|that note|current note|open note|project note|thread note|journal)\b/.test(normalized);
-  if (!noteSubject) return false;
-  return /\b(organize|reorganize|structure|restructure|clean up|cleanup|tidy|reformat|format|rewrite|rework|make it readable|make .* easier to scan|use .*style|style it|summarize into sections)\b/.test(normalized);
-}
-
-function shouldUseDirectKnowledgeInsteadOfAgent(text: string) {
-  return looksLikeRealtimeKnowledgeTask(text) && !looksLikeNoteOrganizeTask(text);
-}
-
-function isSideQuestionWhileBusy(text: string) {
-  if (!text) return false;
-  if (/\b(add|fix|change|update|remove|delete|create|make|implement|wire|connect|hook|run|test|debug|install|start|build|commit|push|deploy|rename|move|refactor|write|edit|patch|verify|clone|pull)\b/.test(text)) {
-    return false;
-  }
-  return /^(what|why|how|where|who|which|can you tell|tell me|explain|summarize)\b/.test(text)
-    || /\b(status|what are you doing|what you're doing|what you are doing|working on|progress|codebase|code base|repo|repository|project|app|current folder)\b/.test(text);
-}
-
-function isDelegatedStatusQuestion(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return false;
-  return /\b(status|progress|stuck|still working|still running|still going|done yet|finished yet|complete yet|current status|current step|current tool)\b/.test(normalized)
-    || /^(is|are)\s+(it|that|this|the task|the job|codex|the agent|you)\s+(done|finished|complete)(\s+now)?$/.test(normalized)
-    || /\b(what|which|show|give|tell)\b.{0,45}\b(result|response|answer|outcome)\b/.test(normalized)
-    || /\b(result|response|answer|outcome)\b.{0,35}\b(ready|done|finished|complete|come back|returned)\b/.test(normalized)
-    || /\b(what are you doing|what you are doing|what you're doing|what is it doing|what's it doing|what is the agent doing)\b/.test(normalized)
-    || /\b(what's happening|what is happening|what happened|where is it at|where it is at|where it's at|where its at|where is it right now|where it is right now|where are we at|where we are at|what step is it on)\b/.test(normalized)
-    || /\b(check on it|check on that|check on the task|check on the agent|check on codex)\b/.test(normalized)
-    || /\b(why is it taking|why is this taking|why so long|why did it stop|why it stopped)\b/.test(normalized)
-    || /^why\b.*\bstuck\b/.test(normalized);
-}
-
-function isDelegatedTaskCancellationRequest(text: string) {
-  const normalized = normalizeRealtimeIntent(text);
-  if (!normalized) return false;
-  return /\b(cancel|stop|abort|end|kill)\b.{0,30}\b(task|job|work|run|agent|codex|claude)\b/.test(normalized)
-    || /\b(task|job|work|run|agent|codex|claude)\b.{0,30}\b(cancel|stop|abort|end|kill)\b/.test(normalized);
-}
-
-function looksLikeCodexTask(text: string) {
-  if (isCasualRealtimeQuestion(text)) return false;
-
-  if (
-    /\b(codebase|repo|repository|project|app|current folder)\b.*\b(about|summary|summarize|explain)\b/.test(text) ||
-    /\b(about|summary|summarize|explain)\b.*\b(codebase|repo|repository|project|app|current folder)\b/.test(text)
-  ) {
-    return true;
-  }
-
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length <= 2 && !/\b(fix|add|run|test|check|open|build)\b/.test(text)) return false;
-
-  const actionPattern = /\b(add|fix|change|update|remove|delete|create|make|implement|wire|connect|hook|run|test|check|inspect|search|find|open|read|review|explain|summarize|debug|look|turn|enable|disable|install|start|build|commit|push|deploy|rename|move|organize|clean|cleanup|sort|schedule|reschedule|plan|refactor|write|edit|patch|verify|compare|clone|pull)\b/;
-  if (actionPattern.test(text)) return true;
-
-  const codeContextPattern = /\b(error|bug|file|code|codebase|test|build|app|repo|repository|project|folder|branch|terminal|cli|server|endpoint|api|config|toml|swift|typescript|javascript|python|rust|node|npm|package|workspace|worktree|diff|changes|realtime|real-time|hook|hooks|integration|implementation|browser|brave|chrome|website|webpage|post|x post|tweet|notification|notifications|feed)\b/;
-  if (codeContextPattern.test(text)) return true;
-
-  const askPattern = /^(can you|could you|please|try to|let's|lets|i want|we need|need to|why is|why it|why it's|why does|why doesn't|why isnt|why isn't|why did|how do|where is)\b/;
-  return askPattern.test(text) && !/\b(weather|time|date)\b/.test(text);
-}
-
-function shouldIgnoreBusyDelegationPrompt(prompt: string) {
-  const normalized = normalizeRealtimeIntent(stripAssistantEchoFragments(prompt));
-  if (!normalized) return true;
-  if (isStopOrDismissal(normalized)) return false;
-  if (isCasualRealtimeQuestion(normalized)) return false;
-  if (isSideQuestionWhileBusy(normalized)) return false;
-
-  const words = normalized.split(/\s+/).filter(Boolean);
-  const clearAction = /\b(add|fix|change|update|remove|delete|create|make|implement|wire|connect|hook|run|test|debug|install|start|build|open|check|inspect|search|find|read|review|explain|summarize|organize|clean|cleanup|sort|schedule|reschedule|plan)\b/.test(normalized);
-  if (/^(up|about|it|this|that|there|here|yes|no|ok|okay|uh|um|hmm|mhm)$/.test(normalized)) return true;
-  if (words.length <= 2 && !clearAction) return true;
-  if (words.length <= 3 && !looksLikeCodexTask(normalized)) return true;
-  return false;
+  return shared / Math.min(leftTerms.size, rightTerms.size) >= 0.6;
 }
 
 function conversationItemUserText(event: JsonObject) {
@@ -770,19 +435,19 @@ function isBackendProgressMessage(text: string) {
     || normalized.startsWith("[agent status]");
 }
 
-function isRealtimeControlTool(name: string) {
-  return name === "wait_for_user" || name === "set_listening_mode";
+function isCoordinatorRealtimeTool(name: string) {
+  return name === "assistant_capability"
+    || name === "assistant_delegate_work"
+    || name === "assistant_task_status"
+    || name === "assistant_cancel_task";
 }
 
 function isAnswerBearingRealtimeTool(name: string) {
-  if (!name || isRealtimeControlTool(name)) return false;
-  return name === "background_agent"
-    || name === "delegate_parallel_tasks"
-    || name === "get_delegated_task_status"
-    || name === "cancel_delegated_task"
-    || name === "request_codex_image_generation"
-    || name === "knowledge_personal_recall"
-    || name.startsWith("knowledge_");
+  if (!name) return false;
+  return name === "assistant_capability"
+    || name === "assistant_delegate_work"
+    || name === "assistant_task_status"
+    || name === "assistant_cancel_task";
 }
 
 function realtimeFunctionCallName(item: JsonObject | undefined) {
@@ -796,34 +461,6 @@ function isAnswerBearingFunctionCallItem(item: JsonObject | undefined) {
 function isCodexFinalResultMessage(text: string) {
   const normalized = String(text || "").trim().toLowerCase();
   return normalized.startsWith("[codex task finished]") || normalized.startsWith("[agent task finished]");
-}
-
-function extractRealtimeText(value: unknown): string {
-  if (typeof value === "string") return value.trim();
-  const object = jsonObject(value);
-  if (!object) return "";
-  const direct = stringValue(object.output, object.output_text, object.text, object.transcript, object.delta);
-  if (direct) return direct;
-  const nestedItem = extractRealtimeText(object.item);
-  if (nestedItem) return nestedItem;
-  const content = Array.isArray(object.content) ? object.content : [];
-  return content
-    .map((entry) => extractRealtimeText(entry))
-    .filter(Boolean)
-    .join(" ")
-    .trim();
-}
-
-function appendHandoffText(existing: string, next: string) {
-  const clean = String(next || "")
-    .replace(/^\s*\[BACKEND\]\s*/i, "")
-    .replace(/^\s*\[Codex progress\]\s*/i, "")
-    .replace(/^\s*\[Codex status\]\s*/i, "")
-    .trim();
-  if (!clean) return existing;
-  if (!existing.trim()) return clean;
-  if (existing.includes(clean)) return existing;
-  return `${existing.trim()}\n\n${clean}`;
 }
 
 function compactRealtimeStatusText(text: string, maxLength = 900) {
@@ -852,58 +489,33 @@ function formatRealtimeElapsed(ms: number) {
   return minutes ? `${hours} hr ${minutes} min` : `${hours} hr`;
 }
 
-function isBackgroundAgentFinishedOutput(text: string) {
-  return /^background agent (finished|completed|failed)\b/i.test(String(text || "").trim());
-}
-
-function formatAgentResultForRealtime(output: string, agentLabel: string) {
-  const label = agentLabel.trim() || "Agent";
-  const cleanOutput = compactRealtimeStatusText(String(output || "").trim() || `${label} finished the task.`, 1_600);
-  return [
-    `Narrate this ${label} result to the user now.`,
-    "Keep it short and natural, usually one or two sentences.",
-    "Do not restate the user's question. Do not add extra commentary.",
-    "Do not mention hidden tools or internal routing.",
-    "",
-    cleanOutput
-  ].join("\n");
-}
-
 function delegatedTaskFunctionOutput(agentLabel: string) {
   const label = agentLabel.trim() || "Agent";
   return `${label} finished. The proxy will narrate the result separately.`;
 }
 
-function directSpeechInstructions(output: string, agentLabel: string) {
+function directSpeechInstructions(output: string, agentLabel: string, sourcePrompt = "") {
   const label = agentLabel.trim() || "OpenAssist";
-  const cleanOutput = compactRealtimeStatusText(String(output || "").trim() || `${label} finished the task.`, 1_600);
+  const cleanOutput = compactRealtimeStatusText(String(output || "").trim() || `${label} finished the task.`, 8_000);
+  const recap = sourcePrompt.trim();
   return [
     `Answer the user with this ${label} result now.`,
-    "Keep it short and natural, usually one or two sentences.",
-    "Do not restate the user's question. Do not add extra commentary.",
+    recap
+      ? "The user may have talked about other things while this task ran. Start with one very short clause naming what this answers, such as \"About the credit card reminders:\", then give the result. Do not repeat the full original request word for word."
+      : "Do not restate the user's question.",
+    "Keep it short, direct, and natural. Use more than two sentences only when the result needs it.",
+    "Do not add extra commentary.",
     "Do not mention hidden tools, internal routing, Spark, or source labels unless the result itself says to.",
     "Do not read markdown symbols, backticks, or brackets out loud.",
+    recap ? `The task this result answers: ${recap}` : "",
     "",
     cleanOutput
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function personalRecallAnswerFromResult(result: unknown) {
   const object = jsonObject(result);
   return stringValue(object?.spokenAnswer, object?.answer, object?.summary, object?.output, object?.text);
-}
-
-function personalRecallRunningDetail(argsOrPrompt?: JsonObject | string) {
-  const prompt = typeof argsOrPrompt === "string"
-    ? argsOrPrompt
-    : stringValue(argsOrPrompt?.query, argsOrPrompt?.question, argsOrPrompt?.prompt, argsOrPrompt?.text);
-  const normalized = normalizeRealtimeIntent(prompt);
-  const wantsMemory = /\b(memory|memories|saved)\b/.test(normalized);
-  const wantsChats = /\b(chat|chats|conversation|conversations|thread|threads|session|sessions|transcript|codex|claude|spark|gemini|recent|latest|yesterday|today)\b/.test(normalized);
-  if (wantsMemory && wantsChats) return "Checking memory and saved conversations.";
-  if (wantsChats) return "Checking saved conversations.";
-  if (wantsMemory) return "Checking memory.";
-  return "Checking saved context.";
 }
 
 function isFailedPersonalRecallResult(result: unknown) {
@@ -918,324 +530,18 @@ function knowledgeCompletionDetail(name: string, result: unknown) {
   return `Completed ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`;
 }
 
-function contextualizeRealtimeDelegationPrompt(prompt: string, lastDelegationPrompt: string) {
-  const repairedPrompt = repairRealtimeDelegationText(prompt);
-  const normalizedPrompt = normalizeRealtimeIntent(repairedPrompt);
-  const prior = lastDelegationPrompt.trim();
-  if (!prior || !isVagueRealtimeFollowupTask(normalizedPrompt)) return repairedPrompt;
-  return [
-    "Follow-up to the previous delegated task:",
-    prior,
-    "",
-    "New user request:",
-    repairedPrompt
-  ].join("\n");
+function localMCPMatches(result: unknown) {
+  const object = jsonObject(result);
+  return Array.isArray(object?.matches) ? object.matches.map(jsonObject).filter((match): match is JsonObject => Boolean(match)) : [];
 }
 
-type RealtimeDelegationOptions = {
-  blockRealtimeKnowledgeTasks?: boolean;
-  recentKnowledgePrompt?: string;
-};
-
-function shouldUseRecentKnowledgeContext(prompt: string, recentKnowledgePrompt: string) {
-  if (!recentKnowledgePrompt.trim()) return false;
-  const normalized = normalizeRealtimeIntent(prompt);
-  const asksForAnotherItem = /\b(add|create|put|schedule|move|update|remove)\b/.test(normalized)
-    && /\b(another|one|also|too|as well|next)\b/.test(normalized);
-  if (!asksForAnotherItem) return false;
-  // An explicit file, workflow, browser, or command request really belongs to
-  // an agent. A lone speech-to-text word such as "node" does not override the
-  // immediately preceding reminder or planner request.
-  return !/\b(workflow|n8n|code|codebase|repo|repository|file|folder|terminal|cli|browser|website|api|server|logs?)\b/.test(normalized);
-}
-
-function decideRealtimeDelegation(
-  prompt: string,
-  hasActiveHandoff: boolean,
-  lastDelegationPrompt = "",
-  options: RealtimeDelegationOptions = {}
-): DelegationDecision {
-  const knowledgeContext = shouldUseRecentKnowledgeContext(prompt, options.recentKnowledgePrompt || "")
-    ? options.recentKnowledgePrompt?.trim() || ""
-    : "";
-  const repairedPrompt = knowledgeContext
-    ? [
-      "Follow-up to the previous OpenAssist planner, note, or reminder request:",
-      knowledgeContext,
-      "",
-      "New user request:",
-      repairRealtimeDelegationText(prompt)
-    ].join("\n")
-    : contextualizeRealtimeDelegationPrompt(prompt, lastDelegationPrompt);
-  const normalizedPrompt = normalizeRealtimeIntent(repairedPrompt);
-	  const normalizedRawPrompt = normalizeRealtimeIntent(repairRealtimeDelegationText(prompt));
-	  const blockRealtimeKnowledgeTasks = options.blockRealtimeKnowledgeTasks !== false;
-	  const routeIntent = classifyVoiceRoute(prompt);
-	  const recallRoute = conversationRecallRoute(normalizedRawPrompt) !== "none"
-	    ? conversationRecallRoute(normalizedRawPrompt)
-	    : conversationRecallRoute(normalizedPrompt);
-
-  if (!normalizedPrompt) {
-    return {
-      allow: false,
-      output: "No clear task was heard. Wait for the user.",
-      createResponse: false,
-      reason: "empty prompt"
-    };
-	  }
-
-	  if (routeIntent.kind === "ignore") {
-	    return {
-	      allow: false,
-	      output: "The user did not give a new task. Wait for the next clear request.",
-	      createResponse: false,
-	      reason: routeIntent.reason
-	    };
-	  }
-
-	  if (recallRoute === "none" && isVagueRealtimeFollowupTask(normalizedRawPrompt) && !lastDelegationPrompt.trim()) {
-    return {
-      allow: false,
-      output: "This follow-up is too vague without a previous delegated task. Ask one short clarification question.",
-      createResponse: true,
-      reason: "vague follow-up"
-    };
-  }
-
-  if (isVagueRealtimeHelpRequest(normalizedRawPrompt) || isVagueRealtimeHelpRequest(normalizedPrompt)) {
-    return {
-      allow: false,
-      output: "The user is asking for help but has not given a task yet. Ask one short question, like: Sure, what do you need help with?",
-      createResponse: true,
-      reason: "vague help request"
-    };
-  }
-
-	  if (isShortAcknowledgement(normalizedPrompt)) {
-	    return {
-      allow: false,
-      output: "The user only acknowledged. Do not start the agent; wait for the next clear request.",
-      createResponse: false,
-      reason: "short acknowledgement"
-    };
-	  }
-
-	  if (routeIntent.kind === "control" || isStopOrDismissal(normalizedPrompt)) {
-	    return {
-      allow: false,
-      output: "The user dismissed the task. Do not start the agent.",
-      createResponse: true,
-      reason: "dismissal"
-    };
-  }
-
-  const asksWhereActiveTaskIs = /\bcheck\b.{0,40}\b(where|status|progress)\b/.test(normalizedRawPrompt)
-    || /\bwhere\b.{0,30}\b(it|that|task|agent|we)\b.{0,30}\b(at|now|status|progress)\b/.test(normalizedRawPrompt);
-  const requiresFreshExecution = requiresAgentExecution(normalizedRawPrompt);
-  if (!requiresFreshExecution && (asksWhereActiveTaskIs || isDelegatedStatusQuestion(normalizedRawPrompt) || isDelegatedStatusQuestion(normalizedPrompt))) {
-    return {
-      allow: false,
-      output: hasActiveHandoff
-        ? "The user is asking for the current delegated task status. Call get_delegated_task_status and answer from that result. Do not start a new background_agent task."
-        : "This is a status follow-up. Answer from the recent conversation or completed task state. Do not start a new background_agent task.",
-      createResponse: true,
-      reason: "delegated status question"
-    };
-  }
-
-  if (recallRoute !== "none") {
-    if (recallRoute === "current") {
-      return {
-        allow: false,
-        output: currentConversationRecallText(),
-        createResponse: true,
-        reason: "current conversation recall"
-      };
-    }
-    if (recallRoute === "clarify") {
-      return {
-        allow: false,
-        output: recallScopeClarificationText(),
-        createResponse: true,
-        reason: "ambiguous recall scope"
-      };
-    }
-    return {
-      allow: false,
-      output: "This is a personal recall question. Use knowledge_personal_recall if knowledge tools are available. Do not start background_agent or repeat the task unless the user explicitly asks to run it again.",
-      createResponse: true,
-      reason: "conversation recall"
-    };
-  }
-
-  if (looksLikeMissingReferenceFollowup(normalizedRawPrompt) || looksLikeMissingReferenceFollowup(normalizedPrompt)) {
-    return {
-      allow: false,
-      output: "There is not enough context to identify the exact item. Ask one short clarification question and do not start a background task yet.",
-      createResponse: true,
-      reason: "missing reference context"
-    };
-  }
-
-  if (lastDelegationPrompt.trim() && looksLikeExternalLookupTask(normalizedRawPrompt)) {
-    return {
-      allow: true,
-      prompt: repairedPrompt,
-      normalizedPrompt
-    };
-  }
-
-  const isNoteOrganizeTask = looksLikeNoteOrganizeTask(normalizedRawPrompt) || looksLikeNoteOrganizeTask(normalizedPrompt);
-  if (blockRealtimeKnowledgeTasks && !isNoteOrganizeTask && (looksLikeRealtimeKnowledgeTask(normalizedRawPrompt) || looksLikeRealtimeKnowledgeTask(normalizedPrompt))) {
-    return {
-      allow: false,
-      output: "This is an OpenAssist planner, backlog, notes, or journal request. Use the matching OpenAssist knowledge tool directly. Do not start background_agent.",
-      createResponse: true,
-      reason: "realtime knowledge tool"
-    };
-  }
-
-  if (hasActiveHandoff && shouldIgnoreBusyDelegationPrompt(repairedPrompt)) {
-    return {
-      allow: false,
-      output: "The agent is already working, and this was not a new clear task. Wait for the user.",
-      createResponse: false,
-      reason: "busy non-task"
-    };
-  }
-
-  if (isCasualRealtimeQuestion(normalizedPrompt)) {
-    return {
-      allow: false,
-      output: "This is a casual voice question. Answer it directly without starting the agent.",
-      createResponse: true,
-      reason: "casual question"
-    };
-  }
-
-  if (looksIncompleteForDelegation(repairedPrompt)) {
-    return {
-      allow: false,
-      output: "The user may still be speaking. Wait for the complete request.",
-      createResponse: false,
-      reason: "incomplete request"
-    };
-  }
-
-  if (!isNoteOrganizeTask && !looksLikeCodexTask(normalizedPrompt)) {
-    return {
-      allow: false,
-      output: "This is not a clear delegated task. Answer directly if helpful, otherwise wait.",
-      createResponse: true,
-      reason: "not a codex task"
-    };
-  }
-
-  return { allow: true, prompt: repairedPrompt, normalizedPrompt };
-}
-
-type RealtimeParallelTask = { prompt: string; provider?: string; project?: string };
-
-type ParallelDelegationRoute =
-  | { action: "proceed"; tasks: RealtimeParallelTask[] }
-  | { action: "image"; prompt: string; reason: string }
-  | { action: "recall"; query: string; reason: string }
-  | { action: "output"; output: string; reason: string };
-
-// delegate_parallel_tasks must not be an unguarded side door around the
-// background_agent router: a trigger-happy voice model (Gemini Live especially)
-// can wrap a memory question or a lone vague task in it. A single task goes
-// through the same router background_agent uses; a multi-task call where every
-// entry is really a recall question gets rerouted to personal recall.
-function routeParallelDelegation(
-  tasks: RealtimeParallelTask[],
-  hasActiveHandoff: boolean,
-  lastDelegationPrompt = "",
-  options: RealtimeDelegationOptions = {}
-): ParallelDelegationRoute {
-  if (!tasks.length) {
-    return { action: "output", output: "No tasks were provided. Ask the user what to run.", reason: "no tasks" };
-  }
-  if (tasks.length === 1) {
-    const prompt = tasks[0].prompt;
-    if (realtimePromptWantsImageGeneration(prompt)) {
-      return { action: "image", prompt, reason: "image generation" };
-    }
-    const decision = decideRealtimeDelegation(prompt, hasActiveHandoff, lastDelegationPrompt, options);
-    if (decision.allow) {
-      return { action: "proceed", tasks: [{ ...tasks[0], prompt: decision.prompt || prompt }] };
-    }
-    if (decision.reason === "conversation recall") {
-      return { action: "recall", query: prompt, reason: decision.reason };
-    }
-    return {
-      action: "output",
-      output: decision.output || "This is not a clear delegated task. Answer directly if helpful, otherwise wait.",
-      reason: decision.reason || "blocked"
-    };
-  }
-  const routes = tasks.map((task) => conversationRecallRoute(task.prompt));
-  if (routes.every((route) => route !== "none")) {
-    if (routes.includes("clarify")) {
-      return { action: "output", output: recallScopeClarificationText(), reason: "ambiguous recall scope" };
-    }
-    if (routes.every((route) => route === "current")) {
-      return { action: "output", output: currentConversationRecallText(), reason: "current conversation recall" };
-    }
-    return { action: "recall", query: tasks.map((task) => task.prompt).join("\n"), reason: "conversation recall" };
-  }
-  return { action: "proceed", tasks };
-}
-
-function isHighConfidenceRealtimeDelegation(prompt: string, _source: RealtimeDelegationRouteSource) {
-  const repairedPrompt = repairRealtimeDelegationText(prompt);
-  const normalized = normalizeRealtimeIntent(repairedPrompt);
+function isProgressOnlyAssistantReply(text: string) {
+  const normalized = normalizeRealtimeIntent(text);
   if (!normalized) return false;
-  if (isConversationRecallQuestion(normalized) || isCasualRealtimeQuestion(normalized) || isVagueRealtimeHelpRequest(normalized)) return false;
-  if (looksLikeMissingReferenceFollowup(normalized)) return false;
-  if (looksLikeNoteOrganizeTask(normalized)) return true;
-  if (requiresAgentExecution(normalized)) return true;
-  if (looksLikeRealtimeKnowledgeTask(normalized)) return false;
-  if (looksIncompleteForDelegation(repairedPrompt)) return false;
-  const actionPattern = /\b(add|fix|change|update|remove|delete|create|make|implement|wire|connect|hook|run|test|debug|install|start|build|open|check|inspect|search|find|read|review|summarize|organize|clean|cleanup|sort|schedule|reschedule|plan|write|edit|patch|verify|compare|clone|pull)\b/;
-  const toolContextPattern = /\b(codebase|repo|repository|file|folder|downloads|terminal|browser|chrome|brave|website|webpage|app|notes|today|tomorrow|yesterday|next week|this week|task|tasks|item|items|todo|to-do|reminder|backlog|planner|calendar|computer|desktop|screenshot|image|project|settings|config|server|build|test|bug|error)\b/;
-  return actionPattern.test(normalized) && toolContextPattern.test(normalized);
-}
-
-function routerConfidence(value: unknown) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Math.max(0, Math.min(1, number));
-}
-
-function routerDecisionName(value: unknown): RealtimeDelegationRouteDecision {
-  const decision = String(value || "").trim().toLowerCase();
-  return ["delegate", "answer_direct", "clarify", "ignore", "control"].includes(decision)
-    ? decision as RealtimeDelegationRouteDecision
-    : "answer_direct";
-}
-
-function routerFallbackDecision(source: RealtimeDelegationRouteSource, reason: string): DelegationDecision {
-  if (source === "auto_transcript") {
-    return {
-      allow: false,
-      output: "The voice router could not confirm this was a task. Wait for a clearer request.",
-      createResponse: false,
-      reason
-    };
-  }
-  return {
-    allow: false,
-    output: "This may not need the background agent. Answer directly from the conversation if possible, or ask one short clarification question.",
-    createResponse: true,
-    reason
-  };
-}
-
-function openAIRealtimeURL(model: string) {
-  const url = new URL("wss://api.openai.com/v1/realtime");
-  url.searchParams.set("model", model.trim() || defaultRealtimeModel);
-  return url.toString();
+  if (normalized.split(/\s+/).length > 28) return false;
+  return /^(okay|ok|sure|alright|all right|one moment|hold on|let me|i will|i'll|i am|i'm)\b/.test(normalized)
+    && /\b(check|look|search|find|read|pull|open|review|work|see)\b/.test(normalized)
+    && !/\b(found|here is|here's|the answer|you have|it says|according to)\b/.test(normalized);
 }
 
 function isGemini31LiveModel(model: string) {
@@ -1273,47 +579,20 @@ type RealtimeVoiceToolSpec = {
   description: string;
   parameters: JsonObject;
   geminiBehavior?: "NON_BLOCKING" | "BLOCKING";
+  capability?: {
+    operations?: CapabilityDescriptor["operations"];
+    source?: string;
+    sourceAliases?: string[];
+    keywords?: string[];
+    resourceKinds?: string[];
+    contextBindings?: CapabilityContextBinding[];
+    outputResources?: CapabilityOutputResourceMapping[];
+  };
 };
 
-const realtimeVoiceControlToolSpecs: RealtimeVoiceToolSpec[] = [
-  {
-    name: "wait_for_user",
-    description: "Call this when the latest audio should not receive a spoken response.",
-    parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
-  },
-  {
-    name: "set_listening_mode",
-    description: "Switch between normal listening and quiet mode.",
-    parameters: {
-      type: "object",
-      properties: {
-        mode: { type: "string", enum: ["quiet", "listening"] }
-      },
-      required: ["mode"],
-      additionalProperties: false
-    }
-  }
-];
-
-function realtimeBackgroundAgentToolSpec(agentLabel: string): RealtimeVoiceToolSpec {
-  return {
-    name: "background_agent",
-    description: `Hand coding, repository, terminal, browser, computer, or app tasks to ${agentLabel}. Can be called again while a previous task is still running — new clear tasks run side by side and each result is spoken when it finishes.`,
-    geminiBehavior: "NON_BLOCKING",
-    parameters: {
-      type: "object",
-      properties: {
-        prompt: { type: "string", description: `The exact task the user wants ${agentLabel} to perform.` },
-        project: { type: "string", description: "Optional existing OpenAssist project name or project ID for the new agent thread. If a new destination is needed, call knowledge_create_project first and pass its returned projectID here. Project folders cannot directly contain threads." }
-      },
-      required: ["prompt"],
-      additionalProperties: false
-    }
-  };
-}
-
-function delegatedTaskStartedText(_agentLabel: string) {
-  return "I'm checking that now. I'll let you know as soon as I have the answer.";
+function delegatedTaskStartedText(agentLabel: string) {
+  const label = agentLabel.trim() || "The agent";
+  return `${label} is still working on this. I will share the final answer automatically when it finishes.`;
 }
 
 const realtimeCodexImageGenerationToolSpec: RealtimeVoiceToolSpec = {
@@ -1342,66 +621,36 @@ const realtimeCodexImageGenerationToolSpec: RealtimeVoiceToolSpec = {
   }
 };
 
-function realtimeParallelDelegationToolSpec(agentLabel: string): RealtimeVoiceToolSpec {
-  return {
-    name: "delegate_parallel_tasks",
-    description:
-      `Hand TWO OR MORE separate tasks to ${agentLabel} so they run AT THE SAME TIME, each in its own chat. ` +
-      "Use this only when the user clearly asks for multiple distinct tasks at once (for example \"do A and B at the same time\"). " +
-      "For a single task use background_agent instead. " +
-      "Split the user's request into one entry per task. Set provider only if the user names a model for that task (for example claude, codex, copilot, antigravity, ollama); otherwise leave it empty to use the current assistant. " +
-      "Set project only if the user names a folder or project for that task; otherwise leave it empty to use the current project.",
-    geminiBehavior: "NON_BLOCKING",
+const realtimeLocalMCPToolSpecs: RealtimeVoiceToolSpec[] = [
+  {
+    name: "local_mcp_find_tools",
+    description: "Discover approved local MCP tools that may satisfy the user's external-service request. This is an internal agent step, not a user-facing result. Use the returned descriptions and schemas to decide what to call next.",
     parameters: {
       type: "object",
       properties: {
-        tasks: {
-          type: "array",
-          description: "The list of separate tasks to run in parallel. Provide at least two.",
-          minItems: 2,
-          items: {
-            type: "object",
-            properties: {
-              prompt: { type: "string", description: "The exact task to perform." },
-              provider: {
-                type: "string",
-                description: "Optional model/provider for this task: claude, codex, copilot, antigravity, or ollama. Leave empty to use the current assistant."
-              },
-              project: {
-                type: "string",
-                description: "Optional folder or project name for this task. Leave empty to use the current project."
-              }
-            },
-            required: ["prompt"],
-            additionalProperties: false
-          }
-        }
+        query: { type: "string", description: "The user's complete request, including IDs and the requested action." },
+        server: { type: "string", description: "Optional MCP server name when the user explicitly named it." },
+        limit: { type: "number", description: "Maximum candidate tools to return. Usually 3." }
       },
-      required: ["tasks"],
+      required: ["query"],
       additionalProperties: false
     }
-  };
-}
-
-function realtimeDelegatedStatusToolSpec(agentLabel: string): RealtimeVoiceToolSpec {
-  const label = agentLabel.trim() || "Agent";
-  return {
-    name: "get_delegated_task_status",
-    description: `Get the live status of the current delegated ${label} task, including the latest progress and active tool if available.`,
-    geminiBehavior: "BLOCKING",
-    parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
-  };
-}
-
-function realtimeDelegatedCancelToolSpec(agentLabel: string): RealtimeVoiceToolSpec {
-  const label = agentLabel.trim() || "Agent";
-  return {
-    name: "cancel_delegated_task",
-    description: `Cancel the newest running delegated ${label} task. Use this only when the user clearly asks to cancel agent work, not when they only want Live Voice or the microphone stopped.`,
-    geminiBehavior: "BLOCKING",
-    parameters: { type: "object", properties: {}, required: [], additionalProperties: false }
-  };
-}
+  },
+  {
+    name: "local_mcp_call",
+    description: "Run an approved local MCP tool selected through local_mcp_find_tools. Inspect the result, then either call another useful local tool, ask for a genuinely missing value, or answer the user. Read-only tools run immediately; writes require explicit confirmation.",
+    parameters: {
+      type: "object",
+      properties: {
+        toolID: { type: "string", description: "The exact toolID returned by local_mcp_find_tools." },
+        arguments: { type: "object", description: "Arguments required by the selected MCP tool.", additionalProperties: true },
+        confirmed: { type: "boolean", description: "True only after the user clearly confirmed a write action." }
+      },
+      required: ["toolID", "arguments"],
+      additionalProperties: false
+    }
+  }
+];
 
 const realtimeScopeTagsSchema: JsonObject = {
   type: "array",
@@ -1533,12 +782,33 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
     name: "knowledge_read",
     description: "Read the full markdown content of one note or item by its itemID. Use the id returned by knowledge_search. Required before organizing a note: you must read the full content first so you can compose exact replacement markdown.",
+    capability: {
+      source: "openassist_notes",
+      keywords: ["read selected active note full content summarize"],
+      resourceKinds: ["openassist_note"],
+      contextBindings: [{ resourceKind: "openassist_note", argument: "itemID", resourceField: "id" }]
+    },
     parameters: {
       type: "object",
       properties: {
         itemID: { type: "string" }
       },
       required: ["itemID"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "knowledge_today_tasks_combined",
+    description: "Read a task list for one day from the correct source. A generic 'my to-do list' request checks both OpenAssist Today and Apple Reminders and merges duplicates. If the user explicitly names OpenAssist or Apple Reminders, include only that source.",
+    parameters: {
+      type: "object",
+      properties: {
+        dayID: { type: "string" },
+        date: { type: "string" },
+        includeOpenAssist: { type: "boolean" },
+        includeAppleReminders: { type: "boolean" }
+      },
+      required: [],
       additionalProperties: false
     }
   },
@@ -1656,6 +926,11 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
     name: "knowledge_quick_save_note",
     description: "FAST PATH: save one piece of reference information or detailed checklist to an existing OpenAssist List/thread note. Use for facts, links, specs, dimensions, contacts, prices, fit checks, and other non-task information. Applies immediately only when the target note already exists; missing notes create a pending approval preview.",
+    capability: {
+      source: "openassist_notes",
+      resourceKinds: ["openassist_note"],
+      contextBindings: [{ resourceKind: "openassist_note", argument: "itemID", resourceField: "id" }]
+    },
     parameters: {
       type: "object",
       properties: {
@@ -1815,7 +1090,7 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   },
   {
     name: "knowledge_apple_add_reminder",
-    description: "Create a real Apple Reminders reminder on this Mac. Use only when the user explicitly asks for Apple Reminders or the Reminders app.",
+    description: "Create a real Apple Reminders reminder on this Mac. Use only when the user explicitly asks for Apple Reminders or the Reminders app. A recurring reminder requires a dueDate.",
     parameters: {
       type: "object",
       properties: {
@@ -1823,10 +1098,30 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
         notes: { type: "string" },
         dueDate: { type: "string" },
         calendar: { type: "string" },
-        list: { type: "string" }
+        list: { type: "string" },
+        recurrence: {
+          type: "object",
+          description: "Optional repeat rule. Requires dueDate.",
+          properties: {
+            frequency: { type: "string", enum: ["daily", "weekly", "monthly", "yearly"] },
+            interval: { type: "number", description: "Every N periods. Default 1." },
+            endDate: { type: "string", description: "ISO date when the series stops repeating." },
+            occurrenceCount: { type: "number", description: "Alternative to endDate: stop after N occurrences." }
+          },
+          required: ["frequency"],
+          additionalProperties: false
+        }
       },
       required: ["title"],
       additionalProperties: false
+    },
+    capability: {
+      resourceKinds: ["apple_reminder"],
+      outputResources: [{
+        resourceKind: "apple_reminder",
+        path: ["reminder"],
+        attributeFields: ["calendar", "completed", "dueDate"]
+      }]
     }
   },
   {
@@ -1843,11 +1138,85 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
       },
       required: [],
       additionalProperties: false
+    },
+    capability: {
+      resourceKinds: ["apple_reminder"],
+      outputResources: [{
+        resourceKind: "apple_reminder",
+        path: ["reminders"],
+        multiple: true,
+        attributeFields: ["calendar", "completed", "dueDate"]
+      }]
+    }
+  },
+  {
+    name: "knowledge_apple_search_reminders",
+    description: "Search real Apple Reminders on this Mac by title keywords across all lists, INCLUDING completed reminders by default. Use this to find a specific reminder and its id before updating, completing, or re-opening it. Never conclude a reminder does not exist from a limited list read.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Title keywords. Case-insensitive; every word must appear in the title." },
+        calendar: { type: "string", description: "Optional list name. Omit to search all lists." },
+        includeCompleted: { type: "boolean", description: "Default true." },
+        completedOnly: { type: "boolean" },
+        limit: { type: "number", description: "Default 25, max 100. totalMatches reports the pre-limit count." }
+      },
+      required: ["query"],
+      additionalProperties: false
+    },
+    capability: {
+      operations: ["search"],
+      resourceKinds: ["apple_reminder"],
+      outputResources: [{
+        resourceKind: "apple_reminder",
+        path: ["reminders"],
+        multiple: true,
+        attributeFields: ["calendar", "completed", "dueDate"]
+      }]
+    }
+  },
+  {
+    name: "knowledge_apple_update_reminder",
+    description: "Update the title, notes, due date, or repeat rule of a real Apple Reminder by ID. Use this for edits and renames; never use complete-reminder to rename an item. Can set, replace, extend (recurrence.endDate alone inherits the existing frequency), or clear (clearRecurrence) the repeat rule. Search reminders first if you need the ID.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+        notes: { type: "string" },
+        dueDate: { type: "string" },
+        clearNotes: { type: "boolean" },
+        clearDueDate: { type: "boolean" },
+        recurrence: {
+          type: "object",
+          description: "Repeat rule. Omitted fields inherit from the existing rule, so {endDate} alone extends a series.",
+          properties: {
+            frequency: { type: "string", enum: ["daily", "weekly", "monthly", "yearly"] },
+            interval: { type: "number" },
+            endDate: { type: "string" },
+            occurrenceCount: { type: "number" }
+          },
+          additionalProperties: false
+        },
+        clearRecurrence: { type: "boolean", description: "True removes the repeat rule." }
+      },
+      required: ["id"],
+      additionalProperties: false
+    },
+    capability: {
+      operations: ["update"],
+      resourceKinds: ["apple_reminder"],
+      contextBindings: [{ resourceKind: "apple_reminder", argument: "id", resourceField: "id" }],
+      outputResources: [{
+        resourceKind: "apple_reminder",
+        path: ["reminder"],
+        attributeFields: ["calendar", "completed", "dueDate"]
+      }]
     }
   },
   {
     name: "knowledge_apple_complete_reminder",
-    description: "Mark a real Apple Reminders reminder complete or incomplete by ID. List reminders first if you need the ID.",
+    description: "Mark a real Apple Reminders reminder complete or incomplete by ID. completed:false re-opens a completed reminder, clearing its completion date and keeping any repeat rule. Completing a recurring series head rolls it forward to the next occurrence (normal Apple behavior). Search reminders first if you need the ID.",
     parameters: {
       type: "object",
       properties: {
@@ -1856,6 +1225,15 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
       },
       required: ["id"],
       additionalProperties: false
+    },
+    capability: {
+      resourceKinds: ["apple_reminder"],
+      contextBindings: [{ resourceKind: "apple_reminder", argument: "id", resourceField: "id" }],
+      outputResources: [{
+        resourceKind: "apple_reminder",
+        path: ["reminder"],
+        attributeFields: ["calendar", "completed", "dueDate"]
+      }]
     }
   },
   {
@@ -1914,6 +1292,11 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
     name: "knowledge_request_reference",
     description: "Append small reference information (dimensions, links, specs, prices, addresses, contact info, model numbers, detailed checklists, or 'save this' facts) to an existing canonical note for a Planner List or thread. This is for additive information, fit checks, measurements, and checklist work, not top-level planner actions and not full-note reorganization. New Lists and new notes are never created silently; missing notes create a pending approval preview. For cleanup/restructure/rewrite, use knowledge_request_organize.",
+    capability: {
+      source: "openassist_notes",
+      resourceKinds: ["openassist_note"],
+      contextBindings: [{ resourceKind: "openassist_note", argument: "itemID", resourceField: "id" }]
+    },
     parameters: {
       type: "object",
       properties: {
@@ -1970,7 +1353,7 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   },
   {
     name: "knowledge_update_daily_item",
-    description: "Update an existing planner task by itemID or current task text. Use this for rename, category/list/section/tag/details/date changes. It replaces the matched old item instead of adding a duplicate. Use area/category for a Category such as Work; use listID/listName only for a real @List. If the user says an item is not for the current List and only gives a Category, set clearList=true. Keep task details short; move detailed specs/dimensions/checklists into a linked note and attach it with noteItemID/noteTitle/links. Call knowledge_daily_items first if unsure of the exact text.",
+    description: "Update an existing planner task by itemID or current task text. Use this for rename, category/list/section/tag/details/date changes. It replaces the matched old item instead of adding a duplicate. Use area/category for a Category such as Work; use listID/listName only for a real @List, not as the note name. If the user says an item is not for the current List and only gives a Category, set clearList=true. For reminder-only or done/not-done updates, send just the target plus reminderAt/checked — NEVER include area/category/listName on those calls; guessing one relocates the task. Keep task details short; move detailed specs/dimensions/checklists into a linked note and attach it with noteItemID/noteTitle/links. Call knowledge_daily_items first if unsure of the exact text.",
     parameters: {
       type: "object",
       properties: {
@@ -2043,6 +1426,11 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
     name: "knowledge_request_tasks_from_note",
     description: "Create a Review Inbox preview that turns a source note into multiple linked Backlog or planner-day tasks. Read the full note first, then call this with sourceItemID and proposed items. Default target is backlog unless the user gave a date. Do not claim tasks were created until approved.",
+    capability: {
+      source: "openassist_notes",
+      resourceKinds: ["openassist_note"],
+      contextBindings: [{ resourceKind: "openassist_note", argument: "sourceItemID", resourceField: "id" }]
+    },
     parameters: {
       type: "object",
       properties: {
@@ -2122,6 +1510,11 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
     name: "knowledge_note_style_guide",
     description: "Return the OpenAssist note formatting guide covering callout kinds (decision, warning, info, success, next, comment), collapsible sections, 2-column and 3-column table layouts, how to structure long multi-area reference notes, and when not to use rich blocks. Call this before organizing/restructuring/replacing a note so you produce exact replacement markdown with correct OpenAssist syntax.",
+    capability: {
+      source: "openassist_note_formatting",
+      sourceAliases: ["note formatting", "note style guide"],
+      keywords: ["format syntax callouts columns organize restructure"]
+    },
     parameters: {
       type: "object",
       properties: {},
@@ -2132,6 +1525,11 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   {
     name: "knowledge_request_organize",
     description: "Request a full-note organization/restructure/rewrite preview. OpenAssist notes are NOT append-only: this tool safely replaces the note body after approval, without duplicating content. You MUST supply itemID and the full replacement markdown containing everything that should remain. Pattern: (1) find/read the note with knowledge_search/knowledge_read, (2) call knowledge_note_style_guide, (3) produce exact replacement markdown using OpenAssist blocks, (4) call this tool with itemID + markdown. Then tell the user it is ready for approval. Do not answer that the MCP cannot reorganize a note.",
+    capability: {
+      source: "openassist_notes",
+      resourceKinds: ["openassist_note"],
+      contextBindings: [{ resourceKind: "openassist_note", argument: "itemID", resourceField: "id" }]
+    },
     parameters: {
       type: "object",
       properties: {
@@ -2147,15 +1545,134 @@ const realtimeVoiceKnowledgeToolSpecs: RealtimeVoiceToolSpec[] = [
   }
 ];
 
-function realtimeVoiceToolSpecs(knowledgeEnabled: boolean, agentLabel: string) {
-	  return [
-	    ...realtimeVoiceControlToolSpecs,
-	    realtimeDelegatedStatusToolSpec(agentLabel),
-	    realtimeDelegatedCancelToolSpec(agentLabel),
-	    realtimeCodexImageGenerationToolSpec,
-	    realtimeBackgroundAgentToolSpec(agentLabel),
-    realtimeParallelDelegationToolSpec(agentLabel),
-    ...(knowledgeEnabled ? realtimeVoiceKnowledgeToolSpecs : [])
+function knowledgeCapabilityOperations(name: string): CapabilityDescriptor["operations"] {
+  if (/carry_forward|move_to_backlog|\bmove\b/.test(name)) return ["move"];
+  if (/delete|remove/.test(name)) return ["delete"];
+  if (/complete/.test(name)) return ["complete"];
+  if (/update|organize|apply_approval/.test(name)) return ["update"];
+  if (/add|create|quick_save|request_(daily|backlog|reference|tasks_from_note)/.test(name)) return ["create"];
+  if (/search/.test(name)) return ["search"];
+  return ["read"];
+}
+
+function knowledgeCapabilityRisk(name: string): CapabilityDescriptor["risk"] {
+  if (
+    /delete|organize|apply_approval|request_tasks_from_note|request_move_to_backlog|request_carry_forward|apple_(add|update|complete)|connector_sync/.test(name)
+  ) return "sensitive_write";
+  if (knowledgeCapabilityOperations(name).some((operation) => ["create", "update", "move", "complete", "delete"].includes(operation))) {
+    return "reversible_write";
+  }
+  return "read";
+}
+
+function knowledgeCapabilitySource(name: string) {
+  if (name === "knowledge_personal_recall") return "personal_memory";
+  if (name === "knowledge_today_tasks_combined") return "aggregated_tasks";
+  if (name.startsWith("knowledge_apple_")) return name.includes("event") ? "apple_calendar" : "apple_reminders";
+  if (name.includes("connector")) return "connected_sources";
+  if (name.includes("note") || name.includes("reference") || name.includes("organize")) return "openassist_notes";
+  if (name.includes("planner") || name.includes("daily") || name.includes("today") || name.includes("backlog") || name.includes("task")) {
+    return "openassist_planner";
+  }
+  if (name.includes("project")) return "openassist_projects";
+  return "openassist";
+}
+
+function liveVoiceCapabilityDescriptors(configProvider: () => RealtimeProxyConfig): CapabilityDescriptor[] {
+  const knowledge = realtimeVoiceKnowledgeToolSpecs.map((spec): CapabilityDescriptor => {
+    const source = spec.capability?.source ?? knowledgeCapabilitySource(spec.name);
+    return {
+      id: spec.name,
+      description: spec.description,
+      operations: spec.capability?.operations ?? knowledgeCapabilityOperations(spec.name),
+      source,
+      sourceAliases: spec.capability?.sourceAliases ?? (source === "personal_memory"
+        ? ["memory", "past work", "codex memory", "claude memory", "previous chats"]
+        : source === "aggregated_tasks"
+          ? ["tasks", "todo", "to do", "reminders"]
+          : source === "openassist_planner"
+            ? ["openassist", "today", "planner", "backlog"]
+            : source === "openassist_notes"
+              ? ["openassist", "notes", "note"]
+              : source === "apple_reminders"
+                ? ["apple reminders", "reminders app"]
+              : source === "apple_calendar"
+                ? ["apple calendar", "calendar app"]
+                : [source.replace(/_/g, " ")]),
+      keywords: [spec.name.replace(/^knowledge_/, "").replace(/_/g, " "), ...(spec.capability?.keywords ?? [])],
+      resourceKinds: spec.capability?.resourceKinds,
+      contextBindings: spec.capability?.contextBindings,
+      outputResources: spec.capability?.outputResources,
+      inputSchema: spec.parameters,
+      risk: knowledgeCapabilityRisk(spec.name),
+      executionMode: "blocking",
+      timeoutMs: spec.name === "knowledge_personal_recall" ? 45_000 : 20_000,
+      idempotency: knowledgeCapabilityRisk(spec.name) === "read" ? "turn" : "required",
+      permissionRequirements: source === "apple_reminders"
+        ? [{ permissionID: "eventkit.reminders", access: knowledgeCapabilityRisk(spec.name) === "read" ? "read" : "write" }]
+        : source === "apple_calendar"
+          ? [{ permissionID: "eventkit.calendar", access: knowledgeCapabilityRisk(spec.name) === "read" ? "read" : "write" }]
+          : undefined,
+      enabled: () => Boolean(configProvider().knowledge?.enabled)
+    };
+  });
+  return [
+    {
+      id: "current_conversation",
+      description: "Answer a question about what the user or assistant said in the current Live Voice conversation.",
+      operations: ["read"],
+      source: "current_conversation",
+      sourceAliases: ["this conversation", "current chat", "what you just said"],
+      keywords: ["earlier", "before", "just said", "last answer", "current conversation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      risk: "read",
+      executionMode: "blocking",
+      timeoutMs: 2_000,
+      idempotency: "turn"
+    },
+    ...knowledge,
+    {
+      id: "local_mcp_discover",
+      description: "Discover exact local MCP tools for a request. Discovery is an internal step and cannot be the final answer.",
+      operations: ["discover", "search"],
+      source: "local_mcp",
+      sourceAliases: ["mcp", "local tools", "connected tool"],
+      keywords: ["service", "work item", "external system", "mcp tool"],
+      inputSchema: realtimeLocalMCPToolSpecs[0].parameters,
+      risk: "read",
+      executionMode: "blocking",
+      timeoutMs: 15_000,
+      idempotency: "turn",
+      enabled: () => Boolean(configProvider().localMCP?.enabled)
+    },
+    {
+      id: "local_mcp_execute",
+      description: "Execute one exact local MCP tool selected from local_mcp_discover.",
+      operations: ["read", "create", "update", "execute"],
+      source: "local_mcp",
+      sourceAliases: ["mcp", "local tools", "connected tool"],
+      keywords: ["run tool", "call tool", "external system"],
+      inputSchema: realtimeLocalMCPToolSpecs[1].parameters,
+      risk: "reversible_write",
+      executionMode: "blocking",
+      timeoutMs: 30_000,
+      idempotency: "required",
+      enabled: () => Boolean(configProvider().localMCP?.enabled)
+    },
+    {
+      id: "codex_image_generation",
+      description: "Create or edit an image through the hidden Codex image worker.",
+      operations: ["create", "update", "execute"],
+      source: "codex_image",
+      sourceAliases: ["image", "codex image", "image generation"],
+      keywords: ["photo", "poster", "banner", "logo", "graphic", "mockup", "edit image"],
+      inputSchema: realtimeCodexImageGenerationToolSpec.parameters,
+      risk: "reversible_write",
+      executionMode: "blocking",
+      timeoutMs: 120_000,
+      idempotency: "required",
+      enabled: () => Boolean(configProvider().codexImageGeneration)
+    }
   ];
 }
 
@@ -2181,7 +1698,7 @@ function geminiSchemaFromJSONSchema(schema: unknown): unknown {
   for (const [key, value] of Object.entries(object)) {
     if (key === "additionalProperties") continue;
     // The Live API schema parser is stricter than JSON Schema; size constraints
-    // are enforced at runtime in routeParallelDelegation instead.
+    // are enforced by the coordinator and capability executor.
     if (key === "minItems" || key === "maxItems") continue;
     if (key === "type" && typeof value === "string") {
       schemaType = value.toUpperCase();
@@ -2217,136 +1734,67 @@ function geminiFunctionDeclaration(spec: RealtimeVoiceToolSpec): JsonObject {
   };
 }
 
-function realtimeInstructions(codexInstructions: string, knowledgeEnabled: boolean, agentLabel: string) {
+function coordinatorRealtimeInstructions(codexInstructions: string, agentLabel: string, backgroundWorkContext = "") {
   const label = agentLabel.trim() || "Agent";
   return [
-    "# Role and Objective",
-    "You are the realtime voice layer inside OpenAssist.",
-    `Messages from ${label} are authoritative. Present the system as one OpenAssist assistant.`,
+    "# Role",
+    "You are OpenAssist's live personal assistant. Speak brief, natural English.",
+    "Answer ordinary conversation directly. Use a tool only when the request needs personal data, local tools, saved work, an image, or real execution.",
+    "Never guess a tool result or claim work succeeded before the result says it did.",
     "",
     realtimeLocalTimeInstruction(),
     "",
-    "# Voice Style",
-    "Always speak English. Even if the audio is unclear, noisy, or sounds like another language, reply in English unless the user clearly asks you to switch languages.",
-    "Speak naturally, briefly, and clearly.",
-    "For casual questions, answer directly in one or two short sentences.",
-    "Do not read markdown symbols, XML tags, diffs, or asterisks out loud.",
+    "# One coordinator",
+    "You have exactly four OpenAssist tools. Do not invent other tool names.",
+    "Use assistant_capability for OpenAssist notes, planner, projects, general to-do questions, Apple data, personal recall, local MCP services, and Codex image generation.",
+    "Use assistant_delegate_work for current web research and genuine agent work such as code, terminal, browser, Computer Use, file editing, or Codex skills.",
+    "For every delegated task, supply an executionProfile from the meaning and risk of the request. Use simple/read_only/normal unless the work clearly needs more. Use complex for multi-part or difficult work, high stakes for decisions where a wrong answer could seriously harm the user, and sensitive_write for consequential or hard-to-reverse changes.",
+    "Delegated work continues in one shared worker thread for this session, so the worker remembers earlier tasks. For a follow-up on earlier delegated work, just delegate the follow-up; do not repeat the whole history. Set freshThread=true only when the user explicitly asks to start over or start a new thread.",
+    "Set modelPreference to spark or sol only when the user explicitly names that model. Never choose a named model on the user's behalf.",
+    "Use assistant_task_status for pending work and assistant_cancel_task only after explicit cancel language.",
+    "Background task state is authoritative coordinator data, not conversation memory. Before answering whether delegated work is done, still running, waiting, failed, or has findings, call assistant_task_status. Never infer completion from progress text.",
+    "Only completed, failed, or cancelled is terminal. Running and queued always mean the work is not done.",
+    "Never delegate when a direct capability can do the request unless the user explicitly names a worker or provider.",
     "",
-    "# Listening Control",
-    "If the user only says stop, stop talking, stop speaking, wait, or hold on, stop the current spoken response and keep listening. Do not enter quiet mode for those interruption phrases.",
-    "Only if the user clearly asks you to stop listening, mute the microphone, pause listening, go quiet, or pause Live Voice, call set_listening_mode with mode quiet.",
-    "If the user asks you to start listening again, resume listening, or says they are back after quiet mode, call set_listening_mode with mode listening.",
+    "# Capability selection",
+    "Pass the user's complete goal and operation to assistant_capability. Include sourceHints only for sources the user named.",
+    "If the result is selection_required, inspect the candidates and call assistant_capability again with exactly one capabilityID. Candidate counts or candidate lists are private working context, never the final answer.",
+    "If assistant_capability returns permission_required, tell the user the exact permission action. Do not delegate the same request, switch sources, or claim that the action succeeded.",
+    "A failed direct capability is the final state for that source. Never switch to Codex, Computer Use, another provider, or another data source unless the user explicitly asks for that change.",
+    "If the result is clarification_required, ask exactly one short question for the missing detail.",
+    "If the result is approval_required, briefly describe the exact change and ask for confirmation. Reuse its confirmationToken only after a clear yes.",
+    "After completed or failed, answer once from that exact result. Do not switch source, provider, worker, or tool after a failure.",
+    "Capability results may include typed resources with stable IDs. Keep those IDs across follow-up turns and use the exact matching resource ID for an update, move, complete, or delete. Never replace one operation with a different write operation.",
+    "Never say you will retry or apply a change unless the matching write capability returns completed in that turn.",
     "",
-    "# Silence and Background Audio",
-    "If the latest audio is silence, background noise, speaker echo, a side conversation, or speech not addressed to OpenAssist, call wait_for_user.",
-    "Do not respond conversationally after calling wait_for_user.",
+    "# Source rules",
+    "For a general to-do question, use the aggregated task capability so enabled task sources are labeled. If the user names one source, use only that source.",
+    "For saved memory or past-agent questions, use personal recall. It searches memory first and sessions second. Do not replace a failed recall with another search or a worker.",
+    "For local MCP work, discovery is only an internal step. Select and execute the exact returned tool before answering.",
+    "For image requests, use the Codex image capability. Do not delegate image generation.",
     "",
-    "# Unclear Audio",
-    "Only act on clear audio or text.",
-    "If the user's audio is unclear, ask one short clarification question.",
-    "Do not call tools, guess codebase details, or give a preamble when the audio is unclear.",
-    "",
-	    "# Tools",
-	    "Never answer from guesswork when a tool will provide the answer. When you decide to call a tool, call it immediately WITHOUT speaking first — anything spoken in the same turn as a tool call is cut off. Stay silent while the tool runs, then answer once from the tool result.",
-	    "Never claim there are no tasks, notes, emails, results, or pending items before a tool result confirms it. Saying \"no\" and then checking is wrong; check first, then answer.",
-	    "Use direct OpenAssist knowledge tools before calling background_agent.",
-	    "For image/photo/logo/poster/banner/mockup/graphic generation or edits, call request_codex_image_generation. Do not call background_agent for image generation.",
-	    "Call request_codex_image_generation without speaking first; when the tool result arrives, tell the user briefly that Codex is generating it.",
-	    "Use knowledge_personal_recall only when the user clearly asks about saved memory, previous chats, past work, earlier decisions/plans, or what Codex/Claude/Spark/Gemini previously said or found. The user does not need to say 'check Codex thread' when the intent is clearly recall.",
-    "Do not use knowledge_personal_recall for new/current work, online/web/public-data checks, browsing, files, planner edits, or vague 'check it' follow-ups. Use the correct direct tool or background_agent for those.",
-	    `If the user asks for status, progress, why the task is stuck, what ${label} is doing, or where the delegated task is at, call get_delegated_task_status and answer from that result.`,
-	    `If the user clearly asks to cancel or stop delegated agent work, call cancel_delegated_task. Stopping Live Voice or the microphone must not cancel delegated work.`,
-    "Do not call background_agent for status checks about the task that is already running.",
-	    "Call background_agent immediately without a spoken preamble. After it starts, acknowledge it once in natural language without naming the worker unless the user asks.",
-    "If the user request is agentic and no direct realtime tool can handle it, call background_agent instead of doing it yourself.",
-    "If the user clearly asks for TWO OR MORE separate tasks to run at the same time (for example \"do A and B at the same time\", \"run these in parallel\", or two clearly different jobs in one breath), call delegate_parallel_tasks with one entry per task instead of background_agent. Use background_agent for a single task.",
-    "When using delegate_parallel_tasks, only set a task's provider if the user names a model for that specific task (claude, codex, copilot, antigravity, ollama), and only set a task's project if the user names a folder or project for it; otherwise leave them empty.",
-    "After calling delegate_parallel_tasks, say one short preamble like \"Starting both now\" and then stay quiet. Each task will report its own result when it finishes; speak each result as it arrives, one at a time, without interrupting yourself.",
-    "Agentic means the request needs tools, files, code changes, terminal commands, browser/computer use, website/app inspection, account data, current/live information, or multi-step work.",
-	    "For coding, codebase, repo, app, terminal, debugging, install, file, browser, computer, desktop app, website, current/live data, or configuration work, call background_agent with the user's exact request.",
-	    "When delegated work belongs in a specific sidebar Project, pass its exact name or projectID to background_agent. If no existing project fits, suggest one and use knowledge_create_project after user confirmation, then pass the returned projectID. Never silently use the current project when the requested destination is missing.",
-    `Only call background_agent when the user gives a clear task that needs ${label} or provider tools.`,
-    "If the user asks what happened in the previous or last turn, whether you already found/did/checked something, or what the previous result was, answer from the conversation context. Do not call background_agent unless the user clearly asks you to run/check/search again.",
-    "Do not call background_agent while the user sounds mid-sentence, is pausing, or has only said the first part of a longer task.",
-    "If the request starts like a fragment, for example \"if...\", \"when...\", \"and...\", or \"also...\", call wait_for_user and wait for the complete request.",
-    "Follow-up task requests like \"check it for yesterday\" or \"do the same for yesterday\" should call background_agent using the recent delegated task as context.",
-    "If the user only says ok, yes, no, mhm, hmm, thanks, or another short acknowledgement, do not call background_agent.",
-    `If ${label} is already working and the user gives a tiny acknowledgement or vague follow-up, do not start a new background_agent task.`,
-    `After calling background_agent, stay quiet about task progress and wait for the final ${label} result before giving task details.`,
-    `OpenAssist hides ${label} progress from the model conversation. Do not guess, summarize, or invent task progress.`,
-    `While ${label} is working, keep listening and keep helping like a personal assistant. Answer direct questions, and if the user gives ANOTHER clear task, call background_agent again — tasks run side by side.`,
-    "When several tasks are running, results arrive one at a time in the order they finish. Speak only the result that just arrived, name which task it belongs to, and never mix it with other tasks or re-summarize earlier results.",
-    "Do not guess or report on tasks that have not finished; if asked about them, use get_delegated_task_status.",
-    "Delegated task results are narrated by OpenAssist with per-response instructions. Use only the narrated result and do not add new facts.",
-    "Do not invent codebase details.",
-    knowledgeEnabled
-      ? [
-        "",
-        "# OpenAssist Knowledge",
-	      "For quick questions about the user's notes, Today planner, Backlog, journal, or open tasks, use the knowledge tools.",
-	      "Use knowledge tools only when the user asks for personal OpenAssist knowledge. Do not read all notes into the voice prompt.",
-		      "For connected Gmail/Google/Messages data, call knowledge_connector_status first. If the user asks to find/show/search for a specific email or email type, call knowledge_connector_search_gmail with a narrow query and do not sync Review Inbox. If the user asks to check iMessage, Messages, texts, or SMS for a person, appointment, or follow-up, call knowledge_connector_search_messages with a narrow query and do not ask what they mean by Messages. If the user asks for Gmail to-dos, backlog items, follow-ups, waiting-for items, or task candidates, call knowledge_connector_sync_gmail with userIntent set to the user's exact request. Do not fetch full email bodies or ask for all mail in realtime.",
-      "For greetings and small talk like 'hello', 'hi', 'hey', 'ei', 'how are you', or 'good morning', just reply naturally in one short sentence. Do NOT call knowledge_daily_items or any tool for a greeting.",
-      "Only call a knowledge tool when the user actually asks about their tasks, notes, planner, backlog, or journal. A greeting alone is not such a request.",
-      "For questions like 'what's on today', 'today's plan', 'today's list', or 'today's note', call knowledge_read_today first so you see the full planner markdown, including free-text lines. ALWAYS pass the Selected planner day ID from your context as the `dayID` argument so you read the exact note the user is viewing. If you omit it, you might read the wrong day.",
-      "Use knowledge_daily_items for structured checkbox/planner items with categories, lists, and tags. If it returns no structured items but freeTextItems or noteMarkdown is present, read those and report them. Never tell the user today is empty based only on an empty knowledge_daily_items result.",
-      "Use knowledge_open_tasks for unfinished checkbox tasks across notes and planner days.",
-	      "Use knowledge_backlog_items for backlog or later/follow-up questions.",
-		      "Use knowledge_planner_categories or knowledge_planner_lists to see available Categories and Lists before assigning them when the user has not named an exact match.",
-		      "Use knowledge_list_projects to inspect the sidebar Projects and folders before choosing where a new note, chat, or delegated task belongs. If no existing project fits, suggest one short project name and, when useful, one parent folder. Ask for confirmation unless the user already explicitly asked you to create it.",
-		      "After the user requests or confirms the new destination, call knowledge_create_project with confirmed=true. A folder cannot hold notes or chats by itself, so create or choose a project inside it, then use the returned projectID for the note or task. Never silently fall back to an unrelated existing project.",
-		      "For clear memory/history questions like 'when did we', 'where did I mention', 'what did we decide', 'what did Codex or Claude say', 'did we work on anything for Quality Nails', or 'find the earlier discussion', call knowledge_personal_recall. It searches the right saved memory/chat/session sources automatically, including Codex and Claude Code. Do not make the user ask for a specific Codex thread. Do not call background_agent for clear recall.",
-	      "When the user names a project, pass its exact projectName or projectID. When they say this project or this conversation, OpenAssist applies the selected context. Never broaden a project-scoped recall to unrelated projects; ask one short question when the project is missing or unclear.",
-	      "If the user asks to check/search something now, check online, browse a site, inspect files, update tasks/notes, or use an agent/tool for a new task, do not call knowledge_personal_recall.",
-	      "When a request requires real execution with an agent, computer, external tool, CLI, app, service, logs, database, build, test, or repository, call background_agent with the full request. Do not use personal recall and do not pretend the work was done. Acknowledge the start once, stay conversational while it runs, then answer only from the final result.",
-	      "If the user asks to add a reminder, task, or to-do in OpenAssist, treat it as an OpenAssist planner item, not as Apple Calendar or Apple Reminders. For simple adds, use knowledge_quick_add_task first. By default it goes to the Backlog: only set `when` to a planner day when the user explicitly names a date or says today, tonight, tomorrow, or a specific weekday. If they give an alert time, set `reminderAt` as an ISO datetime and `reminderTimezone` when known; do not store the reminder time only as plain details. If they just say 'add X' or 'add X to @List' with no timing, leave `when` empty or set it to backlog.",
-	      "Reference info is NOT a task: measurements/dimensions, links/URLs, model or SKU numbers, prices, addresses, phone/email, specs, product details, realtor info, and 'save this' facts must go to the existing List/thread reference note with knowledge_quick_save_note or knowledge_request_reference, not Today or Backlog. Reference captures apply immediately only when the target note already exists.",
-	      "Actions are tasks: buy, order, research, decide, schedule, call, message, finish, follow up, or fix. Use knowledge_quick_add_task for a single action. Date-less actions go to Backlog; dated actions go to the named day.",
-	      "Before saving reference info, reuse the existing List/thread note. New Lists and new notes are never created silently: call knowledge_plan_write for uncertain cases, and if the router says approval is required, tell the user the pending preview needs approval.",
-	      "When the live context includes an Active source note itemID and the user says this note, that note, the note, add that as well, save that there, or append to it, pass that exact itemID to knowledge_quick_save_note or knowledge_request_reference. This is an update to the selected note, never a request to create another note with the same title.",
-	      "Call knowledge_plan_write before ambiguous adds/edits, mixed task/reference requests, unknown Lists, possible duplicate/update cases, or anything that might need a new note/List.",
-	      "If the user gives both an action and a fact, handle both intelligently: create the action task and save the concrete reference facts to the note. Example: 'buy a 57 inch TV for @New Home Stuff' is a Backlog task plus a 57 inch TV reference.",
-	      "Planner items are lightweight execution pointers: what to do, when/where, and a few high-level steps. Notes hold detailed working material such as specs, dimensions, copied source content, and long checklists. Example: 'go to Maryland Ave tomorrow and check TV/laundry fit' is one short Tomorrow task linked to New Home Stuff; the TV dimensions, LG WashCombo dimensions, and measurement checklist belong inside the linked note.",
-	      "If a task should refer to a note, attach it with noteItemID, noteTitle, or links on knowledge_quick_add_task, knowledge_request_daily_item, knowledge_request_backlog_item, or knowledge_update_daily_item. Use listName only for a real planner List, not as the note name. Keep details/detailsMarkdown short and never paste the full note body into the task.",
-	      "If reference-vs-action is ambiguous or the user only gives a #Category without a clear @List/thread/note, ask one short clarification instead of guessing.",
-	      "When you create a Today item, put it under the right category heading by setting area/category when the user gives or implies one.",
-	      "Use knowledge_quick_add_task for simple Today/Backlog/date adds. Use knowledge_request_daily_item or knowledge_request_backlog_item only when you need the fuller schema. For date-less ACTIONS, including plain actionable captures aimed at a specific @List, default to Backlog. Reference captures use knowledge_quick_save_note or knowledge_request_reference; they apply immediately only for existing notes and otherwise create a pending approval preview. Never silently add a date-less task to Today. Do not also add Today items to Backlog.",
-	      "When the user asks to create tasks from a note, split a note into tasks, or do sprint planning from a note, first find/read the full source note with knowledge_search/knowledge_read, then call knowledge_request_tasks_from_note with sourceItemID and proposed items. Default to target backlog unless the user gives a date. This creates a Review Inbox preview; do not claim tasks were created until approved.",
-	      "If the user asks to change, rename, move, recategorize, or add details to an existing planner item, use knowledge_update_daily_item with itemID or the current task text in query. Do not use knowledge_request_daily_item for edits, because that creates a duplicate. When replacing task details, set detailsMode='replace' or replaceDetails=true; append only when the user explicitly asks to add a small note. If they say it is not for the current @List and only name a Category such as Work, set area/category and clearList=true.",
-	      "When the user only asks to set/change a reminder or to complete/uncomplete a task, call knowledge_update_daily_item with ONLY itemID or query plus the reminder or checked fields. NEVER include area/category/listName on those calls — guessing a category there moves the task to another section.",
-	      "If the user asks for subtasks, sub-items, sub-checkboxes, or a checklist UNDER an existing task, put them in the `steps` array of knowledge_update_daily_item (one short step per entry, e.g. steps: [{\"text\": \"Costco delivery 11a-2p\"}]). Steps render as checkboxes under the task. Do NOT write subtasks into detailsMarkdown — details are plain text, not checkboxes. When converting existing details into steps, also set detailsMode='replace' with a shorter detailsMarkdown (or empty) so the same content is not duplicated in both places.",
-	      "When you create a Today or Backlog item, use Category -> List -> Section -> Item. The inline shorthand is #Category and @List. If only @List is used, use that List's default Category. Explicit #Category wins. Work, Personal, Business, and Home are Categories, not Lists. Set area/category, listID or listName, section, and tags when the user gives them. If the user names a project/context phrase but not an exact List, call knowledge_planner_lists; if no exact match is clear, omit the List or ask one short clarification. Do not use broad note history to guess the List.",
-	      "Use tags only for cross-category filters such as Shopping, Errands, Waiting For, or Follow-up.",
-	      "Do not assume business-related tasks are Work if a Business category exists; use Business only when knowledge_planner_categories shows it, otherwise ask or omit area.",
-	      "If the user says a task is done, finished, or completed, call knowledge_complete_daily_item with the task text. It is applied immediately, so say it was marked done.",
-	      "To move unfinished or older planner tasks into the Backlog, use knowledge_request_move_to_backlog.",
-	      "To move unfinished tasks from one planner day to another planner day, use knowledge_request_carry_forward.",
-	      "For organizing, correcting, or changing planner content, use knowledge_request_carry_forward or a direct knowledge request only when the source, target, and exact preview are clear; otherwise ask a short question or call background_agent for complex work.",
-	      "OpenAssist notes are not append-only. Use knowledge_quick_save_note/knowledge_request_reference only for small additive reference captures. For reorganize, restructure, cleanup, rewrite, formatting, or make-it-easier-to-scan requests, the safe path is a full replacement approval preview with knowledge_request_organize after reading the note and calling knowledge_note_style_guide.",
-	      `For substantial note organization, restructuring, cleanup, rewriting, or styling requests, call background_agent with the user's exact request so ${label} can read the full note, use OpenAssist note style tools, and create that approval preview. Do not try to do heavy note rewriting in realtime voice, and do not say the MCP can only append.`,
-	      "Use realtime knowledge tools for quick note reads/searches, reference captures, small exact note edits, simple Today/Backlog adds, small tasks-from-note previews, planner item updates, mark-done actions, and planner moves. Delegate full-note organization/restructure/cleanup tasks or large sprint-planning notes.",
-	      "Do not claim a note was organized, changed, or updated until a tool or delegated agent result confirms an approval preview was created.",
-	      "knowledge_request_organize creates a full-note replacement preview that needs the user's approval. After calling it, tell the user the organized version is ready for approval and can be applied in Review Inbox or through knowledge_apply_approval after listing it with knowledge_list_approvals. Do not claim the note was already changed.",
-		      "If background_agent is handling organize, stay quiet until OpenAssist narrates the final result. If the result says a preview is pending, tell the user it is ready for approval in Review Inbox.",
-	      "OpenAssist notes support rich blocks: callouts (::: decision, ::: warning, ::: info, ::: success, ::: next, ::: comment), collapsible sections (## Area <!-- oa:collapsible -->), and 2/3-column table layouts. Always use knowledge_note_style_guide before writing organized markdown so the output uses valid OpenAssist syntax.",
-	      "When a reference note covers multiple areas/items (specs, checklists, option comparisons, on-site references), keep it scannable: short intro and a clear heading per area, then prefer 2/3-column layouts to use horizontal space (compare options side by side, or put saved facts next to the fit/decision fields), the interactive checklist at full width, and derived fields (max-that-fits, final yes/no) in a short decision block. Do not put checkbox items inside table cells. For values the user fills in on-site, use an empty 'Actual'/'Value' table cell (tap to type) and checkboxes for yes/no instead of inline '____' blanks, which are hard to edit on phone. Collapsible sections are optional and only for very long notes.",
-	      `Complex multi-step work should go to background_agent; ${label} can use the same knowledge access.`
-      ].join("\n")
-      : "",
+    "# Voice behavior",
+    "Call tools silently, then give one short answer from the result.",
+    "If work takes time, OpenAssist supplies progress. Do not invent progress lines.",
+    "A later acknowledgement such as thanks does not cancel or replace an earlier pending result.",
+    "If the user acknowledges while background work is active, respond briefly and keep the task running. Do not describe partial progress as a final result.",
+    "Stopping or muting Live Voice does not cancel background work.",
+    `Background work is performed by ${label}; present its result as one OpenAssist assistant.`,
+    backgroundWorkContext,
     codexInstructions.trim()
-      ? ["", "# Codex Session Context", "Use this only as background context. Do not read it aloud unless the user asks.", codexInstructions.trim()].join("\n")
+      ? `Private session context. Use silently and do not read it aloud:\n${codexInstructions.trim()}`
       : ""
   ].filter(Boolean).join("\n");
 }
 
-function realtimeSessionConfig(config: RealtimeProxyConfig, codexInstructions: string, quiet: boolean): JsonObject {
-  const knowledgeEnabled = Boolean(config.knowledge?.enabled);
+function realtimeSessionConfig(config: RealtimeProxyConfig, codexInstructions: string, quiet: boolean, backgroundWorkContext = ""): JsonObject {
   const agentLabel = config.handoff?.agentLabel || "Codex";
-  const tools = realtimeVoiceToolSpecs(knowledgeEnabled, agentLabel).map(openAIRealtimeTool);
+  const tools = liveVoicePublicToolSpecs.map(openAIRealtimeTool);
+  const model = requireOpenAIRealtimeConversationModel(config.model);
   return {
     type: "realtime",
-    model: config.model || defaultRealtimeModel,
-    instructions: realtimeInstructions(codexInstructions, knowledgeEnabled, agentLabel),
+    model,
+    instructions: coordinatorRealtimeInstructions(codexInstructions, agentLabel, backgroundWorkContext),
     output_modalities: ["audio"],
     audio: {
       input: {
@@ -2356,10 +1804,11 @@ function realtimeSessionConfig(config: RealtimeProxyConfig, codexInstructions: s
         turn_detection: {
           type: "semantic_vad",
           eagerness: realtimeVADEagerness,
-          // Keep barge-in enabled even in quiet mode so the user can always cut in;
-          // quiet mode only suppresses the assistant auto-replying (create_response).
+          // OpenAssist routes the finalized transcript before creating the response.
+          // Server-side auto replies can finish before transcription completes, which
+          // leaves a valid user turn silent and lets the next turn inherit stale intent.
           interrupt_response: true,
-          create_response: !quiet
+          create_response: false
         }
       },
       output: {
@@ -2377,9 +1826,9 @@ function geminiLiveSessionConfig(
   config: RealtimeProxyConfig,
   codexInstructions: string,
   resumeHandle?: string,
-  bootstrap?: LiveVoiceBootstrapContext
+  bootstrap?: LiveVoiceBootstrapContext,
+  backgroundWorkContext = ""
 ) {
-  const knowledgeEnabled = Boolean(config.knowledge?.enabled);
   const agentLabel = config.handoff?.agentLabel || "Codex";
   const voiceName = (config.voice || defaultGeminiLiveVoice).trim();
   const model = config.model?.trim() || defaultGeminiLiveModel;
@@ -2395,7 +1844,7 @@ function geminiLiveSessionConfig(
   const geminiConfig: JsonObject = {
     responseModalities: [Modality.AUDIO],
     systemInstruction: [
-      realtimeInstructions(codexInstructions, knowledgeEnabled, agentLabel),
+      coordinatorRealtimeInstructions(codexInstructions, agentLabel, backgroundWorkContext),
       bootstrapInstruction
         ? `Use the following restored text only as private conversation context. Do not repeat it and do not respond until the user speaks:\n${bootstrapInstruction}`
         : ""
@@ -2405,13 +1854,12 @@ function geminiLiveSessionConfig(
     outputAudioTranscription: {},
     realtimeInputConfig: {
       automaticActivityDetection: {
-        // LOW start sensitivity requires clearer/louder speech to open a turn,
-        // so faint background voices no longer trigger Gemini. Paired with the
-        // client-side noise gate that replaces background with clean silence.
-        startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+        // The provider is the single owner of speech-turn detection. HIGH start
+        // sensitivity lets normal nearby speech open a turn after Chromium has
+        // already applied echo cancellation, noise suppression, and isolation.
+        startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
         endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-        // Slightly longer trailing silence so a brief pause mid-thought does not
-        // cut the user off, while clean gated silence still ends the turn.
+        // Keep brief pauses inside one thought without requiring a client gate.
         silenceDurationMs: 800
       },
       activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
@@ -2428,7 +1876,7 @@ function geminiLiveSessionConfig(
       },
 	    tools: [
       {
-        functionDeclarations: realtimeVoiceToolSpecs(knowledgeEnabled, agentLabel).map(geminiFunctionDeclaration)
+        functionDeclarations: liveVoicePublicToolSpecs.map(geminiFunctionDeclaration)
       }
 	    ],
     contextWindowCompression: {
@@ -2457,16 +1905,94 @@ function appendTranscriptChunk(existing: string, next: string) {
   return `${cleanExisting}${/[.!?,;:]$/.test(cleanExisting) ? " " : " "}${cleanNext}`.replace(/\s+/g, " ").trim();
 }
 
+type DirectWorkContext = {
+  callID: string;
+  toolName: string;
+  prompt: string;
+  sourceTurnID: string;
+  args?: JsonObject;
+  result?: unknown;
+};
+
+type PendingOpenAIFunctionOutput = {
+  output: string;
+  createResponse: boolean;
+  options: { agentResult?: boolean; agentLabel?: string };
+};
+
+class OpenAIFunctionOutputCommitGate<T> {
+  private readonly awaitingResponseByCallID = new Map<string, string>();
+  private readonly pendingByCallID = new Map<string, T>();
+
+  begin(callID: string, responseID = "") {
+    if (!callID) return;
+    this.awaitingResponseByCallID.set(callID, responseID);
+  }
+
+  defer(callID: string, value: T) {
+    if (!this.awaitingResponseByCallID.has(callID)) return false;
+    this.pendingByCallID.set(callID, value);
+    return true;
+  }
+
+  finishResponse(responseID: string, callIDs: string[]) {
+    const releasable = new Set(callIDs.filter(Boolean));
+    for (const [callID, ownerResponseID] of this.awaitingResponseByCallID) {
+      if (responseID && ownerResponseID === responseID) releasable.add(callID);
+    }
+    const ready: Array<[string, T]> = [];
+    for (const callID of releasable) {
+      this.awaitingResponseByCallID.delete(callID);
+      const pending = this.pendingByCallID.get(callID);
+      if (pending === undefined) continue;
+      this.pendingByCallID.delete(callID);
+      ready.push([callID, pending]);
+    }
+    return ready;
+  }
+
+  discardResponse(responseID: string) {
+    if (!responseID) return;
+    for (const [callID, ownerResponseID] of this.awaitingResponseByCallID) {
+      if (ownerResponseID !== responseID) continue;
+      this.awaitingResponseByCallID.delete(callID);
+      this.pendingByCallID.delete(callID);
+    }
+  }
+
+  clear() {
+    this.awaitingResponseByCallID.clear();
+    this.pendingByCallID.clear();
+  }
+}
+
+type RealtimeResultNarration = {
+  id: string;
+  kind: "direct" | "delegated";
+  text: string;
+  agentLabel: string;
+  sourcePrompt?: string;
+  taskID?: string;
+  callID?: string;
+  toolName?: string;
+  args?: JsonObject;
+  result?: unknown;
+  sourceTurnID?: string;
+};
+
 class RealtimeProxySession {
   private upstream?: WebSocket;
   private upstreamReady?: Promise<WebSocket | GeminiLiveSession | null>;
   private geminiSession?: GeminiLiveSession;
   private codexInstructions = "";
-  private state: RealtimeSessionState = "idle";
-  private quiet = false;
+  private publishedState: RealtimeSessionState = "idle";
   private audioItemID = "";
   private audioMs = 0;
+  private recentOpenAIAudioItemID = "";
+  private recentOpenAIAudioMs = 0;
+  private recentOpenAIAudioStartedAt = 0;
   private activeOpenAIResponseID = "";
+  private readonly interruptedOpenAIResponses = new OpenAIInterruptedResponseTracker();
   private toolGateDropActive = false;
   private gatedToolResponseIDs = new Set<string>();
   private gatedToolAudioItemIDs = new Set<string>();
@@ -2488,36 +2014,22 @@ class RealtimeProxySession {
   // Results from parallel-delegated tasks waiting to be spoken. They are narrated
   // strictly one at a time (FIFO): the next one only starts once the current spoken
   // response has finished, so two tasks finishing close together never overlap.
-  private parallelResultQueue: Array<{ taskID: string; text: string; agentLabel: string }> = [];
   private parallelResultSpeaking = false;
-  private parallelResultSpeakingTaskID = "";
+  private activeResultNarration?: RealtimeResultNarration;
+  private readonly directWorkContexts = new Map<string, DirectWorkContext>();
+  private readonly openAIFunctionOutputCommitGate = new OpenAIFunctionOutputCommitGate<PendingOpenAIFunctionOutput>();
+  private openAIAnswerBearingToolHandled = false;
+  private geminiAnswerBearingToolHandled = false;
+  private processingOpenAIResponseDone = false;
   // Gemini Live sends generationComplete and turnComplete as separate messages
   // for the same turn; finishGeminiTurn must only run once per turn.
   private geminiTurnFinished = false;
-  // True while a delegation decision (router call) is being awaited, so the
-  // auto-handoff timer and an explicit background_agent tool call cannot both
-  // pass their "nothing running" checks and start the same task twice.
-  private delegationStartInFlight = false;
   private handledCalls = new Set<string>();
-  private handledKnowledgePrompts = new Map<string, number>();
   private personalRecallCache = new Map<string, PersonalRecallCacheEntry>();
-  private localMessageHandoffCallIDs = new Set<string>();
   private lastUserUtterance = "";
   private currentVoiceTurnID = "";
   private currentVoiceProviderItemID = "";
-  private readonly voiceTurnOwners = new Map<string, { owner: string; callID: string }>();
-  private readonly pendingVoiceToolCallIDs = new Set<string>();
   private recentUserUtterances: string[] = [];
-  private lastDelegationPrompt = "";
-  private lastKnowledgePrompt = "";
-  private lastKnowledgePromptAt = 0;
-  // Set while a personal recall is running; used to defer parallel
-  // model-initiated knowledge searches that would answer with stale queries.
-  private personalRecallInFlightSince: number | null = null;
-  private lastDelegationResult = "";
-  private lastAutoHandoffNormalizedPrompt = "";
-  private autoHandoffTimer?: NodeJS.Timeout;
-  private autoHandoffSequence = 0;
   private closed = false;
   // Reliability: automatic reconnect + keepalive for the OpenAI upstream socket.
   private reconnectAttempts = 0;
@@ -2532,6 +2044,12 @@ class RealtimeProxySession {
   private geminiHistoryRestored = false;
   private geminiResumeKey = "";
   private geminiResumeHandleUsed = false;
+  private publishedBackgroundTaskSignature = "";
+  private readonly voiceCoordinator: LiveVoiceCoordinator;
+
+  private get quiet() {
+    return this.voiceCoordinator.snapshot().voice === "quiet";
+  }
 
   constructor(
     private readonly codexSocket: WebSocket,
@@ -2540,7 +2058,30 @@ class RealtimeProxySession {
     private readonly taskCoordinator: RealtimeTaskCoordinator,
     private readonly onClose: (session: RealtimeProxySession) => void = () => {},
     private readonly onTasksIdle: (session: RealtimeProxySession) => void = () => {}
-	  ) {}
+	  ) {
+    const registry = new LiveVoiceCapabilityRegistry(liveVoiceCapabilityDescriptors(configProvider));
+    const traceDirectory = configProvider().traceDirectory?.trim()
+      || path.join(os.homedir(), "Library", "Logs", "OpenAssist", "live-voice");
+    this.voiceCoordinator = new LiveVoiceCoordinator({
+      registry,
+      executeCapability: (descriptor, request) => this.executeCoordinatorCapability(descriptor, request),
+      delegateWork: (request) => this.delegateCoordinatorWork(request),
+      taskStatus: async (taskID) => this.delegatedTaskStatus(taskID),
+      cancelTask: async (taskID) => ({ ok: true, summary: await this.cancelDelegatedTask(taskID) }),
+      checkPermissions: async (permissionIDs) => Promise.all(permissionIDs.map((permissionID) => nativePermissionBroker.get(permissionID))),
+      requestPermission: async (permissionID) => nativePermissionBroker.request(permissionID),
+      contextResources: () => this.configProvider().contextResources ?? [],
+      onProgress: ({ turnID, callID, stage, detail }) => {
+        const capabilityID = this.voiceCoordinator.snapshot().turns[turnID]?.ownerCallID === callID
+          ? this.directWorkContexts.get(callID)?.toolName || "assistant_capability"
+          : "assistant_capability";
+        this.notifyDirectWork(callID, capabilityID, "running", detail);
+        this.log(`[live-voice] progress turn_id=${turnID} call_id=${callID} stage=${stage}`);
+      },
+      trace: new LiveVoiceTrace(traceDirectory),
+      workerPolicy: configProvider().workerPolicy ?? "auto"
+    });
+  }
 
   private taskScopeKey() {
     return this.configProvider().continuity?.threadKey?.trim() || this.continuitySessionID;
@@ -2554,57 +2095,71 @@ class RealtimeProxySession {
     return this.taskCoordinator.activeCount("parallel", this.taskScopeKey());
   }
 
-  private continuityTurnID(provider: RealtimeCloudProvider, providerItemID = "") {
-    const item = providerItemID.replace(/[^a-z0-9_-]/gi, "").slice(-48);
-    const sequence = ++this.continuityTurnSequence;
-    return `live-voice-${provider}-${this.continuitySessionID}-${item || sequence}`;
-  }
-
   private beginContinuityUser(provider: RealtimeCloudProvider, text: string, providerItemID = "") {
     const clean = String(text || "").replace(/\s+/g, " ").trim();
     if (!clean || isBackendProgressMessage(clean) || isCodexFinalResultMessage(clean)) return "";
+    this.rememberRecentUserUtterance(clean);
+    this.lastUserUtterance = clean;
     const normalizedItemID = providerItemID.trim();
     if (!this.currentVoiceTurnID || !normalizedItemID || normalizedItemID !== this.currentVoiceProviderItemID) {
-      this.currentVoiceTurnID = this.continuityTurnID(provider, normalizedItemID);
+      this.currentVoiceTurnID = this.voiceCoordinator.beginTurn(provider, clean, normalizedItemID);
       this.currentVoiceProviderItemID = normalizedItemID;
+    } else {
+      this.voiceCoordinator.beginTurn(provider, clean, normalizedItemID);
     }
     this.continuityTracker.beginUser(this.currentVoiceTurnID, clean);
-    for (const callID of this.pendingVoiceToolCallIDs) {
-      this.claimVoiceTurn("routing", callID, this.currentVoiceTurnID);
-    }
-    this.pendingVoiceToolCallIDs.clear();
     return this.currentVoiceTurnID;
   }
 
-  private reserveVoiceToolCall(callID: string) {
-    if (!callID) return false;
-    if (!this.currentVoiceTurnID) {
-      this.pendingVoiceToolCallIDs.add(callID);
-      return true;
+  private ensureCoordinatorTurn(provider: RealtimeCloudProvider, fallbackText = "") {
+    if (this.currentVoiceTurnID && this.voiceCoordinator.snapshot().turns[this.currentVoiceTurnID]) {
+      return this.currentVoiceTurnID;
     }
-    return this.claimVoiceTurn("routing", callID);
+    const text = fallbackText.trim() || this.lastUserUtterance.trim() || "Continue the user's latest request.";
+    return this.beginContinuityUser(provider, text, makeShortRealtimeID("providerturn"));
   }
 
-  private claimVoiceTurn(owner: string, callID: string, turnID = this.currentVoiceTurnID) {
-    if (!turnID) return true;
-    const existing = this.voiceTurnOwners.get(turnID);
-    if (existing) {
-      if (existing.callID === callID && existing.owner === "routing") {
-        this.voiceTurnOwners.set(turnID, { owner, callID });
-        return true;
-      }
-      if (existing.owner !== owner) return false;
-      return owner === "knowledge" || owner === "status" || owner === "control"
-        ? true
-        : existing.callID === callID;
+  private async executeCoordinatorTool(
+    provider: RealtimeCloudProvider,
+    name: string,
+    callID: string,
+    args: JsonObject
+  ) {
+    const providerText = provider === "geminiLive" ? this.geminiInputTranscript : this.lastUserUtterance;
+    const turnID = this.ensureCoordinatorTurn(provider, stringValue(args.goal, providerText, this.lastUserUtterance));
+    this.voiceCoordinator.recordProviderEvent(providerToolRequested(provider, turnID, callID, name));
+    if (name === "assistant_capability") {
+      return this.voiceCoordinator.capability(turnID, callID, {
+        goal: stringValue(args.goal, providerText, this.lastUserUtterance),
+        operation: stringValue(args.operation) as AssistantCapabilityArguments["operation"],
+        sourceHints: Array.isArray(args.sourceHints) ? args.sourceHints.filter((value): value is string => typeof value === "string") : undefined,
+        capabilityID: stringValue(args.capabilityID) || undefined,
+        arguments: jsonObject(args.arguments) ?? {},
+        confirmationToken: stringValue(args.confirmationToken) || undefined
+      });
     }
-    this.voiceTurnOwners.set(turnID, { owner, callID });
-    if (this.voiceTurnOwners.size > 100) {
-      const oldest = this.voiceTurnOwners.keys().next().value;
-      if (oldest) this.voiceTurnOwners.delete(oldest);
+    if (name === "assistant_delegate_work") {
+      return this.voiceCoordinator.delegate(turnID, callID, {
+        goal: stringValue(args.goal, providerText, this.lastUserUtterance),
+        tasks: Array.isArray(args.tasks) ? args.tasks.flatMap((rawTask) => {
+          const task = jsonObject(rawTask);
+          const prompt = stringValue(task?.prompt);
+          return prompt ? [{ prompt, provider: stringValue(task?.provider) || undefined, project: stringValue(task?.project) || undefined, freshThread: task?.freshThread === true }] : [];
+        }) : undefined,
+        provider: stringValue(args.provider) || undefined,
+        project: stringValue(args.project) || undefined,
+        freshThread: args.freshThread === true
+      });
     }
-    return true;
+    if (name === "assistant_task_status") {
+      return this.voiceCoordinator.taskStatus(turnID, callID, stringValue(args.taskID) || undefined);
+    }
+    if (name === "assistant_cancel_task") {
+      return this.voiceCoordinator.cancelTask(turnID, callID, stringValue(args.taskID) || undefined);
+    }
+    return { status: "failed", error: `Unknown Live Voice tool: ${name}`, errorCode: "unknown_tool" };
   }
+
 
   private markContinuityOwnedExternally() {
     this.continuityTracker.markOwnedExternally();
@@ -2612,6 +2167,12 @@ class RealtimeProxySession {
 
   private interruptContinuityTurn() {
     this.continuityTracker.markInterrupted();
+    if (
+      this.currentVoiceTurnID
+      && !this.voiceCoordinator.shouldPreserveTurnOnInterruption(this.currentVoiceTurnID)
+    ) {
+      this.voiceCoordinator.interruptTurn(this.currentVoiceTurnID, "provider interruption");
+    }
   }
 
   private completeContinuityTurn(assistantText: string) {
@@ -2656,25 +2217,31 @@ class RealtimeProxySession {
 
   private stateSnapshot(reason: string, previousState?: RealtimeSessionState): RealtimeSessionStateSnapshot {
     const responseActive = this.openAIResponseActive || Boolean(this.geminiAudioItemID);
-    const voicePhase: RealtimeSessionStateSnapshot["voicePhase"] = this.closed
+    const coordinator = this.voiceCoordinator.snapshot();
+    const voicePhase: RealtimeSessionStateSnapshot["voicePhase"] = this.closed || coordinator.session === "closed"
       ? "closed"
-      : this.quiet
-        ? "quiet"
-        : responseActive || this.parallelResultSpeaking
-          ? "speaking"
-          : "listening";
+      : coordinator.session === "error"
+        ? "error"
+        : coordinator.session === "connecting"
+          ? "connecting"
+          : coordinator.voice === "quiet"
+            ? "quiet"
+            : responseActive || this.parallelResultSpeaking || coordinator.voice === "speaking"
+              ? "speaking"
+              : "listening";
     return {
-      state: this.state,
+      state: this.publishedState,
       previousState,
       reason,
       quiet: this.quiet,
       pendingHandoffs: this.pendingHandoffs.size,
       activeParallelDelegations: this.activeParallelDelegations,
-      queuedNarrations: this.parallelResultQueue.length,
+      queuedNarrations: this.taskCoordinator.pendingResults().length,
       responseActive,
       voicePhase,
       foregroundWork: this.toolGateDropActive ? "tool" : undefined,
       voiceProvider: this.realtimeProvider(),
+      voiceModel: this.configProvider().model,
       workerProvider: this.configProvider().handoff?.agentLabel || "Codex",
       tasks: this.taskCoordinator.visible(this.taskScopeKey()).map((task) => ({
         taskID: task.taskID,
@@ -2687,6 +2254,11 @@ class RealtimeProxySession {
         result: task.result,
         error: task.error,
         deliveryState: task.deliveryState,
+        workerModelRole: task.workerModelRole,
+        workerModelID: task.workerModelID,
+        workerReasoningEffort: task.workerReasoningEffort,
+        workerSelectionReason: task.workerSelectionReason,
+        workerModelExplicit: task.workerModelExplicit,
         startedAt: task.startedAt,
         updatedAt: task.updatedAt,
         finishedAt: task.finishedAt
@@ -2696,9 +2268,19 @@ class RealtimeProxySession {
 
   private transition(to: RealtimeSessionState, reason: string) {
     const next = this.quiet && to !== "idle" ? "quiet" : to;
-    if (this.state === next) return;
-    const previous = this.state;
-    this.state = next;
+    const nextVoicePhase = next === "quiet"
+      ? "quiet"
+      : next === "speaking" || next === "narrating"
+        ? "speaking"
+        : next === "idle"
+          ? "stopped"
+          : "listening";
+    if (this.voiceCoordinator.snapshot().voice !== nextVoicePhase) {
+      this.voiceCoordinator.setVoicePhase(nextVoicePhase);
+    }
+    if (this.publishedState === next) return;
+    const previous = this.publishedState;
+    this.publishedState = next;
     this.log(`[realtime.proxy] state: ${previous} -> ${next} (${reason})`);
     const snapshot = this.stateSnapshot(reason, previous);
     this.configProvider().connection?.onEvent({
@@ -2713,11 +2295,43 @@ class RealtimeProxySession {
   private publishSessionSnapshot(reason: string) {
     this.configProvider().connection?.onEvent({
       type: "state_changed",
-      state: this.state,
-      previousState: this.state,
+      state: this.publishedState,
+      previousState: this.publishedState,
       reason,
-      snapshot: this.stateSnapshot(reason, this.state)
+      snapshot: this.stateSnapshot(reason, this.publishedState)
     });
+  }
+
+  private syncCoordinatorTask(task?: RealtimeTaskRecord) {
+    if (!task) return;
+    this.voiceCoordinator.updateBackgroundTask({
+      taskID: task.taskID,
+      sourceTurnID: task.sourceTurnID,
+      state: task.state,
+      updatedAt: task.updatedAt
+    });
+    this.refreshProviderBackgroundWorkContext();
+  }
+
+  private backgroundWorkContext() {
+    const active = this.taskCoordinator.active(this.taskScopeKey());
+    if (!active.length) return "";
+    return [
+      "# Authoritative Background Work State",
+      `${active.length} background ${active.length === 1 ? "task is" : "tasks are"} currently RUNNING. None of these tasks is complete.`,
+      ...active.map((task) => `- RUNNING: ${compactRealtimeStatusText(task.prompt, 320)}`),
+      "This state comes from the coordinator. Do not contradict it. Call assistant_task_status before answering any follow-up about status, progress, findings, or completion."
+    ].join("\n");
+  }
+
+  private refreshProviderBackgroundWorkContext() {
+    const signature = this.taskCoordinator.active(this.taskScopeKey())
+      .map((task) => `${task.taskID}:${task.state}`)
+      .sort()
+      .join("|");
+    if (signature === this.publishedBackgroundTaskSignature) return;
+    this.publishedBackgroundTaskSignature = signature;
+    if (!this.isGeminiLive()) this.updateOpenAISession();
   }
 
   private refreshSessionState(reason: string) {
@@ -2740,8 +2354,8 @@ class RealtimeProxySession {
     this.transition("listening", reason);
   }
 
-	  start() {
-	    this.transition("listening", "client connected");
+		  start() {
+		    this.transition("listening", "client connected");
 	    this.codexSocket.on("message", (data) => {
 	      void this.onCodexMessage(data.toString());
     });
@@ -2950,6 +2564,141 @@ class RealtimeProxySession {
 	    }
 	  }
 
+  private async executeCoordinatorCapability(descriptor: CapabilityDescriptor, request: CapabilityRequest) {
+    const args = { ...request.arguments };
+    this.directWorkContexts.set(request.callID, {
+      callID: request.callID,
+      toolName: descriptor.id,
+      prompt: request.goal,
+      sourceTurnID: request.turnID,
+      args
+    });
+    this.notifyDirectWork(request.callID, descriptor.id, "running", `Using ${descriptor.source.replace(/_/g, " ")}.`, undefined, { args });
+    try {
+      let result: unknown;
+      if (descriptor.id === "current_conversation") {
+        const context = this.continuityContext();
+        result = {
+          ok: true,
+          messages: context.messages.slice(-10),
+          earlierHighlights: context.earlierHighlights || undefined
+        };
+      } else if (descriptor.id === "codex_image_generation") {
+        result = parseJSON(await this.codexImageGenerationToolOutput(request.callID, args, request.goal));
+      } else if (descriptor.id === "local_mcp_discover") {
+        const localMCP = this.configProvider().localMCP;
+        if (!localMCP?.enabled) throw new Error("Local MCP access is off in Live Voice settings.");
+        const discovered = await localMCP.findTools({ ...args, query: stringValue(args.query, request.goal), limit: Number(args.limit) || 5 });
+        const matches = localMCPMatches(discovered);
+        if (!matches.length) {
+          const error = stringValue(jsonObject(discovered)?.error) || "No compatible local MCP tool was found.";
+          throw new Error(error);
+        }
+        result = {
+          __voiceCapabilityStatus: "selection_required",
+          message: "Select one exact MCP toolID from the result, then call local_mcp_execute. Do not report the candidate count as the answer.",
+          output: { matches, originalRequest: request.goal }
+        };
+      } else if (descriptor.id === "local_mcp_execute") {
+        const localMCP = this.configProvider().localMCP;
+        if (!localMCP?.enabled) throw new Error("Local MCP access is off in Live Voice settings.");
+        const toolID = stringValue(args.toolID);
+        if (!toolID) {
+          result = {
+            __voiceCapabilityStatus: "clarification_required",
+            message: "Select the exact local MCP toolID before execution."
+          };
+        } else {
+          const callArgs = request.confirmationToken ? { ...args, confirmed: true } : args;
+          const called = await localMCP.callTool(callArgs);
+          const calledObject = jsonObject(called);
+          if (calledObject?.confirmationRequired === true || calledObject?.status === "approval_required") {
+            result = {
+              __voiceCapabilityStatus: "approval_required",
+              message: stringValue(calledObject.message, calledObject.error) || "This local MCP write needs your confirmation.",
+              output: called
+            };
+          } else {
+            result = called;
+          }
+        }
+      } else if (descriptor.id.startsWith("knowledge_")) {
+        const knowledge = this.configProvider().knowledge;
+        if (!knowledge?.enabled) throw new Error("Knowledge access is off in Live Voice settings.");
+        const effectiveArgs = descriptor.id === "knowledge_personal_recall"
+          ? this.personalRecallArgs(args, request.goal)
+          : args;
+        result = descriptor.id === "knowledge_personal_recall"
+          ? await this.runPersonalRecall(effectiveArgs, () => knowledge.call(descriptor.id, effectiveArgs))
+          : await knowledge.call(descriptor.id, effectiveArgs);
+      } else {
+        throw new Error(`Capability ${descriptor.id} has no executor.`);
+      }
+
+      const resultObject = jsonObject(result);
+      if (resultObject?.ok === false && !resultObject.__voiceCapabilityStatus) {
+        throw new Error(stringValue(resultObject.error, resultObject.message) || `${descriptor.description} failed.`);
+      }
+      const completion = descriptor.id.startsWith("knowledge_")
+        ? knowledgeCompletionDetail(descriptor.id, result)
+        : stringValue(resultObject?.summary, resultObject?.message) || `${descriptor.description} completed.`;
+      this.notifyDirectWork(request.callID, descriptor.id, "completed", completion, undefined, { args, result });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `${descriptor.description} failed.`;
+      this.notifyDirectWork(request.callID, descriptor.id, "failed", message, message, { args });
+      throw error;
+    }
+  }
+
+  private async delegateCoordinatorWork(request: AssistantDelegateArguments & { turnID: string; callID: string; contextResources?: LiveVoiceContextResource[] }) {
+    const tasks = (request.tasks ?? [])
+      .map((task) => ({
+        prompt: stringValue(task.prompt),
+        provider: stringValue(task.provider) || undefined,
+        project: stringValue(task.project) || undefined,
+        executionProfile: normalizeDelegatedWorkExecutionProfile(task.executionProfile ?? request.executionProfile),
+        freshThread: task.freshThread === true || request.freshThread === true
+      }))
+      .filter((task) => task.prompt);
+    if (!tasks.length) {
+      tasks.push({
+        prompt: request.goal.trim(),
+        provider: stringValue(request.provider) || undefined,
+        project: stringValue(request.project) || undefined,
+        executionProfile: normalizeDelegatedWorkExecutionProfile(request.executionProfile),
+        freshThread: request.freshThread === true
+      });
+    }
+    if (!tasks[0]?.prompt) return { status: "failed", error: "The work request was empty." };
+
+    if (tasks.length > 1 || tasks.some((task) => task.provider || task.project)) {
+      const summary = await this.startParallelDelegation(request.callID, {
+        tasks,
+        __coordinatorApproved: true
+      });
+      return { status: "running", summary };
+    }
+
+    const started = this.startCodexHandoff(request.callID, tasks[0].prompt, "message", {
+      sourceTurnID: request.turnID,
+      userText: request.goal,
+      executionProfile: tasks[0].executionProfile,
+      freshThread: tasks[0].freshThread,
+      contextResources: request.contextResources
+    });
+    return started.started
+      ? {
+          status: "running",
+          terminal: false,
+          taskID: started.task?.taskID,
+          summary: started.message,
+          statusSource: "task_coordinator",
+          followUpAction: "assistant_task_status"
+        }
+      : { status: "failed", error: started.message };
+  }
+
 	  async appendUserText(text: string) {
     const prompt = String(text || "").trim();
     if (!prompt) return false;
@@ -2963,20 +2712,9 @@ class RealtimeProxySession {
       content_index: 0,
       transcript: prompt
     });
-    if (this.handleStopCommand(prompt)) return true;
-
-    const recallRoute = conversationRecallRoute(prompt);
-    if (recallRoute === "personal") {
-      const callID = makeShortRealtimeID("callrec", ++this.autoHandoffSequence);
-      void this.tryPersonalRecallRequest(callID, prompt, "message");
-      return true;
-    }
-    if (recallRoute === "clarify") {
-      void this.speakDirectText(recallScopeClarificationText());
-      return true;
-    }
-
-    this.scheduleAutoHandoff(prompt);
+    if (this.handleVoiceControlCommand(prompt)) return true;
+    const providerItemID = makeShortRealtimeID("typedturn");
+    this.beginContinuityUser(this.realtimeProvider(), prompt, providerItemID);
     if (this.isGeminiLive()) {
       return this.sendGeminiText(prompt);
     }
@@ -3001,82 +2739,6 @@ class RealtimeProxySession {
     return true;
   }
 
-  private pruneHandledKnowledgePrompts() {
-    const cutoff = Date.now() - 90_000;
-    for (const [prompt, timestamp] of this.handledKnowledgePrompts) {
-      if (timestamp < cutoff) this.handledKnowledgePrompts.delete(prompt);
-    }
-  }
-
-  private rememberKnowledgeHandled(prompt: string, reason: string) {
-    const normalized = normalizeRealtimeIntent(prompt);
-    if (!normalized) return;
-    this.pruneHandledKnowledgePrompts();
-    this.handledKnowledgePrompts.set(normalized, Date.now());
-    this.log(`[realtime.proxy] knowledge handled route=${reason} chars=${normalized.length}`);
-  }
-
-  private wasKnowledgeHandled(prompt: string) {
-    const normalized = normalizeRealtimeIntent(prompt);
-    if (!normalized) return false;
-    this.pruneHandledKnowledgePrompts();
-    return this.handledKnowledgePrompts.has(normalized);
-  }
-
-  private knowledgeDedupeKeys(name: string, args: JsonObject) {
-    const keys = new Set<string>();
-    const utterance = this.lastUserUtterance.trim();
-    // Scope the utterance key by tool name: one spoken sentence legitimately
-    // triggers multi-step flows (read_today then daily_items, search then read),
-    // so only the SAME tool repeating for the same utterance is a duplicate.
-    if (utterance) keys.add(`${name} utterance ${utterance}`);
-    // Targeted edits legitimately hit the SAME task several times in a row with
-    // different arguments ("add details", then "turn them into steps", then
-    // "rename it"). Keying those on the task text vetoed the second edit as a
-    // duplicate — and the model then claimed the change was "already made".
-    // Same-utterance and identical-args repeats are still deduped below.
-    const isTargetedEdit = name === "knowledge_update_daily_item"
-      || name === "knowledge_complete_daily_item";
-    if (!isTargetedEdit) {
-      const primaryText = stringValue(
-        args.title,
-        args.text,
-        args.task,
-        args.query,
-        args.prompt,
-        args.item,
-        args.dayID,
-        args.date
-      );
-      if (primaryText) keys.add(`${name} ${primaryText}`);
-    }
-    keys.add(`${name} ${JSON.stringify(args)}`);
-    return Array.from(keys);
-  }
-
-  private wasKnowledgeRequestHandled(name: string, args: JsonObject) {
-    return this.knowledgeDedupeKeys(name, args).some((key) => this.wasKnowledgeHandled(key));
-  }
-
-  private rememberKnowledgeRequestHandled(name: string, args: JsonObject, reason: string) {
-    for (const key of this.knowledgeDedupeKeys(name, args)) {
-      this.rememberKnowledgeHandled(key, reason);
-    }
-    if (!/pending/i.test(reason)) this.rememberKnowledgeContext();
-  }
-
-  private rememberKnowledgeContext(prompt = this.lastUserUtterance) {
-    const cleanPrompt = String(prompt || "").trim();
-    if (!cleanPrompt) return;
-    this.lastKnowledgePrompt = cleanPrompt;
-    this.lastKnowledgePromptAt = Date.now();
-  }
-
-  private recentKnowledgePrompt() {
-    if (!this.lastKnowledgePrompt || Date.now() - this.lastKnowledgePromptAt > 2 * 60_000) return "";
-    return this.lastKnowledgePrompt;
-  }
-
   private personalRecallCacheKey(args: JsonObject) {
     const primaryText = stringValue(
       args.query,
@@ -3097,36 +2759,13 @@ class RealtimeProxySession {
     }
   }
 
-  private async existingPersonalRecallResult(args: JsonObject) {
-    this.prunePersonalRecallCache();
-    const key = this.personalRecallCacheKey(args);
-    if (!key) return undefined;
-    const existing = this.personalRecallCache.get(key);
-    if (!existing) return undefined;
-    if (existing.result !== undefined) return existing.result;
-    // Callers await this outside their try/catch; a rejected in-flight recall
-    // must resolve to undefined so they fall through to a fresh run instead of
-    // leaving the tool call without any output.
-    if (existing.promise) return existing.promise.catch(() => undefined);
-    return undefined;
-  }
-
   private async runPersonalRecall(
     args: JsonObject,
     run: () => Promise<unknown>
   ) {
     this.prunePersonalRecallCache();
     const key = this.personalRecallCacheKey(args);
-    // While a recall actually runs, concurrent model-initiated knowledge
-    // searches are deferred (see the personalRecallInFlight guard) so the
-    // model cannot narrate a contradictory "found nothing" from a stale
-    // parallel search. Cache hits are instant and skip the flag.
-    if (!key) {
-      this.personalRecallInFlightSince = Date.now();
-      return run().finally(() => {
-        this.personalRecallInFlightSince = null;
-      });
-    }
+    if (!key) return run();
     const existing = this.personalRecallCache.get(key);
     if (existing?.result !== undefined) {
       this.log("[realtime.proxy] reused completed personal recall result");
@@ -3137,11 +2776,7 @@ class RealtimeProxySession {
       return existing.promise;
     }
     const entry: PersonalRecallCacheEntry = { updatedAt: Date.now() };
-    this.personalRecallInFlightSince = Date.now();
     entry.promise = run()
-      .finally(() => {
-        this.personalRecallInFlightSince = null;
-      })
       .then((result) => {
         if (isFailedPersonalRecallResult(result)) {
           // Do not replay a failed recall (Spark down, no sourced answer) for
@@ -3171,7 +2806,27 @@ class RealtimeProxySession {
     error?: string,
     extra?: { args?: JsonObject; result?: unknown }
   ) {
-    const prompt = this.lastUserUtterance.trim() || detail || toolName;
+    let context = this.directWorkContexts.get(callID);
+    if (!context) {
+      context = {
+        callID,
+        toolName,
+        prompt: this.lastUserUtterance.trim() || detail || toolName,
+        sourceTurnID: this.currentVoiceTurnID,
+        args: extra?.args,
+        result: extra?.result
+      };
+      this.directWorkContexts.set(callID, context);
+      if (this.directWorkContexts.size > 100) {
+        const oldest = this.directWorkContexts.keys().next().value;
+        if (oldest) this.directWorkContexts.delete(oldest);
+      }
+    } else {
+      context.toolName = toolName;
+      if (extra?.args !== undefined) context.args = extra.args;
+      if (extra?.result !== undefined) context.result = extra.result;
+    }
+    const prompt = context.prompt;
     if (status === "running") this.markContinuityOwnedExternally();
     this.configProvider().directWork?.onEvent({
       callID,
@@ -3185,42 +2840,41 @@ class RealtimeProxySession {
     });
   }
 
-  private knowledgeUnavailableText(callID: string) {
-    const message = "Knowledge access is off. Enable Knowledge in Settings to search saved notes, tasks, reminders, and memory.";
-    this.notifyDirectWork(callID, "knowledge_access", "failed", message, message);
-    return message;
+  private enqueueResultNarration(entry: RealtimeResultNarration) {
+    this.taskCoordinator.enqueueResult({
+      deliveryID: entry.id,
+      sourceTurnID: entry.sourceTurnID || this.currentVoiceTurnID || entry.taskID || entry.callID || entry.id,
+      kind: entry.kind === "delegated" ? "delegated" : "capability",
+      text: entry.text,
+      label: entry.agentLabel,
+      taskID: entry.taskID,
+      callID: entry.callID,
+      capabilityID: entry.toolName,
+      createdAt: Date.now(),
+      metadata: {
+        sourcePrompt: entry.sourcePrompt,
+        args: entry.args,
+        result: entry.result
+      }
+    });
   }
 
-  private startDirectWorkProgress(
-    callID: string,
-    toolName: string,
-    args?: JsonObject
-  ) {
-    const label = toolName.replace(/^knowledge_/, "").replace(/_/g, " ");
-    const messages = toolName === "knowledge_personal_recall"
-      ? [
-        personalRecallRunningDetail(args),
-        "Still checking saved context...",
-        "Waiting for Spark recall to finish..."
-      ]
-      : [
-        `Still running ${label}...`,
-        `Waiting for ${label} to finish...`
-      ];
-    let index = 0;
-    const sendProgress = () => {
-      const detail = messages[Math.min(index, messages.length - 1)] || `Still running ${label}...`;
-      index += 1;
-      this.notifyDirectWork(callID, toolName, "running", detail, undefined, { args });
-      this.log(`[realtime.proxy] direct work progress tool=${toolName} call_id=${callID} detail=${detail}`);
-    };
-    const first = setTimeout(sendProgress, 1_200);
-    const interval = setInterval(sendProgress, 4_500);
-    unrefTimer(first);
-    unrefTimer(interval);
-    return () => {
-      clearTimeout(first);
-      clearInterval(interval);
+  private narrationFromOutbox(deliveryID: string): RealtimeResultNarration | undefined {
+    const envelope = this.taskCoordinator.getResult(deliveryID);
+    if (!envelope) return undefined;
+    const metadata = envelope.metadata ?? {};
+    return {
+      id: envelope.deliveryID,
+      kind: envelope.kind === "delegated" ? "delegated" : "direct",
+      text: envelope.text,
+      agentLabel: envelope.label,
+      sourceTurnID: envelope.sourceTurnID,
+      taskID: envelope.taskID,
+      callID: envelope.callID,
+      toolName: envelope.capabilityID,
+      sourcePrompt: stringValue(metadata.sourcePrompt),
+      args: jsonObject(metadata.args),
+      result: metadata.result
     };
   }
 
@@ -3232,129 +2886,12 @@ class RealtimeProxySession {
     return this.realtimeProvider() === "geminiLive";
   }
 
-  private currentVoiceState(): RealtimeDelegationRouteInput["voiceState"] {
-    if (this.quiet) return "quiet";
-    if (this.openAIResponseActive || this.geminiAudioItemID) return "speaking";
-    return "listening";
-  }
-
-  private routerDelegationDecision(
-    result: RealtimeDelegationRouteResult,
-    baseDecision: Extract<DelegationDecision, { allow: true }>,
-    source: RealtimeDelegationRouteSource
-  ): DelegationDecision {
-    const decision = routerDecisionName(result?.decision);
-    const confidence = routerConfidence(result?.confidence);
-    const responseText = stringValue(result?.responseText);
-    const reason = stringValue(result?.reason, `router ${decision}`);
-
-    if (decision === "delegate") {
-      if (confidence < 0.7) return routerFallbackDecision(source, `router low confidence ${confidence.toFixed(2)}`);
-      const routedPrompt = contextualizeRealtimeDelegationPrompt(stringValue(result?.taskText, baseDecision.prompt), this.lastDelegationPrompt);
-      const normalizedPrompt = normalizeRealtimeIntent(routedPrompt);
-      if (!normalizedPrompt) return routerFallbackDecision(source, "router empty task");
-      return { allow: true, prompt: routedPrompt, normalizedPrompt };
-    }
-
-    if (decision === "clarify") {
-      return {
-        allow: false,
-        output: responseText || "Ask one short clarification question before starting the background agent.",
-        createResponse: true,
-        reason
-      };
-    }
-
-    if (decision === "ignore") {
-      return {
-        allow: false,
-        output: responseText || "This does not need a response or background agent task. Wait for the user.",
-        createResponse: Boolean(responseText),
-        reason
-      };
-    }
-
-    if (decision === "control") {
-      return {
-        allow: false,
-        output: responseText || "Follow the user's voice control request. Do not start the background agent.",
-        createResponse: Boolean(responseText),
-        reason
-      };
-    }
-
-    return {
-      allow: false,
-      output: responseText || "Answer this directly from the current conversation context. Do not start the background agent.",
-      createResponse: true,
-      reason
-    };
-  }
-
-  private async routeRealtimeDelegation(rawPrompt: string, source: RealtimeDelegationRouteSource): Promise<DelegationDecision> {
-    const delegationMode = this.configProvider().delegationMode || "autoHardTasksOnly";
-    if (delegationMode === "neverDelegate") {
-      return {
-        allow: false,
-        output: "Live Voice is set to answer directly. Do not start the background agent.",
-        createResponse: true,
-        reason: "delegation disabled"
-      };
-    }
-    const baseDecision = decideRealtimeDelegation(rawPrompt, this.pendingHandoffs.size > 0, this.lastDelegationPrompt, {
-      blockRealtimeKnowledgeTasks: true,
-      recentKnowledgePrompt: this.recentKnowledgePrompt()
-    });
-    if (!baseDecision.allow) return baseDecision;
-    if (this.wasKnowledgeHandled(baseDecision.prompt)) {
-      return {
-        allow: false,
-        output: "This request was already handled by an OpenAssist knowledge tool. Do not start the background agent.",
-        createResponse: false,
-        reason: "already handled by knowledge"
-      };
-    }
-    if (delegationMode === "alwaysDelegate") return baseDecision;
-
-    const router = this.configProvider().delegationRouter;
-    if (!router?.route || isHighConfidenceRealtimeDelegation(baseDecision.prompt, source)) return baseDecision;
-
-    const startedAt = Date.now();
-    const config = this.configProvider();
-    const agentLabel = config.handoff?.agentLabel || "Codex";
-    try {
-      const result = await router.route({
-        source,
-        provider: this.realtimeProvider(),
-        agentLabel,
-        prompt: rawPrompt,
-        proposedTaskText: baseDecision.prompt,
-        lastDelegationPrompt: this.lastDelegationPrompt,
-        lastDelegationResult: this.lastDelegationResult,
-        hasActiveHandoff: this.pendingHandoffs.size > 0,
-        voiceState: this.currentVoiceState()
-      });
-      const routedDecision = this.routerDelegationDecision(result, baseDecision, source);
-      const decision = routerDecisionName(result?.decision);
-      const confidence = routerConfidence(result?.confidence);
-      this.log(
-        `[realtime.proxy] delegation router decision=${decision} allow=${String(routedDecision.allow)} confidence=${confidence.toFixed(2)} source=${source} elapsedMs=${Date.now() - startedAt} reason=${stringValue(result?.reason).slice(0, 120)}`
-      );
-      return routedDecision;
-    } catch (error) {
-      this.log(
-        `[realtime.proxy] delegation router unavailable; using deterministic decision source=${source} elapsedMs=${Date.now() - startedAt}: ${error instanceof Error ? error.message : String(error)}`
-      );
-      return baseDecision;
-    }
-  }
-
-  // A delegated run that dies without ever sending its "background agent
-  // finished" message would otherwise gate delegation forever ("already
-  // working"). Treat a handoff with no progress for 10 minutes as dead.
+  // Treat a worker with no progress for 10 minutes as stale so it cannot hold
+  // the active-task limit forever.
   private evictStaleHandoffs() {
     const staleAfterMs = 10 * 60_000;
     for (const handoff of this.taskCoordinator.evictStale(staleAfterMs, this.taskScopeKey())) {
+      this.syncCoordinatorTask(handoff);
       this.taskAbortControllers.get(handoff.taskID)?.abort();
       this.taskAbortControllers.delete(handoff.taskID);
       this.log(`[realtime.proxy] evicted stale delegated task task_id=${handoff.taskID} promptChars=${handoff.prompt.length}`);
@@ -3363,24 +2900,68 @@ class RealtimeProxySession {
     this.notifyTasksIdleIfNeeded();
   }
 
-  private async delegatedTaskStatusText() {
+  private delegatedTaskStatus(taskID?: string) {
     this.evictStaleHandoffs();
-    const handoff = this.taskCoordinator.latestRelevant(this.taskScopeKey());
+    const requested = taskID ? this.taskCoordinator.get(taskID) : undefined;
+    const handoff = requested?.scopeKey === this.taskScopeKey()
+      ? requested
+      : this.taskCoordinator.latestRelevant(this.taskScopeKey());
     if (!handoff) {
-      return "No delegated task is running right now.";
+      return {
+        ok: true,
+        state: "none",
+        terminal: true,
+        runningCount: 0,
+        summary: "No delegated task is running right now."
+      };
     }
+
+    const worker = handoff.workerModelID
+      ? {
+          role: handoff.workerModelRole,
+          modelID: handoff.workerModelID,
+          reasoningEffort: handoff.workerReasoningEffort,
+          selectionReason: handoff.workerSelectionReason,
+          explicitlySelected: handoff.workerModelExplicit === true
+        }
+      : undefined;
 
     if (handoff.state === "completed") {
       const result = compactRealtimeStatusText(handoff.result, 700);
-      return result
+      const summary = result
         ? `${handoff.agentLabel} finished the task. Result: ${result}`
         : `${handoff.agentLabel} finished the task.`;
+      return {
+        ok: true,
+        taskID: handoff.taskID,
+        state: handoff.state,
+        terminal: true,
+        runningCount: this.taskCoordinator.activeCount(undefined, this.taskScopeKey()),
+        worker,
+        summary
+      };
     }
     if (handoff.state === "failed") {
-      return `${handoff.agentLabel} could not finish the task: ${compactRealtimeStatusText(handoff.error, 700)}`;
+      return {
+        ok: true,
+        taskID: handoff.taskID,
+        state: handoff.state,
+        terminal: true,
+        runningCount: this.taskCoordinator.activeCount(undefined, this.taskScopeKey()),
+        worker,
+        summary: `${handoff.agentLabel} could not finish the task: ${compactRealtimeStatusText(handoff.error, 700)}`
+      };
     }
     if (handoff.state === "cancelled") {
-      return `${handoff.agentLabel} task was cancelled.`;
+      return {
+        ok: true,
+        taskID: handoff.taskID,
+        state: handoff.state,
+        terminal: true,
+        runningCount: this.taskCoordinator.activeCount(undefined, this.taskScopeKey()),
+        worker,
+        summary: `${handoff.agentLabel} task was cancelled.`
+      };
     }
 
     const now = Date.now();
@@ -3400,7 +2981,17 @@ class RealtimeProxySession {
         ? `${otherHandoffs.length} other ${otherHandoffs.length === 1 ? "task is" : "tasks are"} also running.`
         : ""
     ].filter(Boolean);
-    return lines.join("\n");
+    return {
+      ok: true,
+      taskID: handoff.taskID,
+      state: handoff.state,
+      terminal: false,
+      runningCount: this.taskCoordinator.activeCount(undefined, this.taskScopeKey()),
+      startedAt: handoff.startedAt,
+      updatedAt: handoff.updatedAt,
+      worker,
+      summary: lines.join("\n")
+    };
   }
 
   async cancelDelegatedTask(taskID?: string) {
@@ -3410,7 +3001,7 @@ class RealtimeProxySession {
       : this.taskCoordinator.latestActive(this.taskScopeKey());
     if (task?.scopeKey !== this.taskScopeKey()) return "No delegated task is running right now.";
     if (!task) return "No delegated task is running right now.";
-    this.taskCoordinator.cancel(task.taskID, "Cancelled by the user.");
+    this.syncCoordinatorTask(this.taskCoordinator.cancel(task.taskID, "Cancelled by the user."));
     this.taskAbortControllers.get(task.taskID)?.abort();
     this.taskAbortControllers.delete(task.taskID);
     try {
@@ -3482,9 +3073,8 @@ class RealtimeProxySession {
 	    const model = config.model?.trim() || defaultGeminiLiveModel;
       const continuity = config.continuity;
       const instructionVersion = createHash("sha256")
-        .update(`live-voice-continuity-v1\u0000${realtimeInstructions(
+        .update(`live-voice-continuity-v2\u0000${coordinatorRealtimeInstructions(
           this.codexInstructions,
-          Boolean(config.knowledge?.enabled),
           config.handoff?.agentLabel || "Codex"
         )}`)
         .digest("hex")
@@ -3536,6 +3126,9 @@ class RealtimeProxySession {
           onclose: (event: unknown) => {
             const close = jsonObject(event);
             const reason = stringValue(close?.reason) || "no reason";
+            if (!this.closed) {
+              this.voiceCoordinator.recordProviderEvent(providerConnectionClosed("geminiLive", reason));
+            }
             if (setupState === "pending") {
               setupState = "failed";
               rejectSetup?.(new Error("Gemini Live closed before setup completed."));
@@ -3562,7 +3155,8 @@ class RealtimeProxySession {
             config,
             this.codexInstructions,
             handle,
-            handle ? undefined : this.continuityContext()
+            handle ? undefined : this.continuityContext(),
+            this.backgroundWorkContext()
           ),
           callbacks
         });
@@ -3638,6 +3232,13 @@ class RealtimeProxySession {
         });
         return null;
       }
+      const modelValidation = validateOpenAIRealtimeConversationModel(config.model);
+      if (!modelValidation.ok) {
+        this.fatalUpstreamError = true;
+        this.sendToCodex({ type: "error", error: { message: modelValidation.message } });
+        return null;
+      }
+      const model = modelValidation.model;
 
       let connectionErrorMessage = "";
       let rejectConnection: ((error: Error) => void) | undefined;
@@ -3646,13 +3247,16 @@ class RealtimeProxySession {
       if (config.projectID) headers["OpenAI-Project"] = config.projectID;
       if (config.safetyIdentifier) headers["OpenAI-Safety-Identifier"] = config.safetyIdentifier;
 
-      const ws = new WebSocket(openAIRealtimeURL(config.model), { headers });
+      const ws = new WebSocket(buildOpenAIRealtimeURL(model), { headers });
       this.upstream = ws;
       ws.on("message", (data) => {
         void this.onOpenAIMessage(data.toString());
       });
       ws.on("error", (error) => {
-        const message = connectionErrorMessage || error.message || "OpenAI Realtime connection failed.";
+        const message = connectionErrorMessage || readableOpenAIRealtimeConnectionError({
+          model,
+          detail: error.message
+        });
         this.log(`[realtime.proxy] OpenAI websocket error: ${message}`);
         this.sendToCodex({ type: "error", error: { message } });
       });
@@ -3661,11 +3265,15 @@ class RealtimeProxySession {
         response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
         response.on("end", () => {
           const detail = Buffer.concat(chunks).toString("utf8").trim();
-          connectionErrorMessage = [
-            `OpenAI Realtime rejected the connection (${response.statusCode} ${response.statusMessage || "HTTP error"}).`,
-            detail ? detail.slice(0, 240) : "Check the API key, project access, and realtime model."
-          ].join(" ");
-          this.log(`[realtime.proxy] ${connectionErrorMessage}`);
+          connectionErrorMessage = readableOpenAIRealtimeConnectionError({
+            model,
+            statusCode: response.statusCode,
+            statusMessage: response.statusMessage,
+            detail
+          });
+          this.log(
+            `[realtime.proxy] OpenAI handshake rejected model=${model} status=${response.statusCode || 0} detailChars=${detail.length}`
+          );
           // A rejected handshake (bad key, no project access, wrong model) will not
           // succeed on retry — mark it fatal so we do not reconnect in a loop.
           this.fatalUpstreamError = true;
@@ -3674,9 +3282,12 @@ class RealtimeProxySession {
           ws.terminate();
         });
       });
-      ws.on("close", (_code, reason) => {
-        const message = reason?.toString() || connectionErrorMessage || "no reason";
-        this.log(`[realtime.proxy] OpenAI websocket closed: ${message}`);
+	      ws.on("close", (_code, reason) => {
+	        const message = reason?.toString() || connectionErrorMessage || "no reason";
+	        this.log(`[realtime.proxy] OpenAI websocket closed: ${message}`);
+	        if (!this.closed) {
+	          this.voiceCoordinator.recordProviderEvent(providerConnectionClosed("openaiRealtime", message));
+	        }
         this.stopKeepAlive();
         if (this.upstream === ws) this.upstream = undefined;
         this.upstreamReady = undefined;
@@ -3687,12 +3298,13 @@ class RealtimeProxySession {
       await new Promise<void>((resolve, reject) => {
         rejectConnection = reject;
         const timer = setTimeout(() => reject(new Error("OpenAI Realtime connection timed out.")), 15_000);
-        ws.once("open", () => {
-          rejectConnection = undefined;
-          clearTimeout(timer);
-          this.reconnectAttempts = 0;
-          this.startKeepAlive(ws);
-          resolve();
+	        ws.once("open", () => {
+	          rejectConnection = undefined;
+	          clearTimeout(timer);
+	          this.reconnectAttempts = 0;
+	          this.startKeepAlive(ws);
+	          this.voiceCoordinator.recordProviderEvent(providerConnectionRestored("openaiRealtime"));
+	          resolve();
         });
         ws.once("error", (error) => {
           rejectConnection = undefined;
@@ -3707,9 +3319,13 @@ class RealtimeProxySession {
       return ws;
     })().catch((error) => {
       this.upstreamReady = undefined;
+      const config = this.configProvider();
+      const message = error instanceof Error && error.message
+        ? error.message
+        : readableOpenAIRealtimeConnectionError({ model: config.model });
       this.sendToCodex({
         type: "error",
-        error: { message: error instanceof Error ? error.message : "OpenAI Realtime connection failed." }
+        error: { message }
       });
       return null;
     });
@@ -3720,7 +3336,12 @@ class RealtimeProxySession {
   private updateOpenAISession() {
     this.sendUpstream({
       type: "session.update",
-      session: realtimeSessionConfig(this.configProvider(), this.codexInstructions, this.quiet)
+      session: realtimeSessionConfig(
+        this.configProvider(),
+        this.codexInstructions,
+        this.quiet,
+        this.backgroundWorkContext()
+      )
     });
   }
 
@@ -3822,28 +3443,19 @@ class RealtimeProxySession {
       return;
     }
 
-    if (event.type === "conversation.handoff.append") {
-      this.appendHandoff(event);
-      return;
-    }
-
-    if (await this.handleHandoffFinishedItem(event)) {
-      return;
-    }
-
-    if (this.isLocalMessageHandoffOutput(event)) return;
-
     const userText = conversationItemUserText(event);
-    if (userText && this.pendingHandoffs.size > 0 && isBackendProgressMessage(userText)) {
-      this.appendTextToLatestHandoff(userText);
-      this.log(`[realtime.proxy] swallowed backend progress while delegated task is running: ${userText.slice(0, 160)}`);
-      return;
-    }
     if (userText && !isBackendProgressMessage(userText) && !isCodexFinalResultMessage(userText)) {
-      if (!this.handleStopCommand(userText)) this.scheduleAutoHandoff(userText);
+	      if (!this.handleVoiceControlCommand(userText)) {
+        const item = jsonObject(event.item);
+        this.beginContinuityUser(this.realtimeProvider(), userText, stringValue(item?.id, event.item_id));
+      }
     }
 
     if (event.type === "response.create" && this.quiet) return;
+    if (event.type === "response.cancel" && !this.isGeminiLive()) {
+      this.interruptOpenAIResponse("manual");
+      return;
+    }
     if (event.type === "response.cancel") this.interruptContinuityTurn();
 
 	    if (this.isGeminiLive()) {
@@ -3897,9 +3509,10 @@ class RealtimeProxySession {
       geminiResumptionHandles.set(this.geminiResumeKey, newHandle);
     }
 
-	    if (event.setupComplete) {
-	      this.log("[realtime.proxy] Gemini Live setup complete");
-	      if (this.geminiSession) this.restoreGeminiHistory();
+		    if (event.setupComplete) {
+		      this.log("[realtime.proxy] Gemini Live setup complete");
+		      this.voiceCoordinator.recordProviderEvent(providerConnectionRestored("geminiLive"));
+		      if (this.geminiSession) this.restoreGeminiHistory();
 	      return;
 	    }
 
@@ -3912,9 +3525,11 @@ class RealtimeProxySession {
     const content = jsonObject(event.serverContent);
     if (!content) return;
 
-	    if (content.interrupted) {
-	      this.log("[realtime.proxy] Gemini Live interrupted");
-	      this.interruptContinuityTurn();
+		    if (content.interrupted) {
+		      this.log("[realtime.proxy] Gemini Live interrupted");
+		      this.voiceCoordinator.recordProviderEvent(
+		        providerInterrupted("geminiLive", this.currentVoiceTurnID, "speech")
+		      );
       this.sendToCodex({
         type: "input_audio_buffer.speech_started",
         item_id: `item_gemini_interrupt_${Date.now()}`
@@ -3931,7 +3546,7 @@ class RealtimeProxySession {
 	      this.geminiContinuityItemID ||= makeShortRealtimeID("gemturn", ++this.continuityTurnSequence);
 	      this.beginContinuityUser("geminiLive", this.geminiInputTranscript, this.geminiContinuityItemID);
 	      this.log(`[realtime.proxy] Gemini input transcript updated chars=${this.geminiInputTranscript.length}`);
-      if (!this.handleStopCommand(this.geminiInputTranscript)) this.scheduleAutoHandoff(this.geminiInputTranscript);
+      this.handleVoiceControlCommand(this.geminiInputTranscript);
       this.sendToCodex({
         type: "conversation.item.input_audio_transcription.completed",
         item_id: `item_gemini_input_${Date.now()}`,
@@ -3968,296 +3583,52 @@ class RealtimeProxySession {
     }
   }
 
-	  private async onGeminiToolCalls(functionCalls: unknown[]) {
-	    if (functionCalls.length) {
-	      if (this.geminiInputTranscript.trim()) {
-	        this.geminiContinuityItemID ||= makeShortRealtimeID("gemturn", ++this.continuityTurnSequence);
-	        this.beginContinuityUser("geminiLive", this.geminiInputTranscript, this.geminiContinuityItemID);
-	      }
-	      this.markContinuityOwnedExternally();
-	    }
-	    const responses: JsonObject[] = [];
-	    let gatedToolSpeech = false;
-	    for (const rawCall of functionCalls) {
-	      const call = jsonObject(rawCall);
-	      if (!call) continue;
-	      const name = stringValue(call.name);
-	      if (!name) continue;
-	      const callID = stringValue(call.id, call.call_id) || makeShortRealtimeID("gemcall");
-	      const args = jsonObject(call.args) ?? jsonObject(parseJSON(stringValue(call.arguments))) ?? {};
-	      if (isAnswerBearingRealtimeTool(name) && !this.reserveVoiceToolCall(callID)) {
-	        responses.push({ id: callID, name, response: { output: "This voice turn is already being handled." } });
-	        continue;
-	      }
-	      if (isAnswerBearingRealtimeTool(name)) {
-	        gatedToolSpeech = true;
-	        this.toolGateDropActive = true;
-	        this.transition("toolPending", `gemini_function_call:${name}`);
-	        this.finishGeminiAudio("function-call");
-	        this.sendToCodex({ type: "output_audio_buffer.cleared" });
-	      }
-	      if (name === "wait_for_user") {
-	        responses.push({ id: callID, name, response: { output: "Waiting for the user." } });
-	        continue;
+  private async onGeminiToolCalls(functionCalls: unknown[]) {
+    if (functionCalls.length) {
+      if (this.geminiInputTranscript.trim()) {
+        this.geminiContinuityItemID ||= makeShortRealtimeID("gemturn", ++this.continuityTurnSequence);
+        this.beginContinuityUser("geminiLive", this.geminiInputTranscript, this.geminiContinuityItemID);
       }
-
-	      if (name === "set_listening_mode") {
-	        const mode = stringValue(args.mode, args.state).toLowerCase();
-	        this.quiet = /quiet|mute|pause|stop|off|not.listening/.test(mode);
-	        this.refreshSessionState(this.quiet ? "gemini quiet mode" : "gemini listening mode");
-	        responses.push({ id: callID, name, response: { output: this.quiet ? "Quiet mode is on." : "Listening mode is on." } });
-        if (this.quiet) {
-          // Cut any answer that is currently playing and clear the renderer's
-          // audio buffer so going quiet takes effect immediately.
-          this.finishGeminiAudio("quiet");
-          this.sendToCodex({ type: "output_audio_buffer.cleared" });
-        } else {
-          this.drainParallelResults();
-        }
-        continue;
-      }
-
-	      if (name === "get_delegated_task_status") {
-	        this.claimVoiceTurn("status", callID);
-	        responses.push({ id: callID, name, response: { output: await this.delegatedTaskStatusText() } });
-	        continue;
-	      }
-
-	      if (name === "cancel_delegated_task") {
-	        this.claimVoiceTurn("cancel", callID);
-	        responses.push({ id: callID, name, response: { output: await this.cancelDelegatedTask() } });
-	        continue;
-	      }
-
-	      if (name === "request_codex_image_generation") {
-	        responses.push({
-	          id: callID,
-	          name,
-	          response: { output: await this.codexImageGenerationToolOutput(callID, args, this.geminiInputTranscript || this.lastUserUtterance) }
-	        });
-	        continue;
-	      }
-
-	      if (name.startsWith("knowledge_")) {
-	        if (!this.claimVoiceTurn("knowledge", callID)) {
-	          responses.push({ id: callID, name, response: { output: "This voice turn is already being handled." } });
-	          continue;
-	        }
-        if (isCasualRealtimeGreeting(this.geminiInputTranscript || this.lastUserUtterance)) {
-          responses.push({ id: callID, name, response: { output: "The user only greeted you. Reply naturally in one short sentence. Do not use knowledge tools for this." } });
-          continue;
-        }
-        const knowledge = this.configProvider().knowledge;
-        if (!knowledge?.enabled) {
-          responses.push({ id: callID, name, response: { output: this.knowledgeUnavailableText(callID) } });
-          continue;
-        }
-        const effectiveArgs = name === "knowledge_personal_recall"
-          ? this.personalRecallArgs(args, this.geminiInputTranscript || this.lastUserUtterance)
-          : args;
-        const promptSnippet = this.geminiInputTranscript || this.lastUserUtterance || JSON.stringify(args);
-        // A memory recall is already running for this turn: a parallel search
-        // (often carrying the PREVIOUS utterance's query) must not race it and
-        // narrate a contradictory "found nothing" before the recall answers.
-        if (
-          name === "knowledge_search_everything"
-          && this.personalRecallInFlightSince
-          && Date.now() - this.personalRecallInFlightSince < 30_000
-        ) {
-          this.log(`[realtime.proxy] deferred ${name} while personal recall in flight promptChars=${promptSnippet.length}`);
-          responses.push({
-            id: callID,
-            name,
-            response: { output: "A saved-memory recall for this request is already running. Wait for its result and answer only from it. Do not tell the user nothing was found." }
-          });
-          continue;
-        }
-        if (this.wasKnowledgeRequestHandled(name, effectiveArgs)) {
-          if (name === "knowledge_personal_recall") {
-            const cachedResult = await this.existingPersonalRecallResult(effectiveArgs);
-            if (cachedResult !== undefined) {
-              this.log(`[realtime.proxy] reused duplicate Gemini personal recall promptChars=${promptSnippet.length}`);
-              this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, cachedResult), undefined, { args: effectiveArgs, result: cachedResult });
-              responses.push({ id: callID, name, response: { output: JSON.stringify(cachedResult, null, 2) } });
-              continue;
-            }
-            this.log(`[realtime.proxy] stale Gemini personal recall dedupe; running recall promptChars=${promptSnippet.length}`);
-          } else {
-            this.log(`[realtime.proxy] ignored duplicate Gemini knowledge ${name} promptChars=${promptSnippet.length}`);
-            responses.push({
-              id: callID,
-              name,
-              response: {
-                output: "This exact request already ran a moment ago, so it was skipped. Do NOT tell the user you just made a change — nothing new was written. If the user asked for something different, call the tool again with the new arguments; otherwise refer to the earlier result."
-              }
-            });
-            continue;
-          }
-        }
-        if (name === "knowledge_personal_recall") {
-          const query = stringValue(effectiveArgs.query, effectiveArgs.question, effectiveArgs.prompt, effectiveArgs.text);
-          const recallRoute = recallRouteForToolCall(query, this.geminiInputTranscript || this.lastUserUtterance);
-          if (recallRoute === "none") {
-            responses.push({ id: callID, name, response: { output: notPersonalRecallToolText() } });
-            continue;
-          }
-          if (recallRoute === "clarify") {
-            responses.push({ id: callID, name, response: { output: recallScopeClarificationText() } });
-            continue;
-          }
-          if (recallRoute === "current") {
-            responses.push({ id: callID, name, response: { output: currentConversationRecallText() } });
-            continue;
-          }
-        }
-        const runningDetail = name === "knowledge_personal_recall"
-          ? personalRecallRunningDetail(effectiveArgs)
-          : `Running ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`;
-        this.notifyDirectWork(callID, name, "running", runningDetail, undefined, { args: effectiveArgs });
-        const stopProgress = this.startDirectWorkProgress(callID, name, effectiveArgs);
-        try {
-          const result = name === "knowledge_personal_recall"
-            ? await this.runPersonalRecall(effectiveArgs, () => knowledge.call(name, effectiveArgs))
-            : await knowledge.call(name, effectiveArgs);
-          this.clearAutoHandoff();
-          this.rememberKnowledgeRequestHandled(name, effectiveArgs, name);
-          this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, result), undefined, { args: effectiveArgs, result });
-          responses.push({ id: callID, name, response: { output: JSON.stringify(result, null, 2) } });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Knowledge access failed.";
-          this.notifyDirectWork(callID, name, "failed", message, message);
-          responses.push({ id: callID, name, response: { output: message } });
-        } finally {
-          stopProgress();
-        }
-        continue;
-      }
-
-      if (name === "delegate_parallel_tasks") {
-        if (!this.claimVoiceTurn("delegate", callID)) {
-          responses.push({ id: callID, name, response: { output: "This voice turn is already being handled." } });
-          continue;
-        }
-        const ack = await this.startParallelDelegation(callID, args);
-        responses.push({ id: callID, name, response: { output: ack } });
-        continue;
-      }
-
-      if (name !== "background_agent") {
-        responses.push({ id: callID, name, response: { output: `Unknown tool: ${name}` } });
-        continue;
-      }
-
-		      const rawPrompt = stringValue(args.prompt, args.task, this.geminiInputTranscript) || "Continue the user's requested task.";
-		      const requestedProject = stringValue(args.project, args.projectID, args.projectName).trim();
-	      if (realtimePromptWantsImageGeneration(rawPrompt)) {
-	        responses.push({
-	          id: callID,
-	          name,
-	          response: {
-	            output: await this.codexImageGenerationToolOutput(callID, { ...args, prompt: rawPrompt }, rawPrompt)
-	          }
-	        });
-	        continue;
-	      }
-	      if (this.pendingHandoffs.size > 0 && isDelegatedStatusQuestion(rawPrompt)) {
-        responses.push({ id: callID, name, response: { output: await this.delegatedTaskStatusText() } });
-        continue;
-      }
-      const userPrompt = (this.geminiInputTranscript || this.lastUserUtterance).trim();
-      if (shouldUseDirectKnowledgeInsteadOfAgent(userPrompt)) {
-        if (!this.claimVoiceTurn("knowledge", callID)) {
-          responses.push({ id: callID, name, response: { output: "This voice turn is already being handled." } });
-          continue;
-        }
-        const knowledge = this.configProvider().knowledge;
-        if (!knowledge?.enabled) {
-          responses.push({ id: callID, name, response: { output: this.knowledgeUnavailableText(callID) } });
-          continue;
-        }
-        if (await this.tryDirectKnowledgeRequest(callID, userPrompt, "function")) continue;
-        responses.push({
-          id: callID,
-          name,
-          response: { output: "Use the matching OpenAssist knowledge tool for this note, planner, task, or reminder request. Do not start a background agent." }
-        });
-        continue;
-      }
-      const recallRoute = conversationRecallRoute(rawPrompt);
-      if (recallRoute !== "none") {
-        if (recallRoute === "clarify") {
-          responses.push({ id: callID, name, response: { output: recallScopeClarificationText() } });
-          continue;
-        }
-        if (recallRoute === "current") {
-          responses.push({ id: callID, name, response: { output: currentConversationRecallText() } });
-          continue;
-        }
-        const knowledge = this.configProvider().knowledge;
-        if (!knowledge?.enabled) {
-          responses.push({
-            id: callID,
-            name,
-            response: { output: this.knowledgeUnavailableText(callID) }
-          });
-          continue;
-        }
-        const recallArgs = this.personalRecallArgs({ query: rawPrompt }, rawPrompt);
-        this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(recallArgs), undefined, { args: recallArgs });
-        const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", recallArgs);
-        try {
-          const result = await this.runPersonalRecall(recallArgs, () => knowledge.call("knowledge_personal_recall", recallArgs));
-          this.clearAutoHandoff();
-          this.rememberKnowledgeRequestHandled("knowledge_personal_recall", recallArgs, "knowledge_personal_recall");
-          this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", knowledgeCompletionDetail("knowledge_personal_recall", result), undefined, { args: recallArgs, result });
-          this.log(`[realtime.proxy] Gemini recall background_agent rerouted to knowledge_personal_recall call_id=${callID}`);
-          responses.push({ id: callID, name, response: { output: JSON.stringify(result, null, 2) } });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Personal recall failed.";
-          this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args: recallArgs });
-          responses.push({ id: callID, name, response: { output: message } });
-        } finally {
-          stopProgress();
-        }
-        continue;
-      }
-      this.evictStaleHandoffs();
-      const decision = await this.routeRealtimeDelegation(rawPrompt, "tool_call");
-      if (!decision.allow) {
-        responses.push({
-          id: callID,
-          name,
-          response: { output: decision.output }
-        });
-        continue;
-      }
-
-	      if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "message")) continue;
-	      if (requestedProject && this.configProvider().parallelDelegation) {
-	        const ack = await this.startParallelDelegation(callID, { tasks: [{ prompt: decision.prompt, project: requestedProject }] });
-	        responses.push({ id: callID, name, response: { output: ack } });
-	        continue;
-	      }
-        this.log(`[realtime.proxy] Gemini Live background_agent routed call_id=${callID}`);
-	      if (!this.claimVoiceTurn("delegate", callID)) {
-	        responses.push({ id: callID, name, response: { output: "This voice turn is already being handled." } });
-	        continue;
-	      }
-	      const start = this.startCodexHandoff(callID, decision.prompt, "message");
-	      responses.push({
-          id: callID,
-          name,
-          response: {
-	          output: start.message
-          }
-        });
+      this.markContinuityOwnedExternally();
     }
 
-	    if (responses.length) {
-	      await this.sendGeminiToolResponses(responses);
-	    }
-	    if (gatedToolSpeech) this.clearToolGate("gemini tool responses sent");
-	  }
+    const responses: JsonObject[] = [];
+    let gatedToolSpeech = false;
+    for (const rawCall of functionCalls) {
+      const call = jsonObject(rawCall);
+      if (!call) continue;
+      const name = stringValue(call.name);
+      if (!name) continue;
+      const callID = stringValue(call.id, call.call_id) || makeShortRealtimeID("gemcall");
+      const args = jsonObject(call.args) ?? jsonObject(parseJSON(stringValue(call.arguments))) ?? {};
+
+      gatedToolSpeech = true;
+      this.geminiAnswerBearingToolHandled = true;
+      this.toolGateDropActive = true;
+      this.transition("toolPending", `gemini_function_call:${name}`);
+      this.finishGeminiAudio("function-call");
+      this.sendToCodex({ type: "output_audio_buffer.cleared" });
+
+      const result = isCoordinatorRealtimeTool(name)
+        ? await this.executeCoordinatorTool("geminiLive", name, callID, args)
+        : {
+            status: "failed",
+            error: `Unknown Live Voice tool: ${name}`,
+            errorCode: "unknown_tool"
+          };
+      const resultStatus = (result as { status?: string; errorCode?: string; capabilityID?: string }) ?? {};
+      this.log(
+        `[live-voice] gemini tool=${name} status=${resultStatus.status ?? "unknown"}`
+        + `${resultStatus.capabilityID ? ` capability=${resultStatus.capabilityID}` : ""}`
+        + `${resultStatus.errorCode ? ` code=${resultStatus.errorCode}` : ""}`
+      );
+      responses.push({ id: callID, name, response: { output: result } });
+    }
+
+    if (responses.length) await this.sendGeminiToolResponses(responses);
+    if (gatedToolSpeech) this.clearToolGate("gemini tool responses sent");
+    this.drainParallelResults();
+  }
 
 	  private sendGeminiAudioDelta(audio: Buffer) {
 	    if (!audio.length) return;
@@ -4266,9 +3637,12 @@ class RealtimeProxySession {
 	    // still hear "start listening again") but its spoken output is dropped here.
 	    if (this.quiet) return;
 	    if (this.toolGateDropActive) return;
-	    if (!this.geminiAudioItemID) {
-	      this.geminiAudioItemID = `item_gemini_audio_${Date.now()}`;
-	      this.markOpenAIResponseActive();
+		    if (!this.geminiAudioItemID) {
+		      this.geminiAudioItemID = `item_gemini_audio_${Date.now()}`;
+		      this.voiceCoordinator.recordProviderEvent(
+		        providerAudioStarted("geminiLive", this.currentVoiceTurnID, this.geminiAudioItemID)
+		      );
+		      this.markOpenAIResponseActive();
 	    }
     this.sendToCodex({
       type: "response.output_audio.delta",
@@ -4283,8 +3657,8 @@ class RealtimeProxySession {
 	  private finishGeminiTurn() {
 	    const audioItemID = this.geminiAudioItemID || `item_gemini_audio_${Date.now()}`;
 	    const wasDelegatedResultNarration = this.parallelResultSpeaking;
-    this.finishGeminiAudio("turn-complete");
 	    const transcript = this.geminiOutputTranscript.trim();
+    this.finishGeminiAudio("turn-complete");
     if (transcript) {
       this.sendToCodex({
         type: "response.output_audio_transcript.done",
@@ -4294,24 +3668,34 @@ class RealtimeProxySession {
         transcript
       });
 	    }
-	    if (!wasDelegatedResultNarration && this.geminiInputTranscript.trim() && transcript) {
+	    if (!wasDelegatedResultNarration && this.geminiInputTranscript.trim() && transcript && !isProgressOnlyAssistantReply(transcript)) {
 	      this.geminiContinuityItemID ||= makeShortRealtimeID("gemturn", ++this.continuityTurnSequence);
 	      this.beginContinuityUser("geminiLive", this.geminiInputTranscript, this.geminiContinuityItemID);
-	      this.claimVoiceTurn("direct", audioItemID);
-	      this.completeContinuityTurn(transcript);
+	      if (this.voiceCoordinator.claimFinalDelivery(this.currentVoiceTurnID, audioItemID)) {
+	        this.completeContinuityTurn(transcript);
+	        this.voiceCoordinator.completeTurn(this.currentVoiceTurnID);
+	      }
 	    } else if (wasDelegatedResultNarration && transcript) {
 	      this.log("[realtime.proxy] skipped continuity persistence for delegated Gemini narration");
 	    }
-	    this.sendToCodex({ type: "response.done", response: { id: `resp_gemini_${Date.now()}`, output: [] } });
+		    const responseID = `resp_gemini_${Date.now()}`;
+		    this.sendToCodex({ type: "response.done", response: { id: responseID, output: [] } });
+		    this.voiceCoordinator.recordProviderEvent(
+		      providerResponseCompleted("geminiLive", this.currentVoiceTurnID, responseID)
+		    );
 	    this.geminiInputTranscript = "";
 	    this.geminiOutputTranscript = "";
 	    this.geminiContinuityItemID = "";
-	    this.resetCurrentVoiceTurn();
+	    const keepToolTurnOpen = (this.geminiAnswerBearingToolHandled && !transcript) || isProgressOnlyAssistantReply(transcript);
+	    this.geminiAnswerBearingToolHandled = false;
+	    if (!keepToolTurnOpen) this.resetCurrentVoiceTurn();
+      this.onParallelNarrationEnded(transcript);
   }
 
   private beginGeminiResponseTurn() {
     if (!this.geminiTurnFinished) return;
     this.geminiTurnFinished = false;
+	    this.geminiAnswerBearingToolHandled = false;
 	    this.geminiInputTranscript = "";
 	    this.geminiOutputTranscript = "";
 	    this.geminiContinuityItemID = "";
@@ -4328,13 +3712,12 @@ class RealtimeProxySession {
 	    this.geminiAudioItemID = "";
 	    this.clearOpenAIResponseActive();
 	    this.flushOpenAIResponseCreate();
-    if (reason === "turn-complete") {
-      this.onParallelNarrationEnded();
-    } else {
+    if (reason !== "turn-complete") {
       // Stop, interrupt, quiet, or connection loss must not immediately start
       // narrating the next queued result over the user; just unblock the queue
       // so it drains at the next natural pause (turn complete / unmute).
-      this.parallelResultSpeaking = false;
+	      const shouldRequeue = ["interrupted", "connection-closed", "quiet", "function-call"].includes(reason);
+	      this.interruptResultNarration(shouldRequeue);
     }
   }
 
@@ -4436,7 +3819,15 @@ class RealtimeProxySession {
         return;
       }
       this.log(`[realtime.proxy] OpenAI error: ${messageText}`);
-      this.sendToCodex({ type: "error", error: { message: messageText } });
+      const shouldMapConnectionError = /api key|auth|permission|forbidden|model|quota|billing|rate limit|invalid_request|invalid argument|service unavailable|overloaded/i.test(messageText);
+      const readableMessage = shouldMapConnectionError
+        ? readableOpenAIRealtimeConnectionError({
+            model: this.configProvider().model,
+            detail: messageText,
+            statusCode: /invalid_request|invalid argument/i.test(messageText) ? 400 : undefined
+          })
+        : messageText;
+      this.sendToCodex({ type: "error", error: { message: readableMessage } });
       return;
     }
 
@@ -4446,25 +3837,40 @@ class RealtimeProxySession {
       return;
     }
 
+    const eventType = stringValue(event.type);
+    if (eventType.startsWith("response.") && eventType !== "response.created" && eventType !== "response.done") {
+      const identity = openAIRealtimeEventIdentity(event, this.activeOpenAIResponseID, this.audioItemID);
+      if (this.interruptedOpenAIResponses.matches(identity.responseID, identity.itemID)) {
+        this.log(
+          `[realtime.audio-diag] dropped interrupted event type=${eventType} response=${identity.responseID || "none"} item=${identity.itemID || "none"}`
+        );
+        return;
+      }
+    }
+
 	    if (event.type === "response.created") {
 	      const response = jsonObject(event.response);
 	      this.activeOpenAIResponseID = stringValue(response?.id, event.response_id);
+	      this.openAIAnswerBearingToolHandled = false;
 	      this.markOpenAIResponseActive();
 	      this.sendToCodex(event);
 	      return;
 	    }
 
     if (event.type === "input_audio_buffer.speech_started") {
-      const hasAssistantAudio = Boolean(this.audioItemID);
-      if (hasAssistantAudio || this.openAIResponseActive) this.interruptContinuityTurn();
-      this.log(
-        `[realtime.audio-diag] speech_started ${hasAssistantAudio ? "interrupt" : "ignored"} ` +
-        `(responseActive=${String(this.openAIResponseActive)} audioItem=${hasAssistantAudio ? this.audioItemID : "none"})`
+      const hasAssistantResponse = Boolean(
+        this.audioItemID
+        || this.pendingOpenAIAudioPlayback()
+        || this.openAIResponseActive
+        || this.activeOpenAIResponseID
       );
-      if (hasAssistantAudio) {
-        this.truncateOpenAIAudio();
-        this.sendToCodex(event);
-      }
+      if (hasAssistantResponse) this.interruptOpenAIResponse("speech");
+      this.log(
+        `[realtime.audio-diag] speech_started ${hasAssistantResponse ? "interrupt" : "new-turn"}`
+      );
+      // Always forward speech-start so the renderer clears audio already queued
+      // for playback, even when the server has not sent an audio item id yet.
+      this.sendToCodex(event);
       return;
     }
 
@@ -4475,12 +3881,18 @@ class RealtimeProxySession {
         this.beginContinuityUser("openaiRealtime", transcript, stringValue(event.item_id, event.itemId));
         this.log(`[realtime.proxy] OpenAI input transcript completed chars=${transcript.length}`);
       }
-      if (transcript && (isBackendProgressMessage(transcript) || isCodexFinalResultMessage(transcript))) {
+      const ignoredTranscript = Boolean(
+        transcript && (isBackendProgressMessage(transcript) || isCodexFinalResultMessage(transcript))
+      );
+      let voiceControlHandled = false;
+      if (ignoredTranscript) {
         this.log(`[realtime.proxy] ignored backend transcript from OpenAI chars=${transcript.length}`);
-      } else if (transcript && this.handleStopCommand(transcript)) {
+      } else if (transcript && this.handleVoiceControlCommand(transcript)) {
+        voiceControlHandled = true;
         // User asked the assistant to stop; already silenced. Do not start a task.
-      } else if (transcript) {
-        this.scheduleAutoHandoff(transcript);
+      }
+      if (transcript && !ignoredTranscript && !voiceControlHandled && !this.quiet) {
+        this.requestOpenAIResponseCreate("finalized transcript");
       }
       this.sendToCodex(event);
       return;
@@ -4503,11 +3915,16 @@ class RealtimeProxySession {
 	    if (event.type === "response.output_item.added") {
 	      const item = jsonObject(event.item);
 	      if (item?.type === "function_call") {
+	        this.openAIFunctionOutputCommitGate.begin(
+	          stringValue(item.call_id),
+	          stringValue(event.response_id, item.response_id, this.activeOpenAIResponseID)
+	        );
 	        this.markContinuityOwnedExternally();
 	        this.gateAnswerBearingToolSpeech(event, item);
 	        if (isAnswerBearingFunctionCallItem(item)) {
-	          this.reserveVoiceToolCall(stringValue(item.call_id));
+	          this.openAIAnswerBearingToolHandled = true;
 	        }
+	        return;
 	      }
 	      this.sendToCodex(event);
 	      return;
@@ -4522,13 +3939,20 @@ class RealtimeProxySession {
 	      const itemID = stringValue(event.item_id, this.audioItemID) || `item_openai_audio_${Date.now()}`;
 	      const audio = delta ? Buffer.from(delta, "base64") : Buffer.alloc(0);
       if (audio.length) this.clearOpenAIDirectResultAudioRetry();
-      if (this.audioItemID !== itemID) {
-        this.audioItemID = itemID;
-        this.audioMs = 0;
+	      if (this.audioItemID !== itemID) {
+	        this.audioItemID = itemID;
+	        this.voiceCoordinator.recordProviderEvent(
+	          providerAudioStarted("openaiRealtime", this.currentVoiceTurnID, itemID)
+	        );
+	        this.audioMs = 0;
+        this.recentOpenAIAudioItemID = itemID;
+        this.recentOpenAIAudioMs = 0;
+        this.recentOpenAIAudioStartedAt = Date.now();
       }
       if (audio.length) {
         const samples = Math.floor(audio.length / 2);
         this.audioMs += Math.max(1, Math.round((samples * 1000) / 24000));
+        this.recentOpenAIAudioMs = this.audioMs;
       }
       this.sendToCodex({
         ...event,
@@ -4555,18 +3979,40 @@ class RealtimeProxySession {
 	    if (event.type === "response.output_item.done") {
 	      const item = jsonObject(event.item);
 	      if (item?.type === "function_call") {
+	        this.openAIFunctionOutputCommitGate.begin(
+	          stringValue(item.call_id),
+	          stringValue(event.response_id, item.response_id, this.activeOpenAIResponseID)
+	        );
 	        this.markContinuityOwnedExternally();
 	        this.gateAnswerBearingToolSpeech(event, item);
 	        if (isAnswerBearingFunctionCallItem(item)) {
-	          this.reserveVoiceToolCall(stringValue(item.call_id));
+	          this.openAIAnswerBearingToolHandled = true;
 	        }
 	        await this.handleFunctionCall(item);
 	        return;
 	      }
     }
 
-	    if (event.type === "response.done") {
+		    if (event.type === "response.done") {
+		      const responseTurnID = this.currentVoiceTurnID;
+		      const doneIdentity = openAIRealtimeEventIdentity(event, this.activeOpenAIResponseID, this.audioItemID);
+	      const response = jsonObject(event.response);
+	      const output = Array.isArray(response?.output) ? response.output : [];
+	      if (this.interruptedOpenAIResponses.matches(doneIdentity.responseID, doneIdentity.itemID)) {
+	        this.openAIFunctionOutputCommitGate.discardResponse(doneIdentity.responseID);
+	        this.interruptedOpenAIResponses.finish(doneIdentity.responseID);
+	        if (!this.activeOpenAIResponseID || this.activeOpenAIResponseID === doneIdentity.responseID) {
+	          this.activeOpenAIResponseID = "";
+	          this.audioItemID = "";
+	          this.audioMs = 0;
+	          this.openAIOutputTranscript = "";
+	          this.clearOpenAIResponseActive();
+	        }
+	        this.log(`[realtime.audio-diag] ignored interrupted response.done response=${doneIdentity.responseID || "none"}`);
+	        return;
+	      }
 	      const wasDelegatedResultNarration = this.parallelResultSpeaking;
+      this.processingOpenAIResponseDone = true;
       // This response has ended, so clear the active flag FIRST. Otherwise any
       // function-call handler below (e.g. a knowledge tool) calls
       // requestOpenAIResponseCreate() while the flag is still set, the spoken reply
@@ -4575,11 +4021,26 @@ class RealtimeProxySession {
 	      this.audioMs = 0;
 	      this.activeOpenAIResponseID = "";
 	      this.clearOpenAIResponseActive();
-	      this.sendToCodex(event);
-	      const response = jsonObject(event.response);
-	      const output = Array.isArray(response?.output) ? response.output : [];
-	      const responseStatus = stringValue(response?.status).toLowerCase();
-	      if (responseStatus && responseStatus !== "completed") this.interruptContinuityTurn();
+	      const codexEvent = codexVisibleOpenAIEvent(event);
+	      if (codexEvent) this.sendToCodex(codexEvent);
+	      const committedCallIDs = output.flatMap((item) => {
+	        const object = jsonObject(item);
+	        return object?.type === "function_call" ? [stringValue(object.call_id)] : [];
+	      }).filter(Boolean);
+	      const committedFunctionOutputs = this.openAIFunctionOutputCommitGate.finishResponse(
+	        doneIdentity.responseID || stringValue(response?.id),
+	        committedCallIDs
+	      );
+	      for (const [callID, pendingOutput] of committedFunctionOutputs) {
+	        this.log(`[realtime.proxy] releasing committed function output call_id=${callID}`);
+	        this.sendOpenAIFunctionOutputNow(callID, pendingOutput);
+	      }
+		      const responseStatus = stringValue(response?.status).toLowerCase();
+		      if (responseStatus && responseStatus !== "completed") {
+		        this.voiceCoordinator.recordProviderEvent(
+		          providerInterrupted("openaiRealtime", responseTurnID, responseStatus)
+		        );
+		      }
 	      for (const item of output) {
 	        const object = jsonObject(item);
 	        if (object?.type === "function_call") {
@@ -4589,556 +4050,180 @@ class RealtimeProxySession {
 	        }
 	      }
 	      const completedTranscript = this.openAIOutputTranscript.trim() || openAIResponseTranscript(response);
+	      const answerBearingToolHandled = this.openAIAnswerBearingToolHandled || output.some((item) => {
+          const object = jsonObject(item);
+          return object?.type === "function_call" && isAnswerBearingFunctionCallItem(object);
+        });
 	      if (completedTranscript) {
 	        this.clearOpenAIDirectResultAudioRetry();
 	        if (wasDelegatedResultNarration) {
 	          this.log("[realtime.proxy] skipped continuity persistence for delegated OpenAI narration");
+	        } else if (!answerBearingToolHandled && !isProgressOnlyAssistantReply(completedTranscript)) {
+	          const deliveryID = stringValue(response?.id) || `direct-${Date.now()}`;
+	          if (this.voiceCoordinator.claimFinalDelivery(this.currentVoiceTurnID, deliveryID)) {
+	            this.completeContinuityTurn(completedTranscript);
+	            this.voiceCoordinator.completeTurn(this.currentVoiceTurnID);
+	          }
 	        } else {
-	          this.claimVoiceTurn("direct", stringValue(response?.id) || `direct-${Date.now()}`);
-	          this.completeContinuityTurn(completedTranscript);
+          this.log("[realtime.proxy] kept the voice turn open for its answer-bearing tool");
 	        }
 	      }
 	      this.openAIOutputTranscript = "";
-	      this.resetCurrentVoiceTurn();
+	      this.openAIAnswerBearingToolHandled = false;
+	      if (!answerBearingToolHandled && !isProgressOnlyAssistantReply(completedTranscript)) this.resetCurrentVoiceTurn();
 	      this.clearToolGate("response.done");
 	      this.flushOpenAIResponseCreate();
-	      this.onParallelNarrationEnded();
+	      this.onParallelNarrationEnded(completedTranscript);
+	      this.voiceCoordinator.recordProviderEvent(
+	        providerResponseCompleted(
+	          "openaiRealtime",
+	          responseTurnID,
+	          doneIdentity.responseID || stringValue(response?.id)
+	        )
+	      );
+        this.processingOpenAIResponseDone = false;
+        this.drainParallelResults();
 	      return;
     }
 
-    this.sendToCodex(event);
+    const codexEvent = codexVisibleOpenAIEvent(event);
+    if (codexEvent) this.sendToCodex(codexEvent);
   }
 
   private async handleFunctionCall(item: JsonObject) {
     const callID = stringValue(item.call_id);
+    const name = stringValue(item.name);
     if (!callID) {
-      this.log(`[realtime.proxy] ignored function call without call_id: ${stringValue(item.name) || "unknown"}`);
+      this.log(`[realtime.proxy] ignored function call without call_id: ${name || "unknown"}`);
       return;
     }
     if (this.handledCalls.has(callID)) return;
-    const name = stringValue(item.name);
-    if (isAnswerBearingRealtimeTool(name) && !this.reserveVoiceToolCall(callID)) {
-      this.sendFunctionOutput(callID, "This voice turn is already being handled.", false);
-      return;
-    }
     this.handledCalls.add(callID);
     if (this.handledCalls.size > 100) {
       const oldest = this.handledCalls.values().next().value;
       if (oldest) this.handledCalls.delete(oldest);
     }
 
-    if (name === "wait_for_user") {
-      this.sendFunctionOutput(callID, "Waiting for the user.", false);
+    if (!isCoordinatorRealtimeTool(name)) {
+      this.sendFunctionOutput(callID, JSON.stringify({
+        status: "failed",
+        error: `Unknown Live Voice tool: ${name}`,
+        errorCode: "unknown_tool"
+      }), true);
       return;
     }
 
-	    if (name === "set_listening_mode") {
-	      const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-	      const mode = stringValue(args.mode, args.state).toLowerCase();
-	      this.quiet = /quiet|mute|pause|stop|off|not.listening/.test(mode);
-	      this.refreshSessionState(this.quiet ? "quiet mode" : "listening mode");
-	      this.sendFunctionOutput(callID, this.quiet ? "Quiet mode is on." : "Listening mode is on.", !this.quiet);
-      this.updateOpenAISession();
-      // Coming out of quiet mode: speak any parallel-task results that finished while
-      // we were muted, so they are not lost.
-      if (!this.quiet) this.drainParallelResults();
-      return;
-    }
-
-	    if (name === "get_delegated_task_status") {
-	      this.claimVoiceTurn("status", callID);
-	      this.sendFunctionOutput(callID, await this.delegatedTaskStatusText(), true);
-	      return;
-	    }
-
-	    if (name === "cancel_delegated_task") {
-	      this.claimVoiceTurn("cancel", callID);
-	      this.sendFunctionOutput(callID, await this.cancelDelegatedTask(), true);
-	      return;
-	    }
-
-	    if (name === "request_codex_image_generation") {
-	      const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-	      this.sendFunctionOutput(callID, await this.codexImageGenerationToolOutput(callID, args, this.lastUserUtterance), true);
-	      return;
-	    }
-
-	    if (name === "delegate_parallel_tasks") {
-	      if (!this.claimVoiceTurn("delegate", callID)) {
-	        this.sendFunctionOutput(callID, "This voice turn is already being handled.", false);
-	        return;
-	      }
-	      await this.handleParallelDelegation(callID, item);
-	      return;
-    }
-
-    if (name.startsWith("knowledge_")) {
-      if (!this.claimVoiceTurn("knowledge", callID)) {
-        this.sendFunctionOutput(callID, "This voice turn is already being handled.", false);
-        return;
-      }
-      if (isCasualRealtimeGreeting(this.lastUserUtterance)) {
-        this.sendFunctionOutput(callID, "The user only greeted you. Reply naturally in one short sentence. Do not use knowledge tools for this.", true);
-        return;
-      }
-      const knowledge = this.configProvider().knowledge;
-      if (!knowledge?.enabled) {
-        this.sendFunctionOutput(callID, this.knowledgeUnavailableText(callID), true);
-        return;
-      }
-      const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-      const effectiveArgs = name === "knowledge_personal_recall"
-        ? this.personalRecallArgs(args, this.lastUserUtterance)
-        : args;
-      if (
-        name === "knowledge_search_everything"
-        && this.personalRecallInFlightSince
-        && Date.now() - this.personalRecallInFlightSince < 30_000
-      ) {
-        this.log(`[realtime.proxy] deferred ${name} while personal recall in flight`);
-        this.sendFunctionOutput(callID, "A saved-memory recall for this request is already running. Wait for its result and answer only from it. Do not tell the user nothing was found.", true);
-        return;
-      }
-      if (this.wasKnowledgeRequestHandled(name, effectiveArgs)) {
-        if (name === "knowledge_personal_recall") {
-          const cachedResult = await this.existingPersonalRecallResult(effectiveArgs);
-          if (cachedResult !== undefined) {
-            this.log("[realtime.proxy] reused duplicate personal recall");
-            this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, cachedResult), undefined, { args: effectiveArgs, result: cachedResult });
-            this.sendFunctionOutput(callID, JSON.stringify(cachedResult, null, 2), true);
-            return;
-          }
-          this.log("[realtime.proxy] stale personal recall dedupe; running recall");
-        } else {
-          this.log(`[realtime.proxy] ignored duplicate knowledge ${name}`);
-          this.sendFunctionOutput(callID, "This exact request already ran a moment ago, so it was skipped. Do NOT tell the user you just made a change — nothing new was written. If the user asked for something different, call the tool again with the new arguments; otherwise refer to the earlier result.", true);
-          return;
-        }
-      }
-      if (name === "knowledge_personal_recall") {
-        const query = stringValue(effectiveArgs.query, effectiveArgs.question, effectiveArgs.prompt, effectiveArgs.text);
-        const recallRoute = recallRouteForToolCall(query, this.lastUserUtterance);
-        if (recallRoute === "none") {
-          this.sendFunctionOutput(callID, notPersonalRecallToolText(), true);
-          return;
-        }
-        if (recallRoute === "clarify") {
-          this.sendFunctionOutput(callID, recallScopeClarificationText(), true);
-          return;
-        }
-        if (recallRoute === "current") {
-          this.sendFunctionOutput(callID, currentConversationRecallText(), true);
-          return;
-        }
-      }
-      const runningDetail = name === "knowledge_personal_recall"
-        ? personalRecallRunningDetail(effectiveArgs)
-        : `Running ${name.replace(/^knowledge_/, "").replace(/_/g, " ")}.`;
-      this.notifyDirectWork(callID, name, "running", runningDetail, undefined, { args: effectiveArgs });
-      const stopProgress = this.startDirectWorkProgress(callID, name, effectiveArgs);
-      try {
-        const result = name === "knowledge_personal_recall"
-          ? await this.runPersonalRecall(effectiveArgs, () => knowledge.call(name, effectiveArgs))
-          : await knowledge.call(name, effectiveArgs);
-        this.clearAutoHandoff();
-        this.rememberKnowledgeRequestHandled(name, effectiveArgs, name);
-        this.notifyDirectWork(callID, name, "completed", knowledgeCompletionDetail(name, result), undefined, { args: effectiveArgs, result });
-        this.log(`[realtime.audio-diag] knowledge ${name} result sent; requesting spoken reply (active=${String(this.openAIResponseActive)})`);
-        this.sendFunctionOutput(callID, JSON.stringify(result, null, 2), true);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Knowledge access failed.";
-        this.notifyDirectWork(callID, name, "failed", message, message);
-        this.sendFunctionOutput(callID, message, true);
-      } finally {
-        stopProgress();
-      }
-      return;
-    }
-
-    if (name !== "background_agent") return;
-
-	    this.clearAutoHandoff();
-	    const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-	    const rawPrompt = stringValue(args.prompt, args.task, item.arguments) || "Continue the user's requested task.";
-	    const requestedProject = stringValue(args.project, args.projectID, args.projectName).trim();
-	    if (realtimePromptWantsImageGeneration(rawPrompt)) {
-	      this.sendFunctionOutput(callID, await this.codexImageGenerationToolOutput(callID, { ...args, prompt: rawPrompt }, rawPrompt), true);
-	      return;
-	    }
-	    if (this.pendingHandoffs.size > 0 && isDelegatedStatusQuestion(rawPrompt)) {
-      this.sendFunctionOutput(callID, await this.delegatedTaskStatusText(), true);
-      return;
-    }
-    const userPrompt = this.lastUserUtterance.trim();
-    if (shouldUseDirectKnowledgeInsteadOfAgent(userPrompt)) {
-      if (!this.claimVoiceTurn("knowledge", callID)) {
-        this.sendFunctionOutput(callID, "This voice turn is already being handled.", false);
-        return;
-      }
-      const knowledge = this.configProvider().knowledge;
-      if (!knowledge?.enabled) {
-        this.sendFunctionOutput(callID, this.knowledgeUnavailableText(callID), true);
-        return;
-      }
-      if (await this.tryDirectKnowledgeRequest(callID, userPrompt, "function")) return;
-      this.sendFunctionOutput(
-        callID,
-        "Use the matching OpenAssist knowledge tool for this note, planner, task, or reminder request. Do not start a background agent.",
-        true
-      );
-      return;
-    }
-    const recallRoute = conversationRecallRoute(rawPrompt);
-    if (recallRoute !== "none") {
-      if (recallRoute === "clarify") {
-        this.sendFunctionOutput(callID, recallScopeClarificationText(), true);
-        return;
-      }
-      if (recallRoute === "current") {
-        this.sendFunctionOutput(callID, currentConversationRecallText(), true);
-        return;
-      }
-      const knowledge = this.configProvider().knowledge;
-      if (!knowledge?.enabled) {
-        this.log(`[realtime.proxy] blocked recall background_agent without knowledge promptChars=${rawPrompt.length}`);
-        this.sendFunctionOutput(callID, this.knowledgeUnavailableText(callID), true);
-        return;
-      }
-      const recallArgs = this.personalRecallArgs({ query: rawPrompt }, rawPrompt);
-      this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(recallArgs), undefined, { args: recallArgs });
-      const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", recallArgs);
-      try {
-        const result = await this.runPersonalRecall(recallArgs, () => knowledge.call("knowledge_personal_recall", recallArgs));
-        this.clearAutoHandoff();
-        this.rememberKnowledgeRequestHandled("knowledge_personal_recall", recallArgs, "knowledge_personal_recall");
-        this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", knowledgeCompletionDetail("knowledge_personal_recall", result), undefined, { args: recallArgs, result });
-        this.log(`[realtime.proxy] rerouted recall background_agent to knowledge_personal_recall call_id=${callID}`);
-        this.sendFunctionOutput(callID, JSON.stringify(result, null, 2), true);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Personal recall failed.";
-        this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args: recallArgs });
-        this.sendFunctionOutput(callID, message, true);
-      } finally {
-        stopProgress();
-      }
-      return;
-    }
-    this.evictStaleHandoffs();
-    const decision = await this.routeRealtimeDelegation(rawPrompt, "tool_call");
-    if (!decision.allow) {
-      this.log(`[realtime.proxy] ignored background_agent (${decision.reason}): ${rawPrompt.slice(0, 160)}`);
-      this.sendFunctionOutput(callID, decision.output, decision.createResponse);
-      return;
-    }
-
-      const duplicatePrompt = Array.from(this.pendingHandoffs.values()).some(
-        (handoff) => normalizeRealtimeIntent(handoff.prompt) === decision.normalizedPrompt
-      );
-      if (duplicatePrompt) {
-        this.log(`[realtime.proxy] ignored duplicate background_agent promptChars=${decision.prompt.length}`);
-        const agentLabel = this.configProvider().handoff?.agentLabel || "Codex";
-        this.sendFunctionOutput(callID, `That ${agentLabel} task is already running. Do not start a duplicate.`, false);
-        return;
-      }
-
-	      if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "function")) return;
-	      if (requestedProject && this.configProvider().parallelDelegation) {
-	        const ack = await this.startParallelDelegation(callID, { tasks: [{ prompt: decision.prompt, project: requestedProject }] });
-	        this.sendFunctionOutput(callID, ack, true);
-	        return;
-	      }
-	      if (!this.claimVoiceTurn("delegate", callID)) {
-	        this.sendFunctionOutput(callID, "This voice turn is already being handled.", false);
-	        return;
-	      }
-	    const start = this.startCodexHandoff(callID, decision.prompt, "message");
-	    this.sendFunctionOutput(callID, start.message, true);
+    const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
+    const result = await this.executeCoordinatorTool("openaiRealtime", name, callID, args);
+    this.sendFunctionOutput(callID, JSON.stringify(result), true);
   }
 
-  // Returns true when the transcript is a stop/interrupt phrase. Immediately
-  // silences the assistant (truncate audio + cancel the active response) so the
-  // user can cut in. A background task that is already running is left to finish.
-  private handleStopCommand(transcript: string) {
-    const normalized = normalizeRealtimeIntent(transcript);
-    if (isDelegatedTaskCancellationRequest(normalized)) return false;
-    if (!normalized || !isStopOrDismissal(normalized)) return false;
-    this.interruptContinuityTurn();
-    this.log("[realtime.proxy] stop phrase heard; silencing assistant");
-    this.clearAutoHandoff();
-    this.lastAutoHandoffNormalizedPrompt = normalized;
-    if (this.isGeminiLive()) {
-      this.finishGeminiAudio("user-stop");
-      this.sendToCodex({ type: "output_audio_buffer.cleared" });
-      return true;
-    }
-    if (this.openAIResponseActive) {
-      this.sendUpstream({ type: "response.cancel" });
-      this.clearOpenAIResponseActive();
-    }
-    this.openAIResponseCreatePending = null;
-    this.truncateOpenAIAudio();
-    this.sendToCodex({ type: "output_audio_buffer.cleared" });
-    return true;
-  }
+	private pendingOpenAIAudioPlayback() {
+	  const itemID = this.recentOpenAIAudioItemID;
+	  const receivedMs = this.recentOpenAIAudioMs;
+	  if (!itemID || !receivedMs) return null;
+	  const playedMs = playedOpenAIAudioMs(receivedMs, this.recentOpenAIAudioStartedAt);
+	  if (!this.audioItemID && playedMs >= receivedMs) {
+	    this.recentOpenAIAudioItemID = "";
+	    this.recentOpenAIAudioMs = 0;
+	    this.recentOpenAIAudioStartedAt = 0;
+	    return null;
+	  }
+	  return { itemID, playedMs };
+	}
 
-  private scheduleAutoHandoff(transcript: string, turnID = this.currentVoiceTurnID) {
-    if (this.quiet) return;
-    this.evictStaleHandoffs();
-	    this.rememberRecentUserUtterance(transcript);
-	    this.lastUserUtterance = transcript;
-	    const stableTurnID = turnID || this.continuityTurnID(this.realtimeProvider());
-	    if (!this.currentVoiceTurnID) this.currentVoiceTurnID = stableTurnID;
-	    if (isDelegatedTaskCancellationRequest(transcript)) {
-	      const callID = makeShortRealtimeID("callcancel", ++this.autoHandoffSequence);
-	      if (this.claimVoiceTurn("cancel", callID, stableTurnID)) {
-	        void this.cancelDelegatedTask().then((text) => this.speakDirectText(text));
-	      }
-	      return;
-	    }
-	    if (isDelegatedStatusQuestion(transcript) && this.taskCoordinator.latestRelevant(this.taskScopeKey())) {
-	      const callID = makeShortRealtimeID("callstatus", ++this.autoHandoffSequence);
-	      if (this.claimVoiceTurn("status", callID, stableTurnID)) {
-	        void this.delegatedTaskStatusText().then((text) => this.speakDirectText(text));
-	      }
-	      return;
-	    }
-	    if (this.wasKnowledgeHandled(transcript)) return;
-	    if (realtimePromptWantsImageGeneration(transcript)) return;
-    const decision = decideRealtimeDelegation(transcript, this.pendingHandoffs.size > 0, this.lastDelegationPrompt, {
-      blockRealtimeKnowledgeTasks: true,
-      recentKnowledgePrompt: this.recentKnowledgePrompt()
-    });
-	    this.log(
-	      `[realtime.proxy] auto route decision allow=${String(decision.allow)} ` +
-	      `reason=${decision.allow ? "delegate" : decision.reason} chars=${transcript.length}`
-	    );
-    if (!decision.allow) {
-      if (decision.reason === "conversation recall") {
-        const callID = makeShortRealtimeID("callrec", ++this.autoHandoffSequence);
-	        if (this.claimVoiceTurn("knowledge", callID, stableTurnID)) {
-	          void this.tryPersonalRecallRequest(callID, transcript, "message");
-	        }
-      } else if (decision.reason === "ambiguous recall scope") {
-        void this.speakDirectText(recallScopeClarificationText());
-      }
-      return;
-    }
-    if (decision.normalizedPrompt === this.lastAutoHandoffNormalizedPrompt) return;
-    this.clearAutoHandoff();
-    this.autoHandoffTimer = setTimeout(() => {
-      void this.runAutoHandoff(transcript, stableTurnID);
-    }, autoHandoffDelayMs);
-  }
+	private clearOpenAIAudioPlayback() {
+	  this.audioItemID = "";
+	  this.audioMs = 0;
+	  this.recentOpenAIAudioItemID = "";
+	  this.recentOpenAIAudioMs = 0;
+	  this.recentOpenAIAudioStartedAt = 0;
+	}
 
-  private async runAutoHandoff(transcript: string, turnID: string) {
-    this.autoHandoffTimer = undefined;
-    this.evictStaleHandoffs();
-    if (this.delegationStartInFlight) return;
-    if (this.wasKnowledgeHandled(transcript)) return;
-    if (realtimePromptWantsImageGeneration(transcript)) return;
-    this.delegationStartInFlight = true;
-    try {
-      if (this.openAIOutputTranscript.trim() || this.geminiOutputTranscript.trim()) {
-        this.claimVoiceTurn("direct", `direct-${turnID}`, turnID);
-        this.log("[realtime.proxy] skipped automatic delegation because the assistant already started a direct reply");
-        return;
-      }
-      const decision = await this.routeRealtimeDelegation(transcript, "auto_transcript");
-      if (!decision.allow) return;
-      if (this.openAIOutputTranscript.trim() || this.geminiOutputTranscript.trim()) {
-        this.claimVoiceTurn("direct", `direct-${turnID}`, turnID);
-        this.log("[realtime.proxy] skipped automatic delegation because a direct reply started while routing");
-        return;
-      }
-      const duplicatePrompt = this.taskCoordinator.hasActivePrompt(decision.prompt, this.taskScopeKey());
-      if (duplicatePrompt || decision.normalizedPrompt === this.lastAutoHandoffNormalizedPrompt) return;
-      const callID = makeShortRealtimeID("calloa", ++this.autoHandoffSequence);
-      if (!this.claimVoiceTurn("delegate", callID, turnID)) return;
-      this.lastAutoHandoffNormalizedPrompt = decision.normalizedPrompt;
-      if (this.openAIResponseActive) {
-        this.sendUpstream({ type: "response.cancel" });
-        this.clearOpenAIResponseActive();
-      }
-      this.truncateOpenAIAudio();
-      this.log(`[realtime.proxy] auto background_agent promptChars=${decision.prompt.length}`);
-      if (await this.tryDirectKnowledgeRequest(callID, decision.prompt, "message")) return;
-      const start = this.startCodexHandoff(callID, decision.prompt, "message", {
-        sourceTurnID: turnID,
-        userText: transcript
+	private interruptOpenAIResponse(reason: OpenAIInterruptionReason) {
+	  const playback = this.pendingOpenAIAudioPlayback();
+	    const plan = planOpenAIInterruption({
+      responseID: this.activeOpenAIResponseID,
+      responseActive: this.openAIResponseActive,
+	    audioItemID: this.audioItemID || playback?.itemID || "",
+	    audioMs: playback?.playedMs ?? 0
+    }, reason);
+    const hadAssistantResponse = Boolean(plan.responseID || plan.audioItemID || this.openAIResponseActive);
+	    if (hadAssistantResponse) {
+	      this.voiceCoordinator.recordProviderEvent(
+	        providerInterrupted("openaiRealtime", this.currentVoiceTurnID, reason)
+	      );
+	    }
+    this.interruptedOpenAIResponses.mark(plan.responseID, plan.audioItemID);
+    this.openAIOutputTranscript = "";
+    this.clearOpenAIDirectResultAudioRetry();
+    if (plan.shouldClearPendingResponse) this.openAIResponseCreatePending = null;
+    if (plan.shouldCancelResponse) this.sendUpstream({ type: "response.cancel" });
+    if (plan.shouldTruncateAudio) {
+      this.sendUpstream({
+        type: "conversation.item.truncate",
+        item_id: plan.audioItemID,
+        content_index: 0,
+        audio_end_ms: plan.audioEndMs
       });
-      void this.speakDirectText(start.message);
-    } finally {
-      this.delegationStartInFlight = false;
     }
+	  this.clearOpenAIAudioPlayback();
+    this.clearOpenAIResponseActive();
+	    this.interruptResultNarration(reason === "speech");
+    if (reason !== "speech") this.sendToCodex({ type: "output_audio_buffer.cleared" });
+    this.log(
+      `[realtime.audio-diag] interrupt reason=${reason} response=${plan.responseID || "none"} item=${plan.audioItemID || "none"} cancel=${String(plan.shouldCancelResponse)}`
+    );
+    return plan;
   }
 
-  private rememberLocalMessageHandoffCallID(callID: string) {
-    this.localMessageHandoffCallIDs.add(callID);
-    if (this.localMessageHandoffCallIDs.size <= 100) return;
-    const oldest = this.localMessageHandoffCallIDs.values().next().value;
-    if (oldest) this.localMessageHandoffCallIDs.delete(oldest);
-  }
+  private handleVoiceControlCommand(transcript: string) {
+    const control = this.voiceCoordinator.handleVoiceControl(transcript);
+    if (!control.handled || !control.action) return false;
 
-  private latestPendingHandoff() {
-    return Array.from(this.pendingHandoffs.values()).at(-1);
-  }
+    this.log(`[live-voice] direct control action=${control.action}`);
+    if (control.action === "resume") {
+	      this.voiceCoordinator.setVoicePhase("listening");
+      if (!this.isGeminiLive()) this.updateOpenAISession();
+      this.refreshSessionState("voice resumed");
+      this.drainParallelResults();
+      return true;
+    }
 
-  private appendTextToLatestHandoff(text: string) {
-    const handoff = this.latestPendingHandoff();
-    if (!handoff) return false;
-    const next = appendHandoffText(handoff.backendText, text);
-    if (next === handoff.backendText) return false;
-    handoff.backendText = next;
-    handoff.lastActivity = compactRealtimeStatusText(text, 500);
-    handoff.updatedAt = Date.now();
+    if (control.action === "stop_listening") {
+      this.stopVoiceManually();
+      return true;
+    }
+
+	    if (control.action === "quiet") this.voiceCoordinator.setVoicePhase("quiet");
+    this.interruptContinuityTurn();
+    if (this.isGeminiLive()) {
+      this.finishGeminiAudio(control.action === "quiet" ? "quiet" : "user-stop");
+      this.sendToCodex({ type: "output_audio_buffer.cleared" });
+    } else {
+      this.interruptOpenAIResponse("manual");
+      if (control.action === "quiet") this.updateOpenAISession();
+    }
+    this.refreshSessionState(control.action === "quiet" ? "voice quiet" : "voice interrupted");
     return true;
-  }
-
-  private appendHandoff(event: JsonObject) {
-    const callID = stringValue(event.handoff_id, event.call_id)
-      || this.pendingHandoffs.keys().next().value
-      || "";
-    const handoff = callID ? this.pendingHandoffs.get(callID) : this.latestPendingHandoff();
-    const text = extractRealtimeText(event);
-    if (!handoff || !text) {
-      this.log(`[realtime.proxy] ignored handoff append call_id=${callID || "none"} textChars=${text.length}`);
-      return;
-    }
-    handoff.backendText = appendHandoffText(handoff.backendText, text);
-    handoff.lastActivity = compactRealtimeStatusText(text, 500);
-    handoff.updatedAt = Date.now();
-    this.log(`[realtime.proxy] buffered agent handoff output call_id=${handoff.callID} chars=${handoff.backendText.length}`);
-  }
-
-  private async handleHandoffFinishedItem(event: JsonObject) {
-    if (event.type !== "conversation.item.create") return false;
-    const item = jsonObject(event.item);
-    if (item?.type !== "function_call_output") return false;
-    const callID = stringValue(item.call_id, event.call_id)
-      || this.pendingHandoffs.keys().next().value
-      || "";
-    const output = extractRealtimeText(item.output ?? item);
-    if (!isBackgroundAgentFinishedOutput(output)) return false;
-    const handoff = callID ? this.pendingHandoffs.get(callID) : this.latestPendingHandoff();
-    if (!handoff) {
-      this.log(`[realtime.proxy] ignored completed handoff with no pending call: ${callID || "none"}`);
-      return true;
-    }
-    await this.completeHandoff(handoff.callID, output);
-    return true;
-  }
-
-  private isLocalMessageHandoffOutput(event: JsonObject) {
-    if (event.type !== "conversation.item.create") return false;
-    const item = jsonObject(event.item);
-    if (item?.type !== "function_call_output") return false;
-    const callID = stringValue(item.call_id, event.call_id);
-    if (!callID || !this.localMessageHandoffCallIDs.has(callID)) return false;
-    this.log(`[realtime.proxy] swallowed local auto-handoff output: ${callID}`);
-    return true;
-  }
-
-  private clearAutoHandoff() {
-    if (!this.autoHandoffTimer) return;
-    clearTimeout(this.autoHandoffTimer);
-    this.autoHandoffTimer = undefined;
-  }
-
-  private async tryDirectKnowledgeRequest(
-    callID: string,
-    prompt: string,
-    replyMode: PendingHandoff["replyMode"]
-  ) {
-    if (isCasualRealtimeGreeting(prompt)) return false;
-    const shortcut = this.configProvider().directKnowledgeRequest;
-    if (!shortcut?.run) return false;
-    try {
-      const output = (await shortcut.run({ callID, prompt, replyMode }))?.trim();
-      if (!output) return false;
-      const agentLabel = "OpenAssist";
-      this.log(`[realtime.proxy] background_agent handled by direct knowledge request call_id=${callID}`);
-      this.clearAutoHandoff();
-      this.rememberKnowledgeHandled(prompt, "directKnowledgeRequest");
-      this.rememberKnowledgeContext(prompt);
-      this.lastDelegationPrompt = prompt;
-      this.lastDelegationResult = output.slice(0, 2_000);
-      this.sendToCodex({ type: "conversation.input_transcript.delta", delta: prompt });
-      if (replyMode === "message") {
-        await this.ensureUpstream();
-        this.sendAgentResultMessage(output, agentLabel);
-      } else {
-        this.sendFunctionOutput(callID, output, true, { agentResult: true, agentLabel });
-      }
-      return true;
-    } catch (error) {
-      this.log(`[realtime.proxy] direct knowledge request failed: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
-    }
-  }
-
-  private async tryPersonalRecallRequest(
-    callID: string,
-    prompt: string,
-    replyMode: PendingHandoff["replyMode"]
-  ) {
-    const knowledge = this.configProvider().knowledge;
-    if (!knowledge?.enabled) {
-      const output = this.knowledgeUnavailableText(callID);
-      if (replyMode === "message") {
-        await this.ensureUpstream();
-        this.sendAgentResultMessage(output, "OpenAssist");
-      } else {
-        this.sendFunctionOutput(callID, output, true);
-      }
-      return true;
-    }
-    const args = this.personalRecallArgs({ query: prompt }, prompt);
-    this.rememberKnowledgeHandled(prompt, "knowledge_personal_recall_pending");
-    this.rememberKnowledgeRequestHandled("knowledge_personal_recall", args, "knowledge_personal_recall_pending");
-    this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(args), undefined, { args });
-    const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", args);
-    try {
-      const result = await this.runPersonalRecall(args, () => knowledge.call("knowledge_personal_recall", args));
-      this.clearAutoHandoff();
-      this.rememberKnowledgeRequestHandled("knowledge_personal_recall", args, "knowledge_personal_recall");
-      const answer = knowledgeCompletionDetail("knowledge_personal_recall", result);
-      this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", answer, undefined, { args, result });
-      this.lastDelegationPrompt = prompt;
-      this.lastDelegationResult = answer.slice(0, 2_000);
-      this.log(`[realtime.proxy] personal recall handled directly call_id=${callID}`);
-      if (replyMode === "message") {
-        await this.ensureUpstream();
-        this.cancelOpenAIResponseBeforeDirectResult("personal recall completed");
-        this.sendAgentResultMessage(answer, "OpenAssist Spark Recall");
-      } else {
-        this.sendFunctionOutput(callID, JSON.stringify(result, null, 2), true);
-      }
-      return true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Personal recall failed.";
-      this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args });
-      if (replyMode === "message") {
-        await this.ensureUpstream();
-        this.cancelOpenAIResponseBeforeDirectResult("personal recall failed");
-        this.sendAgentResultMessage(message, "OpenAssist Spark Recall");
-      } else {
-        this.sendFunctionOutput(callID, message, true);
-      }
-      return true;
-    } finally {
-      stopProgress();
-    }
   }
 
   private startCodexHandoff(
     callID: string,
     prompt: string,
     replyMode: PendingHandoff["replyMode"],
-    options: { sourceTurnID?: string; userText?: string; kind?: PendingHandoff["kind"] } = {}
+    options: {
+      sourceTurnID?: string;
+      userText?: string;
+      kind?: PendingHandoff["kind"];
+      executionProfile?: DelegatedWorkExecutionProfile;
+      freshThread?: boolean;
+      contextResources?: LiveVoiceContextResource[];
+    } = {}
   ) {
     const handoff = this.configProvider().handoff;
     if (!handoff) {
-      return { started: false, message: "No background agent is available for this Live Voice session." };
+      return { started: false, message: "No worker is available for this Live Voice session." };
     }
     const sourceTurnID = options.sourceTurnID || this.currentVoiceTurnID || callID;
     const taskID = options.kind === "parallel"
@@ -5155,6 +4240,9 @@ class RealtimeProxySession {
       userText,
       prompt,
       workerProvider: handoff.agentLabel || "Agent",
+      executionProfile: options.executionProfile,
+      freshThread: options.freshThread,
+      contextResources: options.contextResources,
       replyMode,
       kind: options.kind || "single"
     });
@@ -5168,9 +4256,9 @@ class RealtimeProxySession {
       return { started: false, message: "I could not start that task because the request was empty." };
     }
 
+    this.syncCoordinatorTask(started.task);
     this.markContinuityOwnedExternally();
-    this.lastDelegationPrompt = prompt;
-    this.log(`[realtime.proxy] background_agent routed to ${started.task.agentLabel} task_id=${taskID}`);
+    this.log(`[live-voice] worker started provider=${started.task.agentLabel} task_id=${taskID}`);
     this.publishSessionSnapshot("delegated task started");
     this.startExternalHandoff(started.task, handoff);
     return { started: true, task: started.task, message: delegatedTaskStartedText(started.task.agentLabel) };
@@ -5189,11 +4277,19 @@ class RealtimeProxySession {
           sourceTurnID: task.sourceTurnID,
           callID: task.callID,
           prompt: task.prompt,
+          userText: task.userText,
+          executionProfile: task.executionProfile,
+          freshThread: task.freshThread,
+          contextResources: task.contextResources,
           replyMode: task.replyMode,
           signal: controller.signal,
           onProgress: (detail) => {
-            this.taskCoordinator.updateProgress(task.taskID, detail);
+            this.syncCoordinatorTask(this.taskCoordinator.updateProgress(task.taskID, detail));
             this.publishSessionSnapshot("delegated task progress");
+          },
+          onWorkerResolved: (metadata) => {
+            this.syncCoordinatorTask(this.taskCoordinator.updateWorkerModel(task.taskID, metadata));
+            this.publishSessionSnapshot("delegated worker model selected");
           }
         });
         const output = typeof rawOutput === "string" ? rawOutput : rawOutput.output;
@@ -5215,44 +4311,17 @@ class RealtimeProxySession {
     })();
   }
 
-  // OpenAI Realtime entry: parse the tool args, start the parallel run, and send a
-  // short function_call_output ack. The real results arrive later via the narration
-  // queue (reportTaskResult -> enqueueParallelResult), one spoken reply per task.
-  private async handleParallelDelegation(callID: string, item: JsonObject) {
-    const args = jsonObject(parseJSON(stringValue(item.arguments))) ?? {};
-    const ack = await this.startParallelDelegation(callID, args);
-    this.sendFunctionOutput(callID, ack, true);
-  }
-
   // Shared logic for both OpenAI and Gemini paths. Returns the immediate ack text
   // the model should say; queues each task's result as it finishes.
   private async startParallelDelegation(callID: string, args: JsonObject): Promise<string> {
     const config = this.configProvider();
     const agentLabel = config.handoff?.agentLabel || "Codex";
     const parallel = config.parallelDelegation;
-    const route = routeParallelDelegation(
-      this.parseParallelTasks(args),
-      this.pendingHandoffs.size > 0,
-      this.lastDelegationPrompt,
-      { blockRealtimeKnowledgeTasks: true }
-    );
-    if (route.action !== "proceed") {
-      this.log(`[realtime.proxy] delegate_parallel_tasks guarded call_id=${callID} reason=${route.reason}`);
-      if (route.action === "image") {
-        return this.codexImageGenerationToolOutput(callID, { prompt: route.prompt }, route.prompt);
-      }
-      if (route.action === "recall") {
-        return this.personalRecallRerouteOutput(callID, route.query, "delegate_parallel_tasks");
-      }
-      if (route.reason === "delegated status question") {
-        return this.delegatedTaskStatusText();
-      }
-      return route.output;
-    }
+    const parsedTasks = this.parseParallelTasks(args);
     this.markContinuityOwnedExternally();
-    const tasks = route.tasks.filter((task) => !this.taskCoordinator.hasActivePrompt(task.prompt, this.taskScopeKey()));
+    const tasks = parsedTasks.filter((task) => !this.taskCoordinator.hasActivePrompt(task.prompt, this.taskScopeKey()));
     if (!tasks.length) {
-      this.log(`[realtime.proxy] delegate_parallel_tasks all duplicates call_id=${callID}`);
+      this.log(`[live-voice] parallel worker request contained only duplicates call_id=${callID}`);
       return "That task is already running. Do not start a duplicate; wait for its result.";
     }
     const wasAlreadyBusy = this.taskCoordinator.activeCount(undefined, this.taskScopeKey()) > 0;
@@ -5261,16 +4330,17 @@ class RealtimeProxySession {
     const selectedTasks = tasks.slice(0, availableSlots);
     if (!parallel) {
       for (const task of selectedTasks) {
-        const subCallID = makeShortRealtimeID("callpar", ++this.autoHandoffSequence);
+        const subCallID = makeShortRealtimeID("callpar");
         this.startCodexHandoff(subCallID, task.prompt, "message", {
           sourceTurnID: this.currentVoiceTurnID || callID,
-          kind: "parallel"
+          kind: "parallel",
+          userText: task.prompt,
+          executionProfile: task.executionProfile
         });
       }
       return `Running ${selectedTasks.length} ${selectedTasks.length === 1 ? "task" : "tasks"} with ${agentLabel}. I will share each result when it finishes.`;
     }
 
-    this.clearAutoHandoff();
     const sourceTurnID = this.currentVoiceTurnID || callID;
     const coordinatedTasks = selectedTasks.flatMap((task, index) => {
       const subCallID = `${callID}-${index + 1}`;
@@ -5281,21 +4351,29 @@ class RealtimeProxySession {
         sourceTurnID,
         userText: task.prompt,
         prompt: task.prompt,
-        workerProvider: task.provider || agentLabel,
+        workerProvider: agentLabel,
+        executionProfile: task.executionProfile,
         replyMode: "message",
         kind: "parallel"
       });
+      if (started.ok) this.syncCoordinatorTask(started.task);
       return started.ok ? [{ input: task, task: started.task }] : [];
     });
     if (!coordinatedTasks.length) return "Those tasks are already running.";
     this.publishSessionSnapshot("parallel delegation started");
-    this.log(`[realtime.proxy] delegate_parallel_tasks call_id=${callID} count=${coordinatedTasks.length}`);
+    this.log(`[live-voice] parallel workers started call_id=${callID} count=${coordinatedTasks.length}`);
 
     void (async () => {
       try {
         const summary = await parallel.run({
           callID,
           tasks: coordinatedTasks.map((entry) => entry.input),
+          onTaskWorkerResolved: (index, metadata) => {
+            const coordinated = coordinatedTasks[index]?.task;
+            if (!coordinated) return;
+            this.syncCoordinatorTask(this.taskCoordinator.updateWorkerModel(coordinated.taskID, metadata));
+            this.publishSessionSnapshot("parallel worker model selected");
+          },
           reportTaskResult: (result) => {
             const coordinated = coordinatedTasks[result.index]?.task;
             if (!coordinated) return;
@@ -5315,7 +4393,7 @@ class RealtimeProxySession {
         if (summary.note) this.log(`[realtime.proxy] parallel delegation note: ${summary.note}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Parallel tasks could not be started.";
-        this.log(`[realtime.proxy] delegate_parallel_tasks failed: ${message}`);
+        this.log(`[live-voice] parallel workers failed: ${message}`);
         for (const coordinated of coordinatedTasks) {
           void this.failHandoff(coordinated.task.callID, message);
         }
@@ -5333,36 +4411,9 @@ class RealtimeProxySession {
     return `Starting ${coordinatedTasks.length} ${coordinatedTasks.length === 1 ? "task" : "tasks"} in parallel with ${agentLabel}.${note} I will share each result when it finishes.`;
   }
 
-  // Run a misrouted recall question through Spark personal recall and return the
-  // tool output text, mirroring the background_agent recall reroute.
-  private async personalRecallRerouteOutput(callID: string, query: string, sourceTool: string): Promise<string> {
-    const knowledge = this.configProvider().knowledge;
-    if (!knowledge?.enabled) {
-      this.log(`[realtime.proxy] blocked recall ${sourceTool} without knowledge promptChars=${query.length}`);
-      return this.knowledgeUnavailableText(callID);
-    }
-    const recallArgs = this.personalRecallArgs({ query }, query);
-    this.notifyDirectWork(callID, "knowledge_personal_recall", "running", personalRecallRunningDetail(recallArgs), undefined, { args: recallArgs });
-    const stopProgress = this.startDirectWorkProgress(callID, "knowledge_personal_recall", recallArgs);
-    try {
-      const result = await this.runPersonalRecall(recallArgs, () => knowledge.call("knowledge_personal_recall", recallArgs));
-      this.clearAutoHandoff();
-      this.rememberKnowledgeRequestHandled("knowledge_personal_recall", recallArgs, "knowledge_personal_recall");
-      this.notifyDirectWork(callID, "knowledge_personal_recall", "completed", knowledgeCompletionDetail("knowledge_personal_recall", result), undefined, { args: recallArgs, result });
-      this.log(`[realtime.proxy] rerouted recall ${sourceTool} to knowledge_personal_recall call_id=${callID}`);
-      return JSON.stringify(result, null, 2);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Personal recall failed.";
-      this.notifyDirectWork(callID, "knowledge_personal_recall", "failed", message, message, { args: recallArgs });
-      return message;
-    } finally {
-      stopProgress();
-    }
-  }
-
-  private parseParallelTasks(args: JsonObject): Array<{ prompt: string; provider?: string; project?: string }> {
+  private parseParallelTasks(args: JsonObject): Array<{ prompt: string; provider?: string; project?: string; executionProfile?: DelegatedWorkExecutionProfile }> {
     const rawList = Array.isArray(args.tasks) ? args.tasks : [];
-    const tasks: Array<{ prompt: string; provider?: string; project?: string }> = [];
+    const tasks: Array<{ prompt: string; provider?: string; project?: string; executionProfile?: DelegatedWorkExecutionProfile }> = [];
     for (const raw of rawList) {
       const entry = jsonObject(raw);
       if (!entry) continue;
@@ -5370,10 +4421,14 @@ class RealtimeProxySession {
       if (!prompt) continue;
       const provider = stringValue(entry.provider, entry.model).trim();
       const project = stringValue(entry.project, entry.folder, entry.group).trim();
+      const executionProfile = normalizeDelegatedWorkExecutionProfile(
+        jsonObject(entry.executionProfile) as DelegatedWorkExecutionProfile | undefined
+      );
       tasks.push({
         prompt,
         provider: provider || undefined,
-        project: project || undefined
+        project: project || undefined,
+        executionProfile
       });
     }
     return tasks;
@@ -5382,7 +4437,16 @@ class RealtimeProxySession {
   // Queue a finished-task result for narration. Speaks immediately if nothing is
   // currently being spoken; otherwise it waits its turn so two results never overlap.
   private enqueueParallelResult(taskID: string, text: string, agentLabel: string) {
-	    this.parallelResultQueue.push({ taskID, text, agentLabel });
+    const task = this.taskCoordinator.get(taskID);
+	    this.enqueueResultNarration({
+      id: `delegated:${taskID}`,
+      kind: "delegated",
+      taskID,
+      text,
+      agentLabel,
+      sourcePrompt: task?.prompt,
+      sourceTurnID: task?.sourceTurnID
+    });
 	    this.taskCoordinator.markDelivery(taskID, "queued");
 	    this.drainParallelResults();
 	  }
@@ -5391,25 +4455,27 @@ class RealtimeProxySession {
   // no active spoken response, and not already mid-narration of a previous result.
   private drainParallelResults() {
     if (this.parallelResultSpeaking) return;
+    if (this.processingOpenAIResponseDone) return;
     if (this.quiet) return;
     if (this.openAIResponseActive || this.geminiAudioItemID) return;
     // A reconnecting OpenAI socket silently swallows response.create; leave the
     // queue intact and retry after the reconnect (ensureUpstream drains again).
     if (!this.isGeminiLive() && this.upstream?.readyState !== WebSocket.OPEN) return;
-	    const next = this.parallelResultQueue.shift();
-	    if (!next) return;
+    const envelope = this.taskCoordinator.nextResult();
+    if (!envelope) return;
+    const next = this.narrationFromOutbox(envelope.deliveryID);
+    if (!next) return;
+	    this.taskCoordinator.markResultDelivery(next.id, "speaking");
 	    this.parallelResultSpeaking = true;
-	    this.parallelResultSpeakingTaskID = next.taskID;
-	    this.taskCoordinator.markDelivery(next.taskID, "speaking");
-	    this.transition("narrating", "parallel result narration");
-	    void this.sendAgentResultMessage(next.text, next.agentLabel).then((sent) => {
+      this.activeResultNarration = next;
+	    if (next.taskID) this.taskCoordinator.markDelivery(next.taskID, "speaking");
+	    this.transition("narrating", `${next.kind} result narration`);
+	    void this.sendAgentResultMessage(next.text, next.agentLabel, next.sourcePrompt).then((sent) => {
       if (!sent) {
-        // Gemini session unavailable; put the result back and retry at the next
-        // drain trigger instead of wedging the queue with speaking=true forever.
-	        this.parallelResultQueue.unshift(next);
+	        this.taskCoordinator.markResultDelivery(next.id, "queued");
 	        this.parallelResultSpeaking = false;
-	        this.parallelResultSpeakingTaskID = "";
-	        this.taskCoordinator.markDelivery(next.taskID, "queued");
+	        this.activeResultNarration = undefined;
+	        if (next.taskID) this.taskCoordinator.markDelivery(next.taskID, "queued");
 	        this.refreshSessionState("parallel narration retry queued");
 	      }
 	    });
@@ -5420,20 +4486,46 @@ class RealtimeProxySession {
 
   // Called when a spoken response finishes, so the next queued parallel result (if any)
   // can start. Hooked from response.done and finishGeminiAudio.
-  private onParallelNarrationEnded() {
+  private onParallelNarrationEnded(spokenText = "") {
+	    const finished = this.activeResultNarration;
 	    if (this.parallelResultSpeaking) {
-	      if (this.parallelResultSpeakingTaskID) {
-	        this.taskCoordinator.markDelivery(this.parallelResultSpeakingTaskID, "delivered");
+	      if (finished) {
+	        this.taskCoordinator.markResultDelivery(finished.id, "delivered");
+	        if (finished.sourceTurnID && this.voiceCoordinator.claimFinalDelivery(finished.sourceTurnID, finished.id)) {
+	          this.voiceCoordinator.completeTurn(finished.sourceTurnID);
+	        }
 	      }
+	      if (finished?.taskID) this.taskCoordinator.markDelivery(finished.taskID, "delivered");
+	      if (finished?.kind === "direct" && finished.callID && finished.toolName) {
+        const detail = spokenText.trim() || knowledgeCompletionDetail(finished.toolName, finished.result);
+        this.notifyDirectWork(finished.callID, finished.toolName, "completed", detail, undefined, {
+          args: finished.args,
+          result: finished.result
+        });
+      }
 	      this.parallelResultSpeaking = false;
-	      this.parallelResultSpeakingTaskID = "";
+	      this.activeResultNarration = undefined;
 	    }
-	    if (this.parallelResultQueue.length) {
+	    if (this.taskCoordinator.pendingResults().length) {
 	      this.drainParallelResults();
 	    } else {
 	      this.refreshSessionState("parallel narration ended");
 	    }
 	  }
+
+  private interruptResultNarration(requeue: boolean) {
+    const active = this.activeResultNarration;
+    if (!active) return;
+    if (requeue) {
+      this.taskCoordinator.markResultDelivery(active.id, "queued");
+      if (active.taskID) this.taskCoordinator.markDelivery(active.taskID, "queued");
+    } else {
+      this.taskCoordinator.markResultDelivery(active.id, "delivered");
+      if (active.taskID) this.taskCoordinator.markDelivery(active.taskID, "delivered");
+    }
+    this.parallelResultSpeaking = false;
+    this.activeResultNarration = undefined;
+  }
 
   private async completeHandoff(callID: string, fallbackOutput = "") {
     const handoff = this.taskCoordinator.getByCallID(callID, this.taskScopeKey());
@@ -5445,15 +4537,15 @@ class RealtimeProxySession {
       this.log(`[realtime.proxy] ignored duplicate completed handoff: ${callID}`);
       return;
     }
-    const resultText = String(fallbackOutput || "").replace(/^background agent (finished|completed):?\s*/i, "").trim();
+    const resultText = String(fallbackOutput || "").trim();
     if (!resultText) {
       await this.failHandoff(callID, "The agent finished without returning an answer.");
       return;
     }
     const completed = this.taskCoordinator.complete(handoff.taskID, resultText);
     if (!completed || completed.state !== "completed") return;
+    this.syncCoordinatorTask(completed);
     // Allow the same request to be delegated again after this one finished.
-    this.lastAutoHandoffNormalizedPrompt = "";
 	    this.publishSessionSnapshot("handoff completed");
     // When other tasks are still running, name the task this result belongs to
     // so the spoken answer can't be mistaken for one of the others.
@@ -5461,7 +4553,6 @@ class RealtimeProxySession {
     const text = othersStillRunning
       ? `Finished task: ${handoff.prompt.slice(0, 90)}\n${resultText}`
       : resultText;
-    this.lastDelegationResult = text.slice(0, 2_000);
     await this.persistDelegatedTask(completed);
     this.notifyTasksIdleIfNeeded();
     if (this.closed || this.codexSocket.readyState !== WebSocket.OPEN) {
@@ -5484,7 +4575,7 @@ class RealtimeProxySession {
     if (!handoff || (handoff.state !== "queued" && handoff.state !== "running")) return;
     const failed = this.taskCoordinator.fail(handoff.taskID, error);
     if (!failed) return;
-    this.lastAutoHandoffNormalizedPrompt = "";
+    this.syncCoordinatorTask(failed);
     this.publishSessionSnapshot("handoff failed");
     await this.persistDelegatedTask(failed);
     this.notifyTasksIdleIfNeeded();
@@ -5520,7 +4611,12 @@ class RealtimeProxySession {
         taskState: task.state === "failed" || task.state === "cancelled" ? task.state : "completed",
         taskStartedAt: task.startedAt,
         taskFinishedAt: task.finishedAt,
-        progressEntries: task.progressEntries.map((entry) => ({ ...entry })).slice(-20)
+        progressEntries: task.progressEntries.map((entry) => ({ ...entry })).slice(-20),
+        workerModelRole: task.workerModelRole,
+        workerModelID: task.workerModelID,
+        workerReasoningEffort: task.workerReasoningEffort,
+        workerSelectionReason: task.workerSelectionReason,
+        workerModelExplicit: task.workerModelExplicit
       });
     } catch {
       continuity.onStatus?.({
@@ -5530,45 +4626,16 @@ class RealtimeProxySession {
     }
   }
 
-	  private async sendAgentResultMessage(output: string, agentLabel: string): Promise<boolean> {
+	  private async sendAgentResultMessage(output: string, agentLabel: string, sourcePrompt = ""): Promise<boolean> {
 	    if (this.isGeminiLive()) {
-	      return this.sendGeminiText(directSpeechInstructions(output, agentLabel));
+	      return this.sendGeminiText(directSpeechInstructions(output, agentLabel, sourcePrompt));
 	    }
 	    const response: JsonObject = {
-	      instructions: directSpeechInstructions(output, agentLabel),
+	      instructions: directSpeechInstructions(output, agentLabel, sourcePrompt),
       input: []
     };
     this.requestOpenAIResponseCreate("agent result", response);
     this.scheduleOpenAIDirectResultAudioRetry("agent result", response);
-    return true;
-  }
-
-  private cancelOpenAIResponseBeforeDirectResult(reason: string) {
-    if (this.isGeminiLive()) return;
-    if (!this.openAIResponseActive && !this.audioItemID) return;
-    this.log(`[realtime.proxy] cancelling active OpenAI response before direct result: ${reason}`);
-    if (this.openAIResponseActive) this.sendUpstream({ type: "response.cancel" });
-    this.openAIResponseCreatePending = null;
-    this.clearOpenAIResponseActive();
-    this.truncateOpenAIAudio();
-    this.sendToCodex({ type: "output_audio_buffer.cleared" });
-  }
-
-  private async speakDirectText(text: string) {
-    const cleanText = compactRealtimeStatusText(text, 500);
-    if (!cleanText) return false;
-    const instruction = `Say exactly this to the user, and do not add anything else:\n${cleanText}`;
-    if (this.isGeminiLive()) {
-      return this.sendGeminiText(instruction);
-    }
-    const upstream = await this.ensureUpstream();
-    if (!upstream) return false;
-    const response: JsonObject = {
-      instructions: instruction,
-      input: []
-    };
-    this.requestOpenAIResponseCreate("direct text", response);
-    this.scheduleOpenAIDirectResultAudioRetry("direct text", response);
     return true;
   }
 
@@ -5584,7 +4651,7 @@ class RealtimeProxySession {
 	      void this.sendGeminiToolResponses([
 	        {
 	          id: callID,
-          name: "background_agent",
+          name: "assistant_delegate_work",
           response: { output: text }
 	        }
 	      ]);
@@ -5595,20 +4662,29 @@ class RealtimeProxySession {
 	      }
 	      return;
 	    }
-	    const agentLabel = options.agentLabel || "Agent";
+	    const pendingOutput: PendingOpenAIFunctionOutput = { output, createResponse, options };
+	    if (this.openAIFunctionOutputCommitGate.defer(callID, pendingOutput)) {
+	      this.log(`[realtime.proxy] deferred function output until response.done call_id=${callID}`);
+	      return;
+	    }
+	    this.sendOpenAIFunctionOutputNow(callID, pendingOutput);
+  }
+
+  private sendOpenAIFunctionOutputNow(callID: string, pending: PendingOpenAIFunctionOutput) {
+    const agentLabel = pending.options.agentLabel || "Agent";
 	    this.sendUpstream({
 	      type: "conversation.item.create",
 	      item: {
 	        type: "function_call_output",
 	        call_id: callID,
-	        output: options.agentResult ? delegatedTaskFunctionOutput(agentLabel) : output
+	        output: pending.options.agentResult ? delegatedTaskFunctionOutput(agentLabel) : pending.output
 	      }
 	    });
-	    if (options.agentResult) {
-	      if (createResponse && !this.quiet) void this.sendAgentResultMessage(output, agentLabel);
+	    if (pending.options.agentResult) {
+	      if (pending.createResponse && !this.quiet) void this.sendAgentResultMessage(pending.output, agentLabel);
 	      return;
 	    }
-	    if (createResponse && !this.quiet) {
+	    if (pending.createResponse && !this.quiet) {
 	      this.requestOpenAIResponseCreate("function output");
 	    }
   }
@@ -5700,11 +4776,11 @@ class RealtimeProxySession {
       this.finishGeminiAudio("truncated");
       return;
     }
-    if (!this.audioItemID) return;
-    const itemID = this.audioItemID;
-    const audioEndMs = Math.max(0, Math.round(this.audioMs));
-    this.audioItemID = "";
-    this.audioMs = 0;
+	  const playback = this.pendingOpenAIAudioPlayback();
+	  const itemID = this.audioItemID || playback?.itemID || "";
+	  if (!itemID) return;
+	  const audioEndMs = playback?.playedMs ?? 0;
+	  this.clearOpenAIAudioPlayback();
     this.sendUpstream({
       type: "conversation.item.truncate",
       item_id: itemID,
@@ -5713,11 +4789,31 @@ class RealtimeProxySession {
     });
   }
 
+  interruptVoiceManually() {
+    if (this.closed) return;
+    if (this.isGeminiLive()) {
+      this.finishGeminiAudio("manual stop");
+      this.sendToCodex({ type: "output_audio_buffer.cleared" });
+      return;
+    }
+    this.interruptOpenAIResponse("manual");
+  }
+
+  stopVoiceManually() {
+    if (this.closed) return;
+    this.interruptVoiceManually();
+    this.closeVoice();
+    if (this.codexSocket.readyState === WebSocket.OPEN || this.codexSocket.readyState === WebSocket.CONNECTING) {
+      this.codexSocket.close(1000, "Live Voice stopped");
+    }
+  }
+
   private closeVoice() {
     if (this.closed) return;
+    if (!this.isGeminiLive()) this.interruptOpenAIResponse("shutdown");
     this.closed = true;
+    this.voiceCoordinator.close();
     this.onClose(this);
-    this.clearAutoHandoff();
     this.stopKeepAlive();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -5726,6 +4822,8 @@ class RealtimeProxySession {
 	    this.clearOpenAIResponseActive();
 	    this.transition("idle", "session closed");
     this.openAIResponseCreatePending = null;
+    this.interruptedOpenAIResponses.clear();
+    this.openAIFunctionOutputCommitGate.clear();
     if (this.upstream?.readyState === WebSocket.OPEN || this.upstream?.readyState === WebSocket.CONNECTING) {
       this.upstream.close();
     }
@@ -5750,14 +4848,15 @@ class RealtimeProxySession {
   }
 }
 
-export const __realtimeRouterTestHooks = {
-  decideRealtimeDelegation,
-  isHighConfidenceRealtimeDelegation,
-  normalizeRealtimeIntent,
-  recallRouteForToolCall,
-  realtimeVoiceKnowledgeToolSpecs,
-  routeParallelDelegation,
-  shouldUseDirectKnowledgeInsteadOfAgent
+export const __realtimeProtocolTestHooks = {
+  codexVisibleOpenAIEvent,
+  OpenAIFunctionOutputCommitGate,
+  isSameRealtimeRequest,
+  openAIRealtimeEventIdentity,
+  realtimeSessionConfig,
+  geminiLiveSessionConfig,
+  liveVoiceCapabilityDescriptors,
+  liveVoicePublicToolSpecs
 };
 
 export class CodexRealtimeProxy extends EventEmitter {
@@ -5823,8 +4922,7 @@ export class CodexRealtimeProxy extends EventEmitter {
               knowledge: liveKnowledge
                 ? { ...liveKnowledge, context: sessionConfig.knowledge?.context }
                 : undefined,
-              directKnowledgeRequest: this.config.directKnowledgeRequest,
-              delegationMode: this.config.delegationMode
+              workerPolicy: this.config.workerPolicy
             };
           },
           this.log,
@@ -5876,6 +4974,14 @@ export class CodexRealtimeProxy extends EventEmitter {
     return sent > 0
       ? { ok: true, sent }
       : { ok: false, error: "Could not send text to Live Voice." };
+  }
+
+  interruptActiveVoice() {
+    for (const session of this.sessions) session.interruptVoiceManually();
+  }
+
+  closeActiveVoice() {
+    for (const session of Array.from(this.sessions)) session.stopVoiceManually();
   }
 
   async cancelDelegatedTask(taskID?: string) {

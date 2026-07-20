@@ -1,88 +1,131 @@
-# Live Voice Architecture Improvement Plan
+# Live Voice Architecture
 
-Status: implemented (2026-07-08). Scope: `electron/realtimeProxy.ts`, `electron/openassistBridge.ts`, renderer voice capture in `src/App.tsx`.
+Status: implemented on 2026-07-17.
 
-Implementation note: Phases 1-5 landed with static guards for tool-call speech gating, handoff narration, shared routing, proxy state events, and the optional echo guard setting.
+This architecture is shared by OpenAI Realtime and Gemini Live. The providers still own audio transport, VAD, playback, and reconnect behavior. OpenAssist owns every decision after a user utterance is final.
 
-## Why
+## Invariants
 
-The current pipeline works, but three structural choices generate most Live Voice bugs:
+1. Every finalized utterance has one `turnID` and one coordinator owner.
+2. A turn can claim no more than one final delivery.
+3. OpenAI Realtime and Gemini Live receive the same four public tools.
+4. Capability discovery never counts as the user's answer.
+5. A failed source, provider, capability, or worker is reported as-is. The coordinator does not switch to another one.
+6. Only explicit cancel language cancels background work.
+7. Result delivery is FIFO. A later utterance cannot discard an earlier completed result.
 
-1. **Behavior is enforced by prompts, not by the protocol.** "Wait for the tool result", "don't read `[BACKEND]` messages", "only speak on `[Agent task finished]`" are all instructions the model can ignore. Every drift becomes a user-visible bug (e.g. answering "no pending tasks" before checking).
-2. **Four layers each keep their own session state** (renderer → bridge → Codex app-server → proxy → OpenAI/Gemini). The stuck-`openAIResponseActive` silence bug and its 12s watchdog are symptoms: state desync is possible by construction.
-3. **Two brains route utterances.** A regex fast-path (`createDirectKnowledgeVoiceResponse`, `decideRealtimeDelegation`, `tryDirectKnowledgeRequest`) intercepts speech before the model. It has repeatedly disagreed with user intent ("add a thing in my home list" answered as a read; recall questions vetoed).
+## Runtime Flow
 
-Each phase below is independently shippable and ends with a verify script (repo convention: `scripts/verify-*.mjs`).
+```text
+microphone or typed Live input
+  -> OpenAI Realtime or Gemini Live adapter
+  -> finalized transcript + provider event
+  -> LiveVoiceCoordinator
+       -> direct conversation, or
+       -> assistant_capability -> hidden capability registry, or
+       -> assistant_delegate_work -> genuine agent work
+  -> task coordinator result outbox
+  -> one spoken result, or Voice Log when the session is closed
+```
 
-## Phase 1 — Make "wait for the tool result" mechanical (highest payoff, small)
+`electron/realtimeProxy.ts` composes the system and handles WebSockets. It does not classify user intent with a second router. `electron/openassistBridge.ts` supplies storage, recall, MCP, image, and worker implementations without deciding where a request should go.
 
-Today: the model can stream a spoken guess AND a `function_call` in the same response. The proxy only handles the call at `response.output_item.done` / `response.done` (realtimeProxy.ts ~3687-3712) — after the guess has already played.
+## Public Tool Surface
 
-Change (proxy only):
+Both realtime providers receive only:
 
-- On `response.output_item.added` (and `.done`) with `item.type === "function_call"` for **answer-bearing tools** (`background_agent`, `delegate_parallel_tasks`, `knowledge_*`, `get_delegated_task_status`, `knowledge_personal_recall`), immediately:
-  - truncate any audio already streaming for that response (reuse the barge-in truncation used by `handleStopCommand`),
-  - drop remaining audio deltas for that response id.
-- Exempt control tools (`wait_for_user`, `set_listening_mode`) — they are not answers.
-- Keep the acknowledgment UX deterministic: after truncation, speak a short proxy-chosen filler ("Checking…") via the existing `directSpeechInstructions` response path (~4491) instead of hoping the model words it well.
-- After `sendFunctionOutput`, exactly one `response.create` produces the real answer.
+- `assistant_capability`: discover or execute local data, notes, planner, task, recall, MCP, and image capabilities.
+- `assistant_delegate_work`: run genuine code, terminal, browser, Computer Use, file, or Codex skill work.
+- `assistant_task_status`: inspect pending work.
+- `assistant_cancel_task`: cancel explicitly requested work.
 
-Result: the model *cannot* answer before the tool result, regardless of instructions. The Phase-0 instruction rules (added 2026-07-07) stay as belt-and-braces.
+OpenAI receives capability results as `function_call_output`. Gemini receives the same result as `FunctionResponse`. Provider-specific code does not choose capabilities.
 
-Guard: `verify:realtime-tool-gate` — feed a synthetic response containing audio deltas + a `function_call`; assert truncation is sent and only one post-tool `response.create` fires. Cover the Gemini tool-call path too.
+## Hidden Capabilities
 
-## Phase 2 — Retire the magic-string handoff protocol
+The private registry stores `CapabilityDescriptor` records with an ID, description, operations, source, schema, risk, execution mode, timeout, and idempotency policy.
 
-Today: agent results are injected into the model's conversation as text starting with `[Agent task finished]` / `[Codex task finished]`, progress as `[BACKEND]`/`[Codex progress]`, and ~6 instruction lines teach the model what to read or ignore.
+The model supplies the user's full goal and may name a source. If one exact capability matches, the coordinator runs it. If several match, it returns `selection_required`; the model must select one exact `capabilityID`. If information is missing, it returns `clarification_required` and the assistant asks one short question.
 
-Change:
+Built-in sources include OpenAssist notes, planner, projects, aggregated tasks, Apple data, personal recall, local MCP, and Codex image generation. Explicit source names win. General to-do questions use the aggregate capability and label each source.
 
-- Progress messages never enter the model conversation. They already render in the app's work card; the proxy filter (`isBackendProgressMessage`) becomes a hard drop instead of "inject + instruct to ignore".
-- On handoff completion, do NOT append the result as a user-visible conversation item. Instead issue `response.create` with per-response instructions: "Narrate this result to the user: …" (same mechanism as `directSpeechInstructions`).
-- The existing FIFO (`pendingHandoffs`, `drainParallelResults`, `onParallelNarrationEnded`) stays, but becomes a proxy-owned narration queue feeding those response.creates one at a time.
-- Delete the now-dead instruction lines (realtimeProxy.ts ~2026-2027, 2070) once verified.
+Capabilities may declare typed output resources. The coordinator keeps the stable IDs from recent read results and returns matching resources during later capability selection. This lets follow-up turns update the item that was actually read instead of trying to recover identity from a spoken summary. Argument binding is automatic only when exactly one resource matches; multiple matches require an exact ID or clarification.
 
-Result: no string-prefix contract between layers; the model can't read progress aloud or "contradict the result" because it never sees raw injected text.
+Operations remain separate contracts. Apple Reminder add, update, and complete are different capabilities, so a rename cannot be implemented by completing the reminder.
 
-Guard: `verify:realtime-handoff-narration` — simulate two parallel task completions; assert results are narrated sequentially via instruction-bearing response.creates and no `[Agent task finished]` text reaches the conversation.
+Personal recall keeps its own Spark memory-first, session-second implementation. A recall failure is returned directly and cannot become local search or regular agent work.
 
-## Phase 3 — One router, with a golden test corpus
+## Codex Worker Models
 
-Today routing decisions are split across the bridge regex router (`createDirectKnowledgeVoiceResponse`, openassistBridge.ts ~13775), `decideRealtimeDelegation`, and `tryDirectKnowledgeRequest` call sites (~3442, 3933, 4022), each patched independently after bugs.
+`assistant_delegate_work` carries a structured execution profile. The coordinator first decides that delegation is needed; only then does `liveVoice/workerModelPolicy.ts` choose the worker role. This policy never competes with capability selection.
 
-Change:
+Normal research, browser work, skills, Computer Use, small edits, and reversible writes use the newest available Codex Spark model with medium reasoning. Deep, complex, high-stakes, or sensitive-write work uses the newest available Sol model with high reasoning. An explicit user request for Spark or Sol wins after the backend confirms that request appears in the finalized transcript.
 
-- Extract one `voiceRouting.ts` module that owns the full decision table: stop/dismissal → recall → mutation verbs (write handlers) → explicit read questions → otherwise defer to the model. Every past routing bug becomes a fixture.
-- Policy simplification: the regex layer may only (a) handle hard control phrases (stop/quiet), (b) fast-path unambiguous writes/reads. Anything ambiguous defers to the model — the regex must never *answer* a question the model would have answered differently.
-- Promote `scratchpad/voice-routing-check.mjs` into `scripts/verify-voice-routing.mjs` with a golden corpus: "add a thing in my home list", "what memory do I have", "is there any pending task", "can you stop", "do A and B at the same time", etc.
+Both roles resolve from the Codex app-server `model/list` catalog before the hidden worker thread starts. Advanced settings may provide an exact model override. A missing role or unavailable override fails the task directly; there is no model substitution, provider switch, or mid-task escalation. OpenAI Realtime does not use Responses web search, and Gemini Live does not enable native Google Search. Current web research is delegated to the selected Codex worker.
 
-Guard: `verify:voice-routing` in package.json.
+Agent Work and `assistant_task_status` expose compact worker metadata: role, model ID, reasoning effort, selection reason, and whether the user explicitly chose the model. Hidden worker conversations remain temporary and are not shown as normal threads.
 
-## Phase 4 — Explicit session state machine
+## Native Permissions
 
-Today: booleans and maps (`openAIResponseActive`, `quiet`, `pendingHandoffs`, `activeParallelDelegations`) spread across the proxy, with a 12s watchdog as the safety net.
+`electron/nativeAccess.ts` owns the single `NativePermissionBroker` used by Settings, connectors, and Live Voice. Each permission records the real process that performs the work, its bundle identity, read/write access, restart requirement, and exact macOS Settings page.
 
-Change:
+Capabilities declare `permissionRequirements`. The coordinator checks them before execution and returns `permission_required` when access is missing. It may request one promptable read permission and retry the same capability once. It never changes source or delegates the request after a permission failure.
 
-- One `RealtimeSessionState` enum: `idle | listening | speaking | toolPending | delegating | narrating | quiet`, with a single `transition(to, reason)` method that logs every change (`[realtime.proxy] state: speaking -> toolPending (function_call)`).
-- Derive the current booleans from the state instead of mutating them independently; the watchdog stays but becomes an invariant checker ("in `speaking` for >12s without audio deltas → force `listening`").
-- Emit state snapshots to the bridge/renderer so the HUD reflects proxy truth instead of inferring its own.
+Apple Reminders and Calendar are checked and used by the same signed EventKit helper. Apple Speech and Computer Use are shown under their own helper identities rather than inheriting Electron's permission state. Settings receives broker change events and refreshes on focus; it does not maintain a polling-based permission cache.
 
-Guard: extend `verify:realtime-protocol` to assert legal transitions for the common flows (barge-in, tool call, parallel delegation, quiet mode).
+EventKit and Speech helpers are compiled into `Contents/Resources/native-helpers` during packaging. Packaged builds never compile or re-sign these helpers at runtime. A development helper without a stable Apple signing identity is reported as `devUnsigned`, not as granted.
 
-## Phase 5 (optional, larger) — Shorten the audio path; echo hygiene
+## State And Delivery
 
-- **Direct audio lane:** investigate renderer → proxy WebSocket for PCM frames, keeping Codex only for delegation/thread persistence. Removes two hops and decouples voice availability from Codex health ("Transport closed" class of failures). Requires auth + lifecycle design; do only after Phases 1-4 stabilize.
-- **Echo:** assistant playback goes through Web Audio, which Chromium's AEC may not cancel; current mitigation is getUserMedia AEC flags. Experiment: half-duplex mic gating while assistant audio plays (weakens barge-in — measure), or route playback through a media element. Keep behind a setting.
+`liveVoice/state.ts` is the only state reducer. Session lifecycle, voice phase, turn phase, and background task state are separate fields in one `VoiceSnapshot`.
 
-## Order and effort
+OpenAI and Gemini events normalize to transcript finalized, tool requested, audio started, response completed, interrupted, connection closed, and connection restored. Late provider events cannot reopen a terminal turn.
 
-| Phase | Effort | Risk | Payoff |
-|---|---|---|---|
-| 1 Tool-call speech gate | ~1 day | low (scoped to proxy) | kills the "answers before checking" class |
-| 2 Handoff narration | ~1 day | low-medium | kills the magic-string class |
-| 3 Unified router | ~1-2 days | medium (behavior parity) | kills the misroute class |
-| 4 State machine | ~1-2 days | medium (touch many sites) | kills the stuck/silent class |
-| 5 Direct lane + echo | ~3-5 days | high | reliability + latency |
+The existing `RealtimeTaskCoordinator` owns the sole `VoiceResultOutbox`. Results are narrated one at a time in creation order. Barge-in can stop current audio without deleting capability work, delegated work, or a queued result. Closing Live Voice stops listening and playback but leaves background tasks alive.
 
-Phases 1 and 2 are the recommended immediate work; 3 and 4 next; 5 only if the failure classes it targets still hurt afterwards.
+## Safety
+
+- A turn may use at most four tool steps.
+- Reads may retry once with the same turn and capability.
+- Writes have an idempotency key and are not blindly retried after an unknown result.
+- Approval tokens are bound to the exact turn, capability, and arguments.
+- A provider cannot replace an unavailable update with a different write operation.
+- Single reversible changes may run directly. Sensitive or batch changes require approval.
+- Structured traces store IDs, timing, lengths, hashes, stages, and error codes. They do not store raw audio or duplicate transcript text.
+- Trace files rotate at a bounded size.
+
+Transport reconnects are allowed because they restore the same request. Gemini session resumption stays inside its provider adapter. These are transport recovery, not semantic fallbacks.
+
+## Main Files
+
+- `electron/liveVoice/contracts.ts`: shared contracts.
+- `electron/liveVoice/state.ts`: event reducer.
+- `electron/liveVoice/capabilityRegistry.ts`: hidden capability selection.
+- `electron/liveVoice/coordinator.ts`: turn ownership, safety, and execution policy.
+- `electron/liveVoice/workerModelPolicy.ts`: Spark/Sol role and catalog selection after delegation.
+- `electron/liveVoice/providerAdapters.ts`: shared tool schemas and normalized events.
+- `electron/liveVoice/resultOutbox.ts`: FIFO final-result delivery.
+- `electron/liveVoice/trace.ts`: bounded structured trace.
+- `electron/nativeAccess.ts`: native permission ownership and EventKit execution gate.
+- `electron/realtimeProxy.ts`: provider transport and composition.
+- `electron/realtimeTaskCoordinator.ts`: background task tracking and sole outbox owner.
+
+## Verification
+
+Run from the repository root:
+
+```bash
+npm run verify:live-voice
+npm --prefix apps/desktop run verify:native-permissions
+npm run build
+```
+
+The architecture tests cover legal reducer transitions, explicit cancellation, reconnect, interruption, delayed and duplicate events, exactly-one delivery, four-step limits, read/write retry rules, approvals, FIFO results, identical provider tools, local MCP, recall isolation, planner move safety, Apple permission errors, and idle CPU guards.
+
+Protocol references:
+
+- [OpenAI Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations)
+- [Gemini Live tools](https://ai.google.dev/gemini-api/docs/live-api/tools)
+- [Gemini Live session management](https://ai.google.dev/gemini-api/docs/live-api/session-management)
+- [LiveKit tool design](https://docs.livekit.io/agents/logic/tools/design/)
+- [LiveKit observability](https://docs.livekit.io/deploy/observability/insights/)

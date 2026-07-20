@@ -1,12 +1,11 @@
 import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, shell, systemPreferences, Tray, type ContextMenuParams, type OpenDialogOptions, type WebContents } from "electron";
 import fs from "node:fs";
-import { execFileSync, spawn, execFile, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  appleEventKitStatus,
   buildGoogleCommandPlan,
   connectorSkillGuide,
   createGoogleConnectorAccount,
@@ -18,11 +17,9 @@ import {
   markConnectorItem,
   ignoreConnectorReviewItems,
   removeGoogleConnectorAccount,
-  requestAppleEventKitAccess,
   reuseGoogleClientSecret,
   saveConnectorItemToBacklogInput,
   setConnectorServiceEnabled,
-  setAppleEventKitCommandRunner,
   syncGmailMetadataToReviewInbox,
   type ConnectorItem,
   type ConnectorItemStatus,
@@ -30,6 +27,14 @@ import {
   type GmailSyncOptions,
   type GoogleConnectorOperation
 } from "./connectors.js";
+import {
+  nativePermissionBroker,
+  setAppleEventKitRunner,
+  updateAppleEventKitOwner,
+  type NativeExecutionIdentity,
+  type NativePermissionID,
+  type NativePermissionState
+} from "./nativeAccess.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -3268,7 +3273,13 @@ function voiceHUDHTML() {
     const linksRow = scope.querySelector(".hud-live-links");
     if (linksRow) {
       const rawLinks = payload && Array.isArray(payload.links) ? payload.links.slice(0, 4) : [];
-      const links = rawLinks.filter((link) => link && typeof link.url === "string" && /^https?:\/\//i.test(link.url));
+      // String checks on purpose: an escaped-slash regex here collapses inside
+      // the TS template literal and syntax-errors the whole HUD page.
+      const isWebURL = (value) => {
+        const lower = String(value || "").toLowerCase();
+        return lower.indexOf("http://") === 0 || lower.indexOf("https://") === 0;
+      };
+      const links = rawLinks.filter((link) => link && typeof link.url === "string" && isWebURL(link.url));
       const key = links.map((link) => link.url).join("|");
       if (linksRow.dataset.key !== key) {
         linksRow.dataset.key = key;
@@ -3941,6 +3952,13 @@ function ensureVoiceHUDWindow() {
     const payload = pendingVoiceHUDPayload;
     if (payload) void updateVoiceHUD(payload);
   });
+  // Mirror HUD-page errors into the debug log — "Script failed to execute"
+  // from executeJavaScript hides the real exception, which only surfaces here.
+  window.webContents.on("console-message", (event) => {
+    const details = event as unknown as { level?: unknown; message?: unknown };
+    if (!["error", "3"].includes(String(details.level ?? ""))) return;
+    debugLog(`voice HUD console error: ${String(details.message ?? "").slice(0, 600)}`);
+  });
   window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(voiceHUDHTML())}`);
   voiceHUDWindow = window;
   return window;
@@ -4293,13 +4311,24 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     }
   }
   if (!voiceHUDReady) return { ok: true, visible: true, pending: true };
+  // A HUD-page error must degrade to a logged warning, not an unhandled
+  // rejection flood in every window that called updateVoiceHUD.
+  const runHUDScript = async (script: string) => {
+    try {
+      await window.webContents.executeJavaScript(script);
+      return true;
+    } catch (error) {
+      debugLog(`voice HUD update script failed status=${String(nextPayload.status ?? "")}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  };
   if (isLevelOnlyUpdate) {
-    await window.webContents.executeJavaScript(
+    await runHUDScript(
       `window.updateOpenAssistVoiceHUDLevel(${JSON.stringify(nextPayload.level ?? 0)}, ${JSON.stringify(nextPayload.dictationLevel ?? 0)})`
     );
     return { ok: true, visible: true };
   }
-  await window.webContents.executeJavaScript(
+  await runHUDScript(
     `window.updateOpenAssistVoiceHUD(${JSON.stringify({
       status: nextPayload.status,
       text: nextPayload.text ?? "",
@@ -4317,6 +4346,7 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
       workText: nextPayload.workText ?? "",
       muted: nextPayload.muted === true,
       approval: nextPayload.approval ?? null,
+      links: Array.isArray(nextPayload.links) ? nextPayload.links.slice(0, 4) : [],
       dictationCapture: nextPayload.dictationCapture === true,
       dictationLevel: nextPayload.dictationLevel ?? 0,
       // The orb follows the user's "Realtime & Snip Glow Color" preset.
@@ -8937,6 +8967,15 @@ function appleEventKitHelperSourcePath() {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
+function appleEventKitHelperEntitlementsPath() {
+  const candidates = [
+    path.join(app.getAppPath(), "electron", "helpers", "apple-eventkit-helper-entitlements.plist"),
+    path.join(process.cwd(), "electron", "helpers", "apple-eventkit-helper-entitlements.plist"),
+    path.join(openAssistRepoRoot(), "apps", "desktop", "electron", "helpers", "apple-eventkit-helper-entitlements.plist")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
 function appleEventKitHelperInfoPlistPath() {
   const candidates = [
     path.join(app.getAppPath(), "electron", "helpers", "apple-eventkit-helper-info.plist"),
@@ -8947,11 +8986,22 @@ function appleEventKitHelperInfoPlistPath() {
 }
 
 async function ensureAppleEventKitHelper() {
+  const bundledHelper = path.join(
+    process.resourcesPath,
+    "native-helpers",
+    "Open Assist Apple EventKit Helper.app"
+  );
+  if (app.isPackaged) {
+    if (!fs.existsSync(bundledHelper)) {
+      throw new Error("The signed Apple EventKit helper is missing from this Open Assist build.");
+    }
+    return bundledHelper;
+  }
   const sourcePath = appleEventKitHelperSourcePath();
   if (!sourcePath) throw new Error("Apple EventKit helper source was not found.");
   const infoPlistPath = appleEventKitHelperInfoPlistPath();
   if (!infoPlistPath) throw new Error("Apple EventKit helper Info.plist was not found.");
-  const helperBuildVersion = "2026-06-21-eventkit-helper-v1";
+  const helperBuildVersion = "2026-07-19-eventkit-helper-v6-search-recurrence";
   const helperBundleIdentifier = "com.developingadventures.OpenAssist.ElectronAppleEventKitHelper";
   const helperDirectory = path.join(app.getPath("userData"), "helpers");
   fs.mkdirSync(helperDirectory, { recursive: true });
@@ -8980,6 +9030,8 @@ async function ensureAppleEventKitHelper() {
       "arm64-apple-macos26.0",
       "-framework",
       "EventKit",
+      "-framework",
+      "AppKit",
       "-Xlinker",
       "-sectcreate",
       "-Xlinker",
@@ -8993,10 +9045,25 @@ async function ensureAppleEventKitHelper() {
       helperPath
     ]);
     fs.chmodSync(helperPath, 0o755);
+    let identities = "";
+    try {
+      identities = execFileSync("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"], { encoding: "utf8" });
+    } catch {
+      identities = "";
+    }
+    const identity = identities.match(/\"(Developer ID Application:[^\"]+)\"/)?.[1]
+      || identities.match(/\"(Apple Development:[^\"]+)\"/)?.[1]
+      || "-";
+    // Hardened runtime silently denies EventKit calendar access unless the
+    // signed binary carries the personal-information entitlements.
+    const entitlementsPath = appleEventKitHelperEntitlementsPath();
     await runProcess("/usr/bin/codesign", [
       "--force",
+      "--options",
+      "runtime",
+      ...(entitlementsPath ? ["--entitlements", entitlementsPath] : []),
       "--sign",
-      "-",
+      identity,
       "--identifier",
       helperBundleIdentifier,
       helperAppPath
@@ -9006,12 +9073,36 @@ async function ensureAppleEventKitHelper() {
   return helperAppPath;
 }
 
+function appleEventKitHelperIdentity(helperAppPath: string): NativeExecutionIdentity {
+  const executable = path.join(helperAppPath, "Contents", "MacOS", "apple-eventkit-helper");
+  let teamID: string | undefined;
+  let designatedRequirement: string | undefined;
+  const detailsResult = spawnSync("/usr/bin/codesign", ["-d", "--verbose=4", helperAppPath], { encoding: "utf8" });
+  const details = `${detailsResult.stdout ?? ""}\n${detailsResult.stderr ?? ""}`;
+  teamID = details.match(/TeamIdentifier=([^\n]+)/)?.[1]?.trim();
+  const requirementResult = spawnSync("/usr/bin/codesign", ["-d", "-r-", helperAppPath], { encoding: "utf8" });
+  designatedRequirement = `${requirementResult.stdout ?? ""}\n${requirementResult.stderr ?? ""}`
+    .replace(/^.*designated =>\s*/ms, "")
+    .trim() || undefined;
+  return {
+    kind: "eventkitHelper",
+    displayName: "Open Assist Apple EventKit Helper",
+    bundleID: "com.developingadventures.OpenAssist.ElectronAppleEventKitHelper",
+    teamID: teamID && teamID !== "not set" ? teamID : undefined,
+    designatedRequirement,
+    executable
+  };
+}
+
 async function runAppleEventKitCommand(command: Record<string, unknown>) {
   if (process.platform !== "darwin") {
     throw new Error("Apple Reminders and Apple Calendar integration is only available on macOS.");
   }
   const helperAppPath = await ensureAppleEventKitHelper();
+  updateAppleEventKitOwner(appleEventKitHelperIdentity(helperAppPath));
   const helperPath = path.join(helperAppPath, "Contents", "MacOS", "apple-eventkit-helper");
+  const startedAt = Date.now();
+  debugLog(`[apple-eventkit] command started name=${String(command.command ?? "unknown")} service=${String(command.service ?? "")}`);
   const { stdout } = await runProcessWithOutput(helperPath, ["--json", JSON.stringify(command)], 90_000);
   const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop();
   if (!line) throw new Error("Apple EventKit helper did not return a response.");
@@ -9022,14 +9113,122 @@ async function runAppleEventKitCommand(command: Record<string, unknown>) {
     throw new Error(`Apple EventKit helper returned invalid JSON: ${line}`);
   }
   if (parsed?.ok !== true) {
+    debugLog(`[apple-eventkit] command failed name=${String(command.command ?? "unknown")} elapsedMs=${Date.now() - startedAt} error=${String(parsed?.error ?? "unknown")}`);
     throw new Error(String(parsed?.error ?? "Apple EventKit helper failed."));
   }
+  debugLog(
+    `[apple-eventkit] command completed name=${String(command.command ?? "unknown")} elapsedMs=${Date.now() - startedAt} ` +
+    `status=${String(parsed?.data?.status ?? parsed?.data?.reminders ?? "unknown")}`
+  );
   return parsed.data;
 }
 
-setAppleEventKitCommandRunner(runAppleEventKitCommand);
+setAppleEventKitRunner(runAppleEventKitCommand);
+
+function mediaPermissionState(kind: "screen" | "microphone"): NativePermissionState {
+  try {
+    const state = systemPreferences.getMediaAccessStatus(kind);
+    if (state === "granted") return "granted";
+    if (state === "denied") return "denied";
+    if (state === "restricted") return "restricted";
+    if (state === "not-determined") return "notDetermined";
+  } catch {
+    return "unknown";
+  }
+  return "unknown";
+}
+
+function registerNativePermissionDescriptors() {
+  const openPrivacySettings = async (url: string) => {
+    debugLog(`[native-permissions] opening settings url=${url}`);
+    await runProcess("/usr/bin/open", [url]);
+  };
+  nativePermissionBroker.setSettingsOpener(openPrivacySettings);
+  const electronOwner: NativeExecutionIdentity = {
+    kind: "electron",
+    displayName: "Open Assist",
+    bundleID: "com.developingadventures.OpenAssist",
+    executable: process.execPath
+  };
+  const settings = (pathValue: string) => () => openPrivacySettings(pathValue);
+  nativePermissionBroker.register({
+    id: "electron.accessibility",
+    owner: electronOwner,
+    probe: () => ({ state: systemPreferences.isTrustedAccessibilityClient(false) ? "granted" : "denied" }),
+    request: () => { systemPreferences.isTrustedAccessibilityClient(true); },
+    openSettings: settings("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+  });
+  nativePermissionBroker.register({
+    id: "electron.screenRecording",
+    owner: electronOwner,
+    probe: () => ({ state: mediaPermissionState("screen"), needsRestart: true }),
+    openSettings: settings("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+  });
+  nativePermissionBroker.register({
+    id: "electron.microphone",
+    owner: electronOwner,
+    probe: () => ({ state: mediaPermissionState("microphone") }),
+    request: async () => { await systemPreferences.askForMediaAccess("microphone"); },
+    openSettings: settings("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+  });
+  nativePermissionBroker.register({
+    id: "electron.fullDiskAccess",
+    owner: electronOwner,
+    probe: () => ({
+      state: "unknown",
+      detail: "Full Disk Access is verified when a protected local source is read.",
+      settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+    }),
+    openSettings: settings("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+  });
+  const speechOwner: NativeExecutionIdentity = {
+    kind: "speechHelper",
+    displayName: "Open Assist Speech Helper",
+    bundleID: "com.developingadventures.OpenAssist.ElectronAppleSpeechHelper"
+  };
+  for (const [id, url] of [
+    ["speech.microphone", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"],
+    ["speech.recognition", "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"]
+  ] as const) {
+    nativePermissionBroker.register({
+      id,
+      owner: speechOwner,
+      probe: () => ({ state: "unknown", detail: "This permission is verified by the signed Speech helper when dictation starts." }),
+      openSettings: settings(url)
+    });
+  }
+  const computerUseOwner: NativeExecutionIdentity = {
+    kind: "computerUseHelper",
+    displayName: "Computer Use Helper",
+    bundleID: "com.openai.sky.CUAService"
+  };
+  for (const [id, url] of [
+    ["computerUse.accessibility", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+    ["computerUse.screenRecording", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]
+  ] as const) {
+    nativePermissionBroker.register({
+      id,
+      owner: computerUseOwner,
+      probe: () => ({ state: "unknown", detail: "Computer Use verifies this permission for its own signed helper when it starts." }),
+      openSettings: settings(url)
+    });
+  }
+}
+
+registerNativePermissionDescriptors();
 
 async function ensureAppleSpeechHelper() {
+  const bundledHelper = path.join(
+    process.resourcesPath,
+    "native-helpers",
+    "Open Assist Speech Helper.app"
+  );
+  if (app.isPackaged) {
+    if (!fs.existsSync(bundledHelper)) {
+      throw new Error("The signed Apple Speech helper is missing from this Open Assist build.");
+    }
+    return bundledHelper;
+  }
   const sourcePath = appleSpeechHelperSourcePath();
   if (!sourcePath) throw new Error("Apple Speech helper source was not found.");
   const infoPlistPath = appleSpeechHelperInfoPlistPath();
@@ -9351,6 +9550,8 @@ async function cleanupStaleVoiceHelpers(reason: string, keepPid?: number) {
   let killed = 0;
   for (const helper of helpers) {
     if (keepPid && helper.pid === keepPid) continue;
+    // The parked warm helper is not stale — it is waiting for the next start.
+    if (armedVoiceHelper?.helperPid === helper.pid) continue;
     killed += 1;
     terminateVoiceHelperPid(helper.pid, reason);
   }
@@ -9381,6 +9582,7 @@ function cleanupOldVoiceCaptureDirectories() {
     let removed = 0;
     entries.forEach((entry, index) => {
       if (activeDirectory && entry.path === activeDirectory) return;
+      if (armedVoiceHelper && entry.path === armedVoiceHelper.sessionDirectory) return;
       const isOld = Date.now() - entry.mtimeMs > maxAgeMs;
       const isPastLimit = index >= maxKeptDirectories;
       if (!isOld && !isPastLimit) return;
@@ -9431,10 +9633,19 @@ async function listMicrophones(): Promise<MicrophoneOption[]> {
   }
 }
 
-function launchVoiceHelperApp(helperAppPath: string, sessionDirectory: string, mode: "speech" | "recording", options?: VoiceStartOptions) {
+function launchVoiceHelperApp(
+  helperAppPath: string,
+  sessionDirectory: string,
+  mode: "speech" | "recording",
+  options?: VoiceStartOptions,
+  extras?: { armed?: boolean }
+) {
   const helperPath = path.join(helperAppPath, "Contents", "MacOS", "apple-speech-helper");
   const args = [sessionDirectory];
-  if (mode === "recording") args.push("--record-audio");
+  if (mode === "recording") {
+    args.push("--record-audio", "--parent-pid", String(process.pid));
+    if (extras?.armed) args.push("--arm-recording");
+  }
   if (shouldPreferExternalMicrophone(options)) args.push("--prefer-external-microphone");
   const microphoneUID = selectedMicrophoneArgument(options);
   if (microphoneUID) args.push("--microphone-uid", microphoneUID);
@@ -9445,8 +9656,125 @@ function launchVoiceHelperApp(helperAppPath: string, sessionDirectory: string, m
     debugLog(`voice helper launch failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   child.unref();
-  debugLog(`voice helper launched pid=${child.pid ?? "unknown"} mode=${mode} via=${mode === "speech" ? "launchservices" : "direct"} session=${sessionDirectory}`);
+  debugLog(`voice helper launched pid=${child.pid ?? "unknown"} mode=${mode} armed=${extras?.armed === true} via=${mode === "speech" ? "launchservices" : "direct"} session=${sessionDirectory}`);
   return child;
+}
+
+// ---- Warm dictation helper ---------------------------------------------------
+// A recording helper is pre-spawned with permissions verified and the mic
+// selection resolved, then parked (mic OFF, kqueue-blocked — no polling).
+// Pressing the dictation shortcut just drops a start file into its session
+// directory, skipping process spawn + permission round-trips (~250-800ms).
+
+type ArmedVoiceHelper = {
+  sessionDirectory: string;
+  helperProcess: ChildProcess;
+  helperPid?: number;
+  signature: string;
+  armedAt: number;
+  ready: boolean;
+};
+
+let armedVoiceHelper: ArmedVoiceHelper | null = null;
+let armVoiceHelperInFlight = false;
+const armedVoiceHelperMaxAgeMs = 45 * 60 * 1000;
+
+function voiceHelperArmSignature(options?: VoiceStartOptions) {
+  return JSON.stringify({
+    auto: options?.autoDetectMicrophone !== false,
+    uid: options?.autoDetectMicrophone === false ? options?.selectedMicrophoneUID?.trim() ?? "" : ""
+  });
+}
+
+function disarmVoiceHelper(reason: string) {
+  const armed = armedVoiceHelper;
+  if (!armed) return;
+  armedVoiceHelper = null;
+  try {
+    fs.writeFileSync(path.join(armed.sessionDirectory, "stop"), "stop");
+  } catch {
+    // The stop file is best-effort; the kill below still ends the helper.
+  }
+  if (armed.helperPid) terminateVoiceHelperPid(armed.helperPid, reason);
+  debugLog(`voice helper disarmed reason="${reason}" pid=${armed.helperPid ?? "unknown"}`);
+}
+
+async function armVoiceRecordingHelper(reason: string) {
+  if (process.platform !== "darwin" || armVoiceHelperInFlight || isQuitting) return;
+  armVoiceHelperInFlight = true;
+  try {
+    const configuration = await (await openAssistBridge()).voiceInputConfiguration();
+    if (configuration.transcriptionEngine !== "Cloud Providers" && configuration.transcriptionEngine !== "whisper.cpp") {
+      // Apple Speech launches through LaunchServices in speech mode; the warm
+      // path only covers the recording-mode engines.
+      disarmVoiceHelper("engine without warm support");
+      return;
+    }
+    const signature = voiceHelperArmSignature(configuration);
+    if (armedVoiceHelper) {
+      if (armedVoiceHelper.signature === signature && armedVoiceHelper.helperProcess.exitCode === null) return;
+      disarmVoiceHelper("arm settings changed");
+    }
+    const helperAppPath = await ensureAppleSpeechHelper();
+    const sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-armed-${Math.random().toString(16).slice(2)}`);
+    fs.mkdirSync(sessionDirectory, { recursive: true });
+    const helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration, { armed: true });
+    const armed: ArmedVoiceHelper = {
+      sessionDirectory,
+      helperProcess,
+      helperPid: helperProcess.pid,
+      signature,
+      armedAt: Date.now(),
+      ready: false
+    };
+    armedVoiceHelper = armed;
+    helperProcess.on("exit", () => {
+      if (armedVoiceHelper === armed) armedVoiceHelper = null;
+    });
+    void waitForVoiceFile(sessionDirectory, ["armed.json", "error.json"], 15000).then((result) => {
+      if (armedVoiceHelper !== armed) return;
+      if (!result || result.name === "error.json") {
+        disarmVoiceHelper(`arm failed: ${result?.payload.message ?? "no armed signal"}`);
+        return;
+      }
+      armed.ready = true;
+      debugLog(`voice helper armed pid=${armed.helperPid ?? "unknown"} reason="${reason}"`);
+    });
+  } catch (error) {
+    debugLog(`voice helper arm failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    armVoiceHelperInFlight = false;
+  }
+}
+
+/** Hand the armed helper to a starting capture, or null for the cold path. */
+function adoptArmedVoiceHelper(configuration?: VoiceStartOptions): ArmedVoiceHelper | null {
+  const armed = armedVoiceHelper;
+  if (!armed || !armed.ready) return null;
+  if (armed.helperProcess.exitCode !== null) {
+    armedVoiceHelper = null;
+    return null;
+  }
+  if (Date.now() - armed.armedAt > armedVoiceHelperMaxAgeMs) {
+    disarmVoiceHelper("armed helper expired");
+    return null;
+  }
+  if (armed.signature !== voiceHelperArmSignature(configuration)) {
+    disarmVoiceHelper("microphone settings changed");
+    return null;
+  }
+  armedVoiceHelper = null;
+  try {
+    fs.writeFileSync(
+      path.join(armed.sessionDirectory, "start-recording.json"),
+      JSON.stringify({ startedAt: Date.now() })
+    );
+  } catch (error) {
+    debugLog(`armed voice helper go-signal failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (armed.helperPid) terminateVoiceHelperPid(armed.helperPid, "armed start write failed");
+    return null;
+  }
+  return armed;
 }
 
 function sanitizeWakePhrase(value?: unknown) {
@@ -9950,10 +10278,22 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   }
 
   prewarmCloudVoiceTranscription(configuration);
-  const helperAppPath = await ensureAppleSpeechHelper();
-  const sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  fs.mkdirSync(sessionDirectory, { recursive: true });
-  const helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
+  const startBeganAt = Date.now();
+  const armed = adoptArmedVoiceHelper(configuration);
+  const warmStart = Boolean(armed);
+  let sessionDirectory: string;
+  let helperProcess: ChildProcess;
+  let helperAppPath: string;
+  if (armed) {
+    sessionDirectory = armed.sessionDirectory;
+    helperProcess = armed.helperProcess;
+    helperAppPath = await ensureAppleSpeechHelper();
+  } else {
+    helperAppPath = await ensureAppleSpeechHelper();
+    sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.mkdirSync(sessionDirectory, { recursive: true });
+    helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
+  }
   voiceCapture = {
     sessionDirectory,
     appPath: helperAppPath,
@@ -9979,6 +10319,11 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   startVoiceLevelPolling(sessionDirectory);
   showActiveVoiceCaptureHUD();
   playDictationFeedbackSound("startListening", configuration);
+  debugLog(`voice start timing engine=cloudProviders warm=${warmStart} readyMs=${Date.now() - startBeganAt}`);
+  // Park a fresh helper for the NEXT press while this one records.
+  setTimeout(() => {
+    void armVoiceRecordingHelper("re-arm after start");
+  }, 500);
   return { ok: true };
 }
 
@@ -10173,16 +10518,26 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
     };
   }
 
+  const startBeganAt = Date.now();
   const helperAppPath = await ensureAppleSpeechHelper();
-  const sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const modelID = resolvedModel.modelID;
   const coreMLDirectoryPath = whisperCoreMLDirectoryPath(modelID);
   const shouldForceCPUForStability = modelID.startsWith("small") || modelID.startsWith("medium");
   const useCoreML = Boolean(configuration.whisperUseCoreML)
     && fs.existsSync(coreMLDirectoryPath)
     && !shouldForceCPUForStability;
-  fs.mkdirSync(sessionDirectory, { recursive: true });
-  const helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
+  const armed = adoptArmedVoiceHelper(configuration);
+  const warmStart = Boolean(armed);
+  let sessionDirectory: string;
+  let helperProcess: ChildProcess;
+  if (armed) {
+    sessionDirectory = armed.sessionDirectory;
+    helperProcess = armed.helperProcess;
+  } else {
+    sessionDirectory = path.join(voiceCaptureRootDirectory(), `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.mkdirSync(sessionDirectory, { recursive: true });
+    helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
+  }
   voiceCapture = {
     sessionDirectory,
     appPath: helperAppPath,
@@ -10211,6 +10566,10 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
   startVoiceLevelPolling(sessionDirectory);
   showActiveVoiceCaptureHUD();
   playDictationFeedbackSound("startListening", configuration);
+  debugLog(`voice start timing engine=whisperCpp warm=${warmStart} readyMs=${Date.now() - startBeganAt}`);
+  setTimeout(() => {
+    void armVoiceRecordingHelper("re-arm after start");
+  }, 500);
   return { ok: true, modelID, useCoreML };
 }
 
@@ -10442,107 +10801,34 @@ app.whenReady().then(() => {
     };
   });
 
-  ipcMain.handle("openassist:get-macos-permissions", async () => {
-    if (process.platform !== "darwin") {
-      return {
-        platformSupported: false,
-        accessibility: "unknown" as const,
-        screenRecording: "unknown" as const,
-        microphone: "unknown" as const
-      };
-    }
-    const accessibilityTrusted = systemPreferences.isTrustedAccessibilityClient(false);
-    let screenRecording: "granted" | "denied" | "not-determined" | "unknown" = "unknown";
-    try {
-      const status = systemPreferences.getMediaAccessStatus("screen");
-      screenRecording = status === "granted"
-        ? "granted"
-        : status === "denied" || status === "restricted"
-          ? "denied"
-          : "not-determined";
-    } catch {
-      screenRecording = "unknown";
-    }
-    let microphone: "granted" | "denied" | "not-determined" | "unknown" = "unknown";
-    try {
-      const status = systemPreferences.getMediaAccessStatus("microphone");
-      microphone = status === "granted"
-        ? "granted"
-        : status === "denied" || status === "restricted"
-          ? "denied"
-          : "not-determined";
-    } catch {
-      microphone = "unknown";
-    }
-    return {
-      platformSupported: true,
-      accessibility: accessibilityTrusted ? "granted" : "denied",
-      screenRecording,
-      microphone
-    };
-  });
-
-  ipcMain.handle("openassist:request-macos-permission", async (_event, kind: string) => {
-    if (process.platform !== "darwin") return { ok: false, opened: false };
-    switch (kind) {
-      case "accessibility": {
-        // Triggers the system prompt the first time; on later calls macOS just
-        // remembers the previous answer, so we also open the pane below so the
-        // user can flip it back on if they denied it earlier.
-        systemPreferences.isTrustedAccessibilityClient(true);
-        await shell.openExternal(
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-        );
-        return { ok: true, opened: true };
-      }
-      case "screenRecording": {
-        try {
-          // Asking for "screen" via getMediaAccessStatus does not prompt, but a
-          // CGRequestScreenCaptureAccess-style call does. Electron exposes that
-          // indirectly by accessing the desktop capturer; the most reliable
-          // cross-version path is to just open the System Settings pane.
-          await shell.openExternal(
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-          );
-        } catch {
-          // Ignore — opening the pane is best-effort.
-        }
-        return { ok: true, opened: true };
-      }
-      case "microphone": {
-        try {
-          await systemPreferences.askForMediaAccess("microphone");
-        } catch {
-          // Some macOS versions throw if Info.plist usage strings are missing;
-          // fall back to opening the pane.
-        }
-        await shell.openExternal(
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        );
-        return { ok: true, opened: true };
-      }
-      case "speechRecognition": {
-        await shell.openExternal(
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
-        );
-        return { ok: true, opened: true };
-      }
-      case "automation": {
-        await shell.openExternal(
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
-        );
-        return { ok: true, opened: true };
-      }
-      case "fullDiskAccess": {
-        await shell.openExternal(
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-        );
-        return { ok: true, opened: true };
-      }
-      default:
-        return { ok: false, opened: false, error: `Unknown permission kind: ${kind}` };
+  const nativePermissionIDs = new Set<NativePermissionID>([
+    "electron.accessibility",
+    "electron.screenRecording",
+    "electron.microphone",
+    "electron.fullDiskAccess",
+    "eventkit.reminders",
+    "eventkit.calendar",
+    "speech.microphone",
+    "speech.recognition",
+    "computerUse.accessibility",
+    "computerUse.screenRecording"
+  ]);
+  const nativePermissionID = (value: string) => {
+    if (!nativePermissionIDs.has(value as NativePermissionID)) throw new Error(`Unknown native permission: ${value}`);
+    return value as NativePermissionID;
+  };
+  nativePermissionBroker.onChanged((snapshot) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send("openassist:native-permissions-changed", snapshot);
     }
   });
+  ipcMain.handle("openassist:native-permissions-get", async () => nativePermissionBroker.getSnapshot());
+  ipcMain.handle("openassist:native-permissions-request", async (_event, value: string) =>
+    nativePermissionBroker.request(nativePermissionID(value))
+  );
+  ipcMain.handle("openassist:native-permissions-open-settings", async (_event, value: string) =>
+    nativePermissionBroker.openSettings(nativePermissionID(value))
+  );
 
   ipcMain.handle("openassist:get-computer-use-activity", async () => {
     try {
@@ -10674,10 +10960,6 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:load-settings-app-state", async () => (await openAssistBridge()).loadOpenAssistSettingsAppState());
   ipcMain.handle("openassist:connectors-load", async () => loadConnectorSnapshot());
   ipcMain.handle("openassist:connectors-load-review-inbox", async () => loadConnectorReviewInbox());
-  ipcMain.handle("openassist:apple-eventkit-status", async () => appleEventKitStatus());
-  ipcMain.handle("openassist:apple-eventkit-request-access", async (_event, service: string) =>
-    requestAppleEventKitAccess(service === "calendar" ? "calendar" : "reminders")
-  );
   ipcMain.handle("openassist:connectors-create-google-account", async (_event, label: string) =>
     createGoogleConnectorAccount(label)
   );
@@ -11230,6 +11512,9 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:move-note-to-folder", async (_event, projectID: string, noteID: string, folderID: string | null) =>
     (await openAssistBridge()).moveProjectNoteToFolder(projectID, noteID, folderID)
   );
+  ipcMain.handle("openassist:move-note-to-project", async (_event, sourceProjectID: string, noteID: string, destinationProjectID: string) =>
+    (await openAssistBridge()).moveProjectNoteToProject(sourceProjectID, noteID, destinationProjectID)
+  );
   ipcMain.handle("openassist:delete-thread-note", async (_event, threadID: string, noteID: string) =>
     (await openAssistBridge()).deleteThreadNote(threadID, noteID)
   );
@@ -11648,6 +11933,13 @@ app.whenReady().then(() => {
     pluginIDs?: string[];
     skillIDs?: string[];
     contextHint?: string;
+    contextResources?: Array<{
+      kind: string;
+      id: string;
+      title?: string;
+      source?: string;
+      attributes?: Record<string, unknown>;
+    }>;
     contextProjectID?: string;
     contextProjectName?: string;
     contextThreadID?: string;
@@ -11662,6 +11954,7 @@ app.whenReady().then(() => {
         pluginIDs: options?.pluginIDs,
         skillIDs: options?.skillIDs,
         contextHint: options?.contextHint,
+        contextResources: options?.contextResources,
         contextProjectID: options?.contextProjectID,
         contextProjectName: options?.contextProjectName,
         contextThreadID: options?.contextThreadID
@@ -11759,6 +12052,8 @@ app.whenReady().then(() => {
   setupMenuBarTray();
   setTimeout(prewarmVoiceHUDWindow, 250);
   setTimeout(prewarmVoiceHelperBuild, 700);
+  // Park a warm dictation helper so the first shortcut press is fast too.
+  setTimeout(() => { void armVoiceRecordingHelper("startup"); }, 5_000);
   setTimeout(installApplicationMenu, 800);
   setTimeout(prewarmSettingsWindow, 2200);
   if (process.platform === "darwin") {
@@ -11770,6 +12065,8 @@ app.whenReady().then(() => {
   void refreshConfiguredShortcuts();
 
   app.on("activate", () => {
+    nativePermissionBroker.invalidate();
+    void nativePermissionBroker.getSnapshot().catch(() => undefined);
     ensureRegularDockPresence("app activate");
     if (isScreenAnalysisSurfaceActive()) {
       debugLog("app activate ignored while screen analysis surface is active");
@@ -11786,6 +12083,7 @@ app.whenReady().then(() => {
 
 app.on("before-quit", (event) => {
   isQuitting = true;
+  disarmVoiceHelper("app quitting");
   if (!ollamaQuitCleanupStarted && !ollamaQuitCleanupFinished) {
     event.preventDefault();
     ollamaQuitCleanupStarted = true;

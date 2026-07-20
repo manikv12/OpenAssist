@@ -25,20 +25,30 @@ I built OpenAssist as a daily organizer that I can talk to. It can remember usef
 
 ## GPT-5.6 Build Week Work
 
-The desktop app includes **GPT-5.6 Sol**, **GPT-5.6 Terra**, and **GPT-5.6 Luna** as agent model choices.
+The desktop app includes **GPT-5.6 Sol**, **GPT-5.6 Terra**, and **GPT-5.6 Luna** as agent model choices. GPT-5.6 Sol was the daily driver for the real sessions behind this submission, including everything shown in the demo video.
 
-The GPT-5.6 implementation work in this build includes:
+Build Week work (July 13 onward), checked against the commit history and my Codex session logs:
 
-- the Live Voice coordinator and one-owner voice turn routing
-- reliable background delegation with one shared task registry
-- progress, cancellation, final-result delivery, and duplicate protection
-- same-thread Live Voice continuity without saving raw audio
-- Knowledge routing for notes, reminders, planner data, and memory
-- agent routing for browser, CLI, code, logs, and computer work
-- project creation, note updates, reminders, and mobile parity improvements
-- the professional Live Voice HUD, task cards, provider labels, and completion notifications
+- Made the React + Electron app the primary product and restructured the repository into `apps/desktop`, archiving the old Swift app under `legacy/swift`. The restructure itself was carried out by a Codex agent.
+- Updated Live Voice for the new layout: the global shortcut flow, the floating HUD, the Agent Work shelf, and same-thread continuity.
+- Built the demo from real sessions, recorded live: voice delegation to a Codex agent, and Computer Use opening TextEdit and typing a launch checklist by itself.
+- Fixed reliability bugs found through real daily use: a cleanup routine that was killing live Computer Use helpers, silent empty turns caused by an outdated Codex CLI, and streamed thinking text rendering with dropped words.
+- Used it for real work all week on GPT-5.6 Sol: planning notes with diagrams, research comparisons delegated from voice, reminder and memory recall, and filling a browser form through Computer Use.
 
-OpenAI Realtime or Gemini Live handles the low-latency speech connection. GPT-5.6 is the work agent that can reason over the request and complete delegated tasks.
+The Live Voice engineering in this build includes one-owner voice turn routing, a shared task registry with progress, cancellation and duplicate protection, same-thread continuity without saving raw audio, Knowledge routing for notes, reminders, planner data and memory, and the Live Voice HUD with task cards and completion notifications.
+
+OpenAI Realtime or Gemini Live handles the low-latency speech connection. GPT-5.6 is the work agent that reasons over the request and completes delegated tasks.
+
+## How Codex Powers OpenAssist
+
+OpenAssist runs the official **Codex app server** (`codex app-server`) as its agent engine:
+
+- Chat turns and delegated agent jobs run through the app server, with GPT-5.6 (Sol, Terra, or Luna) as the reasoning model.
+- **Computer Use** comes from Codex's bundled plugin. The agent can open Mac apps and do the work directly; the demo video shows it opening TextEdit and typing a launch checklist by itself, recorded live.
+- Live Voice hands bigger requests to a Codex agent, keeps the conversation going while the job runs, and speaks the finished result back in the same session.
+- Approvals, sandbox modes, and per-turn plugin selection all map onto the app server's own controls.
+
+Codex was also part of the workflow behind the code: feature work, the repository restructure, and many of the regression scripts in this repo were developed with Codex agents.
 
 ## How Live Voice Works
 
@@ -47,19 +57,19 @@ Your voice
   -> OpenAI Realtime or Gemini Live
   -> OpenAssist coordinator
        -> direct conversation
-       -> OpenAssist Knowledge
-       -> delegated GPT-5.6 / Codex / Claude task
+       -> assistant_capability -> exact local capability
+       -> assistant_delegate_work -> genuine agent task
   -> one clear result in Today Live Voice
 ```
 
-Stopping Live Voice closes the microphone and realtime connection. Background work can finish safely, save one result, and notify you without creating extra visible threads.
+Both providers receive the same four-tool surface and use one reducer-owned turn state. Stopping Live Voice closes the microphone and realtime connection. Background work can finish safely, save one FIFO result, and notify you without creating extra visible threads.
 
 ## Quick Start
 
 Requirements:
 
 - macOS 13.3 or newer
-- Node.js 22 or newer
+- Node.js 20.19 or newer, or Node.js 22.12 or newer
 - Xcode Command Line Tools for the small macOS helper binaries
 
 From the repository root:
@@ -95,7 +105,7 @@ Run the desktop build and the Live Voice checks together:
 npm run verify
 ```
 
-The checks cover routing, delegation, task limits, progress, cancellation, continuity, recall, echo protection, provider protocol behavior, and final-result narration.
+The checks cover coordinator state, capability selection, delegation, task limits, progress, cancellation, continuity, recall, echo protection, identical provider contracts, and exactly-one final-result delivery.
 
 ## Repository Layout
 
@@ -110,9 +120,10 @@ Start with:
 - [`apps/desktop/src/App.tsx`](apps/desktop/src/App.tsx) for the React interface
 - [`apps/desktop/electron/main.ts`](apps/desktop/electron/main.ts) for Electron and macOS integration
 - [`apps/desktop/electron/openassistBridge.ts`](apps/desktop/electron/openassistBridge.ts) for app data and agent workers
-- [`apps/desktop/electron/realtimeProxy.ts`](apps/desktop/electron/realtimeProxy.ts) for Live Voice coordination
+- [`apps/desktop/electron/liveVoice/`](apps/desktop/electron/liveVoice/) for the shared Live Voice coordinator, reducer, capability registry, provider adapters, outbox, and trace
+- [`apps/desktop/electron/realtimeProxy.ts`](apps/desktop/electron/realtimeProxy.ts) for Live Voice transport and composition
 - [`apps/desktop/electron/realtimeTaskCoordinator.ts`](apps/desktop/electron/realtimeTaskCoordinator.ts) for delegated-task tracking
-- [`apps/desktop/docs/live-voice-architecture-plan.md`](apps/desktop/docs/live-voice-architecture-plan.md) for the architecture plan
+- [`apps/desktop/docs/live-voice-architecture-plan.md`](apps/desktop/docs/live-voice-architecture-plan.md) for the implemented architecture and invariants
 
 ## Privacy
 

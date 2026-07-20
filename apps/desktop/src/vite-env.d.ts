@@ -35,15 +35,10 @@ interface Window {
   openAssistElectron?: {
     platform: string;
     openExternal: (url: string) => Promise<void>;
-    getMacOSPermissions: () => Promise<{
-      platformSupported: boolean;
-      accessibility: "granted" | "denied" | "not-determined" | "unknown";
-      screenRecording: "granted" | "denied" | "not-determined" | "unknown";
-      microphone: "granted" | "denied" | "not-determined" | "unknown";
-    }>;
-    requestMacOSPermission: (
-      kind: "accessibility" | "screenRecording" | "microphone" | "speechRecognition" | "automation" | "fullDiskAccess"
-    ) => Promise<{ ok: boolean; opened: boolean; error?: string }>;
+    getNativePermissions: () => Promise<import("./types").NativePermissionBrokerSnapshot>;
+    requestNativePermission: (permissionID: import("./types").NativePermissionID) => Promise<import("./types").NativePermissionSnapshot>;
+    openNativePermissionSettings: (permissionID: import("./types").NativePermissionID) => Promise<import("./types").NativePermissionSnapshot>;
+    onNativePermissionsChanged: (callback: (snapshot: import("./types").NativePermissionBrokerSnapshot) => void) => () => void;
     getComputerUseActivity: () => Promise<{
       active: boolean;
       activeToolCalls: number;
@@ -118,8 +113,6 @@ interface Window {
     loadSettingsAppState: () => Promise<import("./types").OpenAssistAppState>;
     loadConnectorSnapshot: () => Promise<import("./types").ConnectorSnapshot>;
     loadConnectorReviewInbox: () => Promise<import("./types").ConnectorReviewInboxSnapshot>;
-    appleEventKitStatus: () => Promise<import("./types").AppleEventKitStatus>;
-    requestAppleEventKitAccess: (service: "reminders" | "calendar") => Promise<import("./types").AppleEventKitStatus>;
     createGoogleConnectorAccount: (label: string) => Promise<import("./types").ConnectorSnapshot>;
     removeGoogleConnectorAccount: (accountID: string) => Promise<import("./types").ConnectorSnapshot>;
     setConnectorServiceEnabled: (
@@ -357,6 +350,7 @@ interface Window {
 	    deleteNoteFolder: (projectID: string, folderID: string) => Promise<{ projectID: string; deletedFolderID: string; deletedFolderIDs?: string[] }>;
 	    moveNoteFolder: (projectID: string, folderID: string, parentFolderID: string | null) => Promise<import("./types").NoteFolderItem>;
 	    moveNoteToFolder: (projectID: string, noteID: string, folderID: string | null) => Promise<{ projectID: string; noteID: string; folderID: string | null }>;
+	    moveNoteToProject: (sourceProjectID: string, noteID: string, destinationProjectID: string) => Promise<import("./types").ProjectNoteMoveResult>;
 	    deleteThreadNote: (threadID: string, noteID: string) => Promise<import("./types").ThreadNoteWorkspace>;
 	    archiveThreadNote: (threadID: string, noteID: string) => Promise<import("./types").ThreadNoteWorkspace>;
 	    restoreThreadNote: (threadID: string, noteID: string) => Promise<import("./types").ThreadNoteWorkspace>;
@@ -652,8 +646,15 @@ interface Window {
       permissionMode?: string;
       reasoningEffort?: string;
       pluginIDs?: string[];
-      skillIDs?: string[];
-      contextHint?: string;
+	      skillIDs?: string[];
+	      contextHint?: string;
+	      contextResources?: Array<{
+	        kind: string;
+	        id: string;
+	        title?: string;
+	        source?: string;
+	        attributes?: Record<string, unknown>;
+	      }>;
 	    }) => Promise<{
 	      ok: boolean;
 	      threadId?: string;

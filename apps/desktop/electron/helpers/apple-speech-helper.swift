@@ -6,6 +6,10 @@ import Speech
 private let launchArguments = Array(CommandLine.arguments.dropFirst())
 private let sessionDirectory = launchArguments.first { !$0.hasPrefix("-") }
 private let shouldRecordAudioFile = launchArguments.contains("--record-audio")
+// Warm-start mode: spawn early, verify permissions, then WAIT (mic off, no
+// polling) until the app drops a start-recording file into the session dir.
+// Cuts the per-shortcut cost of process spawn + permission round-trips.
+private let shouldArmRecording = launchArguments.contains("--arm-recording")
 private let shouldPreferExternalMicrophone = launchArguments.contains("--prefer-external-microphone")
 
 private func argumentValue(after flag: String) -> String? {
@@ -18,6 +22,7 @@ private func argumentValue(after flag: String) -> String? {
 
 private let selectedMicrophoneUID = argumentValue(after: "--microphone-uid")
 private let wakePhrase = argumentValue(after: "--wake-word")
+private let parentProcessID = argumentValue(after: "--parent-pid").flatMap { Int32($0) }
 
 private func normalizedWakeText(_ value: String) -> String {
     let lowercased = value.lowercased()
@@ -498,6 +503,28 @@ private final class AppleSpeechCapture: NSObject {
 
 if shouldRecordAudioFile {
     let capture = AudioFileCapture()
+
+    // If the app that armed us dies, exit instead of lingering forever.
+    // 2s interval — effectively zero CPU, prevents orphaned armed helpers.
+    if let parentProcessID {
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            if kill(parentProcessID, 0) != 0 && errno == ESRCH {
+                exit(0)
+            }
+        }
+    }
+
+    let beginStopWatch = {
+        guard let sessionDirectory else { return }
+        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { timer in
+            let stopPath = URL(fileURLWithPath: sessionDirectory).appendingPathComponent("stop").path
+            if FileManager.default.fileExists(atPath: stopPath) {
+                timer.invalidate()
+                capture.stop()
+            }
+        }
+    }
+
     capture.requestPermissions { allowed, message in
         guard allowed else {
             emit(["type": "error", "message": message ?? "Microphone permission was not granted."])
@@ -505,16 +532,55 @@ if shouldRecordAudioFile {
         }
 
         DispatchQueue.main.async {
-            capture.start()
-        }
-    }
-
-    if let sessionDirectory {
-        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { timer in
-            let stopPath = URL(fileURLWithPath: sessionDirectory).appendingPathComponent("stop").path
-            if FileManager.default.fileExists(atPath: stopPath) {
-                timer.invalidate()
-                capture.stop()
+            if shouldArmRecording, let sessionDirectory {
+                // Armed: permissions verified, mic still OFF. Block on a kqueue
+                // directory watch (no polling) until the app writes
+                // start-recording.json — or a stop file / parent death ends us.
+                emit(["type": "armed", "message": "Voice helper armed."])
+                let directoryURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
+                let startPath = directoryURL.appendingPathComponent("start-recording.json").path
+                let stopPath = directoryURL.appendingPathComponent("stop").path
+                let maybeBegin = {
+                    if FileManager.default.fileExists(atPath: stopPath) {
+                        exit(0)
+                    }
+                    if FileManager.default.fileExists(atPath: startPath) {
+                        capture.start()
+                        beginStopWatch()
+                        return true
+                    }
+                    return false
+                }
+                let descriptor = open(sessionDirectory, O_EVTONLY)
+                if descriptor >= 0 {
+                    let source = DispatchSource.makeFileSystemObjectSource(
+                        fileDescriptor: descriptor,
+                        eventMask: [.write],
+                        queue: DispatchQueue.main
+                    )
+                    var fired = false
+                    source.setEventHandler {
+                        if !fired && maybeBegin() {
+                            fired = true
+                            source.cancel()
+                        }
+                    }
+                    source.setCancelHandler { close(descriptor) }
+                    source.resume()
+                    // The start file may already exist (race with arming).
+                    if maybeBegin() {
+                        fired = true
+                        source.cancel()
+                    }
+                } else {
+                    // kqueue watch failed — fall back to a light poll.
+                    Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { timer in
+                        if maybeBegin() { timer.invalidate() }
+                    }
+                }
+            } else {
+                capture.start()
+                beginStopWatch()
             }
         }
     }

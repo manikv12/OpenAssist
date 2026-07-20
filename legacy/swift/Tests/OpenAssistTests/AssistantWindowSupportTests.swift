@@ -4,11 +4,11 @@ import XCTest
 final class AssistantWindowSupportTests: XCTestCase {
     func testAssistantNotesSessionRegistryMigratesLegacySingleSessionMap() {
         let registries = assistantDecodeNotesAssistantSessionRegistries(
-            from: #"{"amwins":"session-a","ops":"session-b"}"#
+            from: #"{"project-alpha":"session-a","ops":"session-b"}"#
         )
 
         XCTAssertEqual(
-            registries["amwins"],
+            registries["project-alpha"],
             AssistantNotesProjectSessionRegistry(
                 sessionIDs: ["session-a"],
                 lastUsedSessionID: "session-a"
@@ -46,7 +46,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         ]
 
         var registries = [
-            "amwins": AssistantNotesProjectSessionRegistry(
+            "project-alpha": AssistantNotesProjectSessionRegistry(
                 sessionIDs: ["session-a", "session-b"],
                 lastUsedSessionID: "session-a"
             )
@@ -54,21 +54,21 @@ final class AssistantWindowSupportTests: XCTestCase {
 
         XCTAssertEqual(
             assistantResolvedNotesAssistantSessionID(
-                projectID: "amwins",
+                projectID: "project-alpha",
                 registries: registries,
                 sessions: sessions
             ),
             "session-a"
         )
 
-        registries["amwins"] = AssistantNotesProjectSessionRegistry(
+        registries["project-alpha"] = AssistantNotesProjectSessionRegistry(
             sessionIDs: ["session-a", "session-b"],
             lastUsedSessionID: "missing"
         )
 
         XCTAssertEqual(
             assistantResolvedNotesAssistantSessionID(
-                projectID: "amwins",
+                projectID: "project-alpha",
                 registries: registries,
                 sessions: sessions
             ),
@@ -100,7 +100,7 @@ final class AssistantWindowSupportTests: XCTestCase {
         ]
 
         let registries = [
-            "amwins": AssistantNotesProjectSessionRegistry(
+            "project-alpha": AssistantNotesProjectSessionRegistry(
                 sessionIDs: ["archived-session", "active-session"],
                 lastUsedSessionID: "archived-session"
             )
@@ -108,7 +108,7 @@ final class AssistantWindowSupportTests: XCTestCase {
 
         XCTAssertEqual(
             assistantResolvedNotesAssistantSessionID(
-                projectID: "amwins",
+                projectID: "project-alpha",
                 registries: registries,
                 sessions: sessions
             ),

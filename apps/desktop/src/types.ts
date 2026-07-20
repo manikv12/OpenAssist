@@ -34,6 +34,7 @@ export type ThreadItem = {
   runElapsedText?: string;
   hasUnread?: boolean;
   active?: boolean;
+  kind?: string;
 };
 
 export type ComposerImageAttachment = {
@@ -238,6 +239,13 @@ export type NoteItem = {
   active?: boolean;
 };
 
+export type ProjectNoteMoveResult = {
+  sourceProjectID: string;
+  destinationProjectID: string;
+  note: NoteItem;
+  detail: NoteDetail;
+};
+
 export type ThreadNoteListItem = {
   id: string;
   title: string;
@@ -423,6 +431,7 @@ export type DailyItem = {
   order: number;
   structured?: boolean;
   line?: number;
+  readBack?: boolean;
 };
 
 export type DailyItemInput = Partial<Omit<DailyItem, "id" | "createdAt" | "updatedAt" | "structured" | "line">> & {
@@ -672,7 +681,20 @@ export type SettingsSnapshot = {
   liveVoiceEchoGuardEnabled: boolean;
   todayWakeWordEnabled: boolean;
   todayWakeWordPhrase: string;
-  realtimeDelegationMode: "autoHardTasksOnly" | "alwaysDelegate" | "neverDelegate";
+  realtimeWorkerPolicy: "auto" | "never";
+  realtimeFastWorkerModel: string;
+  realtimeDeepWorkerModel: string;
+  realtimeLocalMCPEnabled: boolean;
+  realtimeLocalMCPAllowedServers: string;
+  realtimeLocalMCPServers: Array<{
+    name: string;
+    enabled: boolean;
+    allowed: boolean;
+    transport: "stdio" | "localhost" | "unsupported";
+    status: "ready" | "available" | "disabled" | "blocked" | "error";
+    toolCount: number;
+    error?: string;
+  }>;
   localVoiceModel: string;
   speechOutputRewriteModel: string;
   assistantVoiceOutputEnabled: boolean;
@@ -844,6 +866,11 @@ export type ThreadDetail = {
   realtimeWorkHistory?: Array<{
     taskID: string;
     workerProvider: string;
+    workerModelRole?: "fast" | "deep";
+    workerModelID?: string;
+    workerReasoningEffort?: "medium" | "high";
+    workerSelectionReason?: string;
+    workerModelExplicit?: boolean;
     state: "completed" | "failed" | "cancelled";
     prompt: string;
     resultPreview: string;
@@ -898,6 +925,7 @@ export type OpenAssistIntegrationTargetStatus = {
   skillPath?: string;
   detected: boolean;
   connected: boolean;
+  healthy?: boolean;
   configKind: "json" | "toml" | "copy";
   skillMode: "cursor-rule" | "codex-agents" | "markdown-copy";
 };
@@ -914,7 +942,7 @@ export type OpenAssistIntegrationStatus = {
 export type OpenAssistIntegrationConnectResult = {
   ok: boolean;
   targetID: OpenAssistIntegrationTargetID;
-  action: "written" | "created";
+  action: "created" | "repaired" | "already-connected";
   configPath: string;
   backupPath?: string;
 };
@@ -1085,9 +1113,53 @@ export type ConnectorAccessStatus = {
   permissionKind?: "fullDiskAccess" | "appleEventKit";
 };
 
-export type AppleEventKitStatus = {
-  reminders: ConnectorAccessStatus;
-  calendar: ConnectorAccessStatus;
+export type NativePermissionID =
+  | "electron.accessibility"
+  | "electron.screenRecording"
+  | "electron.microphone"
+  | "electron.fullDiskAccess"
+  | "eventkit.reminders"
+  | "eventkit.calendar"
+  | "speech.microphone"
+  | "speech.recognition"
+  | "computerUse.accessibility"
+  | "computerUse.screenRecording";
+
+export type NativePermissionState =
+  | "notDetermined"
+  | "granted"
+  | "denied"
+  | "restricted"
+  | "writeOnly"
+  | "unavailable"
+  | "identityMismatch"
+  | "devUnsigned"
+  | "unknown";
+
+export type NativePermissionSnapshot = {
+  id: NativePermissionID;
+  state: NativePermissionState;
+  canRead: boolean;
+  canWrite: boolean;
+  owner: {
+    kind: "electron" | "eventkitHelper" | "speechHelper" | "computerUseHelper";
+    displayName: string;
+    bundleID?: string;
+    teamID?: string;
+    designatedRequirement?: string;
+    executable?: string;
+  };
+  checkedAt: number;
+  needsRestart: boolean;
+  settingsURL?: string;
+  errorCode?: string;
+  detail: string;
+};
+
+export type NativePermissionBrokerSnapshot = {
+  platformSupported: boolean;
+  checkedAt: number;
+  permissions: NativePermissionSnapshot[];
 };
 
 export type ConnectorSnapshot = {
@@ -1196,7 +1268,11 @@ export type SettingsUpdateKey =
   | "liveVoiceEchoGuardEnabled"
   | "todayWakeWordEnabled"
   | "todayWakeWordPhrase"
-  | "realtimeDelegationMode"
+  | "realtimeWorkerPolicy"
+  | "realtimeFastWorkerModel"
+  | "realtimeDeepWorkerModel"
+  | "realtimeLocalMCPEnabled"
+  | "realtimeLocalMCPAllowedServers"
   | "localVoiceModel"
   | "speechOutputRewriteModel"
   | "assistantVoiceOutputEnabled"
@@ -1341,6 +1417,7 @@ export type PlannerDailyDigestResult =
       leftovers: PlannerDigestLeftover[];
       followUps: PlannerDigestFollowUp[];
       tomorrowPreview: string[];
+      openLoops?: string[];
       generatedAt: string;
     }
   | { ok: false; error: string };

@@ -4,6 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
+import {
+  cachedAppleEventKitRawStatus,
+  executeAppleEventKitCommand,
+  setAppleEventKitRunner,
+  type AppleEventKitCommandRunner
+} from "./nativeAccess.js";
 
 const execFileAsync = promisify(execFile);
 const pinnedGwsVersion = "0.22.5";
@@ -70,7 +76,12 @@ export type ConnectorAccessStatus = {
   permissionKind?: "fullDiskAccess" | "appleEventKit";
 };
 
-export type AppleEventKitService = "reminders" | "calendar";
+export type AppleReminderRecurrence = {
+  frequency: "daily" | "weekly" | "monthly" | "yearly";
+  interval?: number;
+  endDate?: string;
+  occurrenceCount?: number;
+};
 
 export type AppleReminderRecord = {
   id: string;
@@ -80,6 +91,7 @@ export type AppleReminderRecord = {
   notes?: string;
   dueDate?: string;
   completionDate?: string;
+  recurrence?: AppleReminderRecurrence;
 };
 
 export type AppleCalendarEventRecord = {
@@ -101,6 +113,20 @@ export type AppleReminderInput = {
   due?: string;
   calendar?: string;
   list?: string;
+  recurrence?: AppleReminderRecurrence;
+};
+
+export type AppleReminderUpdateInput = {
+  id: string;
+  title?: string;
+  notes?: string;
+  details?: string;
+  dueDate?: string;
+  due?: string;
+  clearNotes?: boolean;
+  clearDueDate?: boolean;
+  recurrence?: Partial<AppleReminderRecurrence>;
+  clearRecurrence?: boolean;
 };
 
 export type AppleReminderListOptions = {
@@ -135,17 +161,13 @@ export type AppleCalendarEventListOptions = {
   limit?: number;
 };
 
-export type AppleEventKitStatus = {
+type AppleEventKitStatus = {
   reminders: ConnectorAccessStatus;
   calendar: ConnectorAccessStatus;
 };
 
-type AppleEventKitCommandRunner = (command: Record<string, unknown>) => Promise<any>;
-let appleEventKitCommandRunner: AppleEventKitCommandRunner | null = null;
-let cachedAppleEventKitStatus: AppleEventKitStatus | null = null;
-
 export function setAppleEventKitCommandRunner(runner: AppleEventKitCommandRunner) {
-  appleEventKitCommandRunner = runner;
+  setAppleEventKitRunner(runner);
 }
 
 export type ConnectorItem = {
@@ -733,7 +755,8 @@ LIMIT ${maxResults};
 }
 
 export function localConnectorAccessStatuses(): ConnectorAccessStatus[] {
-  const appleStatuses = cachedAppleEventKitStatus ?? defaultAppleEventKitStatus();
+  const rawAppleStatus = cachedAppleEventKitRawStatus();
+  const appleStatuses = rawAppleStatus ? mapAppleEventKitStatus(rawAppleStatus) : defaultAppleEventKitStatus();
   return [appleStatuses.reminders, appleStatuses.calendar, messagesAccessStatus()];
 }
 
@@ -784,7 +807,7 @@ function appleEventKitAccessStatus(serviceID: "appleReminders" | "appleCalendar"
       detail: `${displayName} integration is only available on macOS.`
     };
   }
-  if (normalized === "authorized" || normalized === "fullAccess") {
+  if (normalized === "authorized" || normalized === "fullAccess" || normalized === "granted") {
     return {
       serviceID,
       status: "granted",
@@ -810,6 +833,17 @@ function appleEventKitAccessStatus(serviceID: "appleReminders" | "appleCalendar"
       permissionKind: "appleEventKit"
     };
   }
+  if (normalized === "devUnsigned" || normalized === "identityMismatch") {
+    return {
+      serviceID,
+      status: "blocked",
+      label: "Helper identity issue",
+      detail: normalized === "devUnsigned"
+        ? `The development helper for ${displayName} is not stably signed.`
+        : `${displayName} access belongs to a different helper build.`,
+      permissionKind: "appleEventKit"
+    };
+  }
   return {
     serviceID,
     status: "unknown",
@@ -819,82 +853,90 @@ function appleEventKitAccessStatus(serviceID: "appleReminders" | "appleCalendar"
   };
 }
 
-function requireAppleEventKitRunner() {
-  if (!appleEventKitCommandRunner) throw new Error("Apple EventKit helper is not available yet.");
-  return appleEventKitCommandRunner;
-}
-
-function cacheAppleEventKitStatus(data: any): AppleEventKitStatus {
-  const status = {
+function mapAppleEventKitStatus(data: any): AppleEventKitStatus {
+  return {
     reminders: appleEventKitAccessStatus("appleReminders", String(data?.reminders ?? "")),
     calendar: appleEventKitAccessStatus("appleCalendar", String(data?.calendar ?? ""))
   };
-  cachedAppleEventKitStatus = status;
-  return status;
-}
-
-export async function appleEventKitStatus(): Promise<AppleEventKitStatus> {
-  if (process.platform !== "darwin") {
-    cachedAppleEventKitStatus = defaultAppleEventKitStatus();
-    return cachedAppleEventKitStatus;
-  }
-  const data = await requireAppleEventKitRunner()({ command: "status" });
-  return cacheAppleEventKitStatus(data);
-}
-
-export async function requestAppleEventKitAccess(service: AppleEventKitService): Promise<AppleEventKitStatus> {
-  await requireAppleEventKitRunner()({
-    command: "request-access",
-    service
-  });
-  return appleEventKitStatus();
 }
 
 export async function listAppleReminders(options: AppleReminderListOptions = {}): Promise<AppleReminderRecord[]> {
-  const data = await requireAppleEventKitRunner()({
+  const data = await executeAppleEventKitCommand("reminders", {
     command: "list-reminders",
     ...options
   });
-  void appleEventKitStatus().catch(() => undefined);
   return Array.isArray(data?.reminders) ? data.reminders as AppleReminderRecord[] : [];
 }
 
+export type AppleReminderSearchOptions = {
+  query: string;
+  calendar?: string;
+  includeCompleted?: boolean;
+  completedOnly?: boolean;
+  limit?: number;
+};
+
+export type AppleReminderSearchResult = {
+  reminders: AppleReminderRecord[];
+  totalMatches: number;
+  completedMatches: number;
+  incompleteMatches: number;
+};
+
+export async function searchAppleReminders(options: AppleReminderSearchOptions): Promise<AppleReminderSearchResult> {
+  const data = await executeAppleEventKitCommand("reminders", {
+    command: "search-reminders",
+    ...options
+  });
+  return {
+    reminders: Array.isArray(data?.reminders) ? data.reminders as AppleReminderRecord[] : [],
+    totalMatches: Number(data?.totalMatches ?? 0),
+    completedMatches: Number(data?.completedMatches ?? 0),
+    incompleteMatches: Number(data?.incompleteMatches ?? 0)
+  };
+}
+
 export async function addAppleReminder(input: AppleReminderInput): Promise<AppleReminderRecord> {
-  const data = await requireAppleEventKitRunner()({
+  const data = await executeAppleEventKitCommand("reminders", {
     command: "add-reminder",
     ...input
   });
-  void appleEventKitStatus().catch(() => undefined);
   if (!data?.reminder) throw new Error("Apple Reminders did not return the created reminder.");
   return data.reminder as AppleReminderRecord;
 }
 
+export async function updateAppleReminder(input: AppleReminderUpdateInput): Promise<AppleReminderRecord> {
+  const data = await executeAppleEventKitCommand("reminders", {
+    command: "update-reminder",
+    ...input
+  });
+  if (!data?.reminder) throw new Error("Apple Reminders did not return the updated reminder.");
+  return data.reminder as AppleReminderRecord;
+}
+
 export async function completeAppleReminder(id: string, completed = true): Promise<AppleReminderRecord> {
-  const data = await requireAppleEventKitRunner()({
+  const data = await executeAppleEventKitCommand("reminders", {
     command: "complete-reminder",
     id,
     completed
   });
-  void appleEventKitStatus().catch(() => undefined);
   if (!data?.reminder) throw new Error("Apple Reminders did not return the updated reminder.");
   return data.reminder as AppleReminderRecord;
 }
 
 export async function listAppleCalendarEvents(options: AppleCalendarEventListOptions = {}): Promise<AppleCalendarEventRecord[]> {
-  const data = await requireAppleEventKitRunner()({
+  const data = await executeAppleEventKitCommand("calendar", {
     command: "list-events",
     ...options
   });
-  void appleEventKitStatus().catch(() => undefined);
   return Array.isArray(data?.events) ? data.events as AppleCalendarEventRecord[] : [];
 }
 
 export async function addAppleCalendarEvent(input: AppleCalendarEventInput): Promise<AppleCalendarEventRecord> {
-  const data = await requireAppleEventKitRunner()({
+  const data = await executeAppleEventKitCommand("calendar", {
     command: "add-event",
     ...input
   });
-  void appleEventKitStatus().catch(() => undefined);
   if (!data?.event) throw new Error("Apple Calendar did not return the created event.");
   return data.event as AppleCalendarEventRecord;
 }

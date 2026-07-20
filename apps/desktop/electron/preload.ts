@@ -7,8 +7,14 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   // OPENASSIST_ELECTRON_REMOTE_DEBUG=1 and returns { error: "disabled" }
   // otherwise — safe to expose unconditionally.
   __perfSnapshot: () => ipcRenderer.invoke("openassist:__perf-snapshot"),
-  getMacOSPermissions: () => ipcRenderer.invoke("openassist:get-macos-permissions"),
-  requestMacOSPermission: (kind: string) => ipcRenderer.invoke("openassist:request-macos-permission", kind),
+  getNativePermissions: () => ipcRenderer.invoke("openassist:native-permissions-get"),
+  requestNativePermission: (permissionID: string) => ipcRenderer.invoke("openassist:native-permissions-request", permissionID),
+  openNativePermissionSettings: (permissionID: string) => ipcRenderer.invoke("openassist:native-permissions-open-settings", permissionID),
+  onNativePermissionsChanged: (callback: (snapshot: unknown) => void) => {
+    const listener = (_event: unknown, snapshot: unknown) => callback(snapshot);
+    ipcRenderer.on("openassist:native-permissions-changed", listener);
+    return () => ipcRenderer.off("openassist:native-permissions-changed", listener);
+  },
   getComputerUseActivity: () => ipcRenderer.invoke("openassist:get-computer-use-activity"),
   forceStopComputerUse: () => ipcRenderer.invoke("openassist:force-stop-computer-use"),
   openTarget: (target: string, workspaceRootPath?: string | null) => ipcRenderer.invoke("openassist:open-target", target, workspaceRootPath),
@@ -61,8 +67,6 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   loadSettingsAppState: () => ipcRenderer.invoke("openassist:load-settings-app-state"),
   loadConnectorSnapshot: () => ipcRenderer.invoke("openassist:connectors-load"),
   loadConnectorReviewInbox: () => ipcRenderer.invoke("openassist:connectors-load-review-inbox"),
-  appleEventKitStatus: () => ipcRenderer.invoke("openassist:apple-eventkit-status"),
-  requestAppleEventKitAccess: (service: string) => ipcRenderer.invoke("openassist:apple-eventkit-request-access", service),
   createGoogleConnectorAccount: (label: string) => ipcRenderer.invoke("openassist:connectors-create-google-account", label),
   removeGoogleConnectorAccount: (accountID: string) => ipcRenderer.invoke("openassist:connectors-remove-google-account", accountID),
   setConnectorServiceEnabled: (accountID: string, serviceID: string, enabled: boolean) =>
@@ -235,6 +239,8 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.invoke("openassist:move-note-folder", projectID, folderID, parentFolderID),
   moveNoteToFolder: (projectID: string, noteID: string, folderID: string | null) =>
     ipcRenderer.invoke("openassist:move-note-to-folder", projectID, noteID, folderID),
+  moveNoteToProject: (sourceProjectID: string, noteID: string, destinationProjectID: string) =>
+    ipcRenderer.invoke("openassist:move-note-to-project", sourceProjectID, noteID, destinationProjectID),
   deleteThreadNote: (threadID: string, noteID: string) =>
     ipcRenderer.invoke("openassist:delete-thread-note", threadID, noteID),
   archiveThreadNote: (threadID: string, noteID: string) =>
@@ -526,6 +532,13 @@ contextBridge.exposeInMainWorld("openAssistRealtime", {
     pluginIDs?: string[];
     skillIDs?: string[];
     contextHint?: string;
+    contextResources?: Array<{
+      kind: string;
+      id: string;
+      title?: string;
+      source?: string;
+      attributes?: Record<string, unknown>;
+    }>;
     contextProjectID?: string;
     contextProjectName?: string;
     contextThreadID?: string;

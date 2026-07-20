@@ -24,10 +24,17 @@ if (!fs.existsSync(bridgeSrc)) {
 
 // ── Runtime checks: realtimeProxy (no Electron dep) ────────────────────────
 
-const { __realtimeRouterTestHooks } = await import(path.toNamespacedPath(proxyPath));
-const { realtimeVoiceKnowledgeToolSpecs } = __realtimeRouterTestHooks;
+const { __realtimeProtocolTestHooks } = await import(path.toNamespacedPath(proxyPath));
+const realtimeVoiceKnowledgeToolSpecs = __realtimeProtocolTestHooks
+  .liveVoiceCapabilityDescriptors(() => ({ knowledge: { enabled: true } }))
+  .filter((descriptor) => descriptor.id.startsWith("knowledge_"))
+  .map((descriptor) => ({
+    name: descriptor.id,
+    description: descriptor.description,
+    parameters: descriptor.inputSchema
+  }));
 
-assert.ok(Array.isArray(realtimeVoiceKnowledgeToolSpecs), "realtimeVoiceKnowledgeToolSpecs must be an array");
+assert.ok(Array.isArray(realtimeVoiceKnowledgeToolSpecs), "Live Voice note capabilities must be available in the hidden registry");
 
 // Realtime agent must be able to read a full note by itemID before organizing it
 const rtReadTool = realtimeVoiceKnowledgeToolSpecs.find((t) => t.name === "knowledge_read");
@@ -133,8 +140,8 @@ assert.ok(
   "openAssistKnowledgeAgentInstructions must reference oa_note_style_guide and oa_request_organize"
 );
 assert.ok(
-  bridgeText.includes("Show changes") && bridgeText.includes("before/after diff"),
-  "agent instructions must point users to the approval diff preview"
+  bridgeText.includes("approval preview") && bridgeText.includes("Review Inbox"),
+  "agent instructions must point users to the approval preview"
 );
 
 // Helpful error message for organize without markdown

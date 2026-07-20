@@ -32,8 +32,14 @@ assertIncludes(appendBacklog, "replaceStructuredDailyItem(backlog.markdown, item
 
 const updateByText = functionBody("updateDailyItemByText");
 assertIncludes(updateByText, "appendMovedDailyItemToDay(item, targetDayID)", "cross-day text move");
-assertIncludes(updateByText, "removeStructuredDailyItem(sourceDay.markdown, match.id)", "cross-day text move");
-assertIncludes(updateByText, "removePlainDailyItemLine(sourceDay.markdown, match.id)", "cross-day text move");
+assertIncludes(updateByText, "locatePlannerTask(raw)", "cross-store task lookup");
+assertIncludes(updateByText, "removeStructuredDailyItem(source.detail.markdown, match.id)", "cross-day text move");
+assertIncludes(updateByText, "removePlainDailyItemLine(source.detail.markdown, match.id)", "cross-day text move");
+assertIncludes(updateByText, "appendMovedDailyItemToBacklog(item)", "cross-store text move");
+
+const locateTask = functionBody("locatePlannerTask");
+assertIncludes(locateTask, "plannerTaskContainers(raw)", "task locator must inspect planner stores");
+assertIncludes(locateTask, "matches more than one task", "task locator must reject ambiguous matches");
 
 const moveToBacklog = functionBody("moveDailyItemToBacklog");
 assertIncludes(moveToBacklog, "appendMovedDailyItemToBacklog", "move to backlog");

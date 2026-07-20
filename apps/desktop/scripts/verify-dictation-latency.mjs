@@ -64,3 +64,38 @@ assert.doesNotMatch(
 );
 
 console.log("Dictation latency guards verified.");
+
+// ---- Warm dictation start (2026-07-16) ----
+// A pre-armed recording helper (mic OFF, kqueue-blocked) must exist so the
+// shortcut press skips process spawn + permission round-trips.
+const speechHelper = fs.readFileSync(path.resolve("electron/helpers/apple-speech-helper.swift"), "utf8");
+assert.match(
+  speechHelper,
+  /--arm-recording/,
+  "The Swift helper must support --arm-recording warm mode."
+);
+assert.match(
+  speechHelper,
+  /makeFileSystemObjectSource/,
+  "The armed helper must block on a kqueue watch, not poll."
+);
+assert.match(
+  main,
+  /adoptArmedVoiceHelper\(configuration\)/,
+  "Voice starts must adopt the armed helper when available."
+);
+assert.match(
+  main,
+  /armedVoiceHelper\?\.helperPid === helper\.pid\) continue;/,
+  "The stale-helper sweep must never kill the parked warm helper."
+);
+assert.match(
+  main,
+  /voice start timing engine=/,
+  "Start timing logs must exist so warm vs cold can be measured."
+);
+assert.match(
+  main,
+  /disarmVoiceHelper\("app quitting"\)/,
+  "The armed helper must be torn down on quit (no orphan processes)."
+);

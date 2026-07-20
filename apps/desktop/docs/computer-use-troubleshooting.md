@@ -101,6 +101,21 @@ foreign helpers so the Settings "Force stop" can't kill them either.
 
 Guarded by `npm run verify:computer-use-ownership`.
 
+## The third bug: temporary HOME breaks the native pipe (July 2026)
+
+Computer Use locates its shared macOS socket below the current `HOME`. Demo and
+test launches can intentionally set a temporary home, such as
+`/tmp/openassist-devpost-demo-home`, to isolate OpenAssist data. If that value is
+inherited by `codex app-server`, the Computer Use client misses the real socket
+under the user's account and starts a second `SkyComputerUseService`. The second
+service repeatedly logs `socket lock is unavailable errno=35`, and the tool
+returns `native pipe startup failed` before it ever reaches the requested app.
+
+`computerUseNativeHome()` now uses the macOS account home from `os.userInfo()`.
+Both the main Codex app-server and the Claude/Copilot Codex proxy pass that real
+home to Computer Use while the rest of the demo remains isolated. Do not change
+these routes back to the inherited `process.env.HOME`.
+
 ## If Computer Use stops working again — diagnosis checklist
 
 1. **Read the debug log** (most important):

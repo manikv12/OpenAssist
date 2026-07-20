@@ -13,10 +13,24 @@ const checks = [
   ["types: renderer settings include echo guard", types, /liveVoiceEchoGuardEnabled: boolean/],
   ["types: echo guard can be updated", types, /\| "liveVoiceEchoGuardEnabled"/],
   ["renderer: echo guard ref is synced from settings", renderer, /liveVoiceEchoGuardEnabledRef\.current = Boolean\(appState\.settings\.liveVoiceEchoGuardEnabled\)/],
-  ["renderer: flush drops mic chunks while assistant speaks", renderer, /liveVoiceEchoGuardEnabledRef\.current && \(liveVoiceMeterBus\.outputPlaying \|\| liveVoiceStatusRef\.current === "speaking"\)[\s\S]{0,160}liveVoiceInputChunksRef\.current = \[\]/],
-  ["renderer: processor drops mic chunks while assistant speaks", renderer, /processor\.onaudioprocess = \(event\) => \{[\s\S]{0,650}liveVoiceEchoGuardEnabledRef\.current && \(liveVoiceMeterBus\.outputPlaying \|\| liveVoiceStatusRef\.current === "speaking"\)/],
-  ["renderer: settings UI exposes echo guard", renderer, /checked=\{settings\?\.liveVoiceEchoGuardEnabled \?\? true\}[\s\S]{0,160}label="Pause mic while assistant speaks"/]
+  ["renderer: echo guard uses acoustic echo cancellation", renderer, /const liveVoiceAudioProcessing[\s\S]{0,260}echoCancellation: liveVoiceEchoGuardEnabledRef\.current/],
+  ["renderer: voice isolation is requested when supported", renderer, /supportedAudioConstraints\?\.voiceIsolation[\s\S]{0,80}voiceIsolation: true/],
+  ["renderer: automatic gain does not amplify distant audio", renderer, /autoGainControl: false/],
+  ["renderer: mic processing stays open for barge-in", renderer, /processor\.onaudioprocess = \(event\) => \{[\s\S]{0,500}if \(liveVoiceMutedRef\.current\)[\s\S]{0,300}const channel = event\.inputBuffer\.getChannelData\(0\)/],
+  ["renderer: real mic frames reach provider VAD", renderer, /const frame = new Float32Array\(channel\);[\s\S]{0,400}liveVoiceInputChunksRef\.current\.push\(frame\)/],
+  ["renderer: settings UI exposes echo guard", renderer, /checked=\{settings\?\.liveVoiceEchoGuardEnabled \?\? true\}[\s\S]{0,160}label="Prevent assistant audio echo"/]
 ];
+
+const hardPausePattern = /liveVoiceEchoGuardEnabledRef\.current && \(liveVoiceMeterBus\.outputPlaying \|\| liveVoiceStatusRef\.current === "speaking"\)/;
+if (hardPausePattern.test(renderer)) {
+  console.error("FAIL renderer: echo guard must not hard-pause the mic while the assistant speaks");
+  process.exit(1);
+}
+
+if (/liveVoiceGate|new Float32Array\(channel\.length\)/.test(renderer)) {
+  console.error("FAIL renderer: cloud Live Voice must not replace quiet speech before provider VAD");
+  process.exit(1);
+}
 
 let failures = 0;
 for (const [label, source, pattern] of checks) {

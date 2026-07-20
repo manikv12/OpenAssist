@@ -23,10 +23,19 @@ try {
   assert.ok(bridgeSource.includes("return \"oa_connector_search_gmail\""), "Gmail search aliases must not route to sync");
   assert.ok(bridgeSource.includes("name: \"oa_connector_search_messages\""), "Knowledge tools must include local Messages search");
   assert.ok(bridgeSource.includes("return \"oa_connector_search_messages\""), "Messages search aliases must route to Messages search");
-  assert.ok(realtimeSource.includes("name: \"knowledge_connector_search_gmail\""), "Realtime knowledge tools must include direct Gmail search");
-  assert.ok(realtimeSource.includes("name: \"knowledge_connector_search_messages\""), "Realtime knowledge tools must include Messages search");
-  assert.ok(realtimeSource.includes("do not sync Review Inbox"), "Realtime instructions must separate search from sync");
+  assert.ok(realtimeSource.includes("name: \"knowledge_connector_search_gmail\""), "Hidden Live Voice capabilities must include direct Gmail search");
+  assert.ok(realtimeSource.includes("name: \"knowledge_connector_search_messages\""), "Hidden Live Voice capabilities must include Messages search");
+  assert.ok(realtimeSource.includes("Do not sync Review Inbox for direct email search"), "Direct search capability must stay separate from connector sync");
   assert.ok(appSource.includes("Open Full Disk Access"), "Connector Settings must show a Messages Full Disk Access action");
+  assert.ok(appSource.includes("connectorServiceIcon"), "Connector service rows must render a per-service icon");
+  assert.ok(
+    stylesSource.includes(".connector-service-list-compact .connector-service-row > div > span:not(.connector-service-title-line)"),
+    "Compact connector rows must hide only the sync-mode span, never the service title line"
+  );
+  assert.ok(
+    !/\.connector-service-list-compact \.connector-service-row span \{/.test(stylesSource),
+    "Compact connector rows must not blanket-hide all spans (that hides the Gmail/Calendar names)"
+  );
 
   let snapshot = connectors.loadConnectorSnapshot();
   assert.equal(snapshot.accounts.some((account) => account.id === "apple-this-mac"), true);
@@ -44,16 +53,16 @@ try {
   assert.equal(updatedGoogle.enabledServiceIDs.includes("gmail"), true);
 
   const plannedQueries = connectors.planGmailMetadataSearches({
-    userIntent: "Find email tasks for Quality Nails today",
+    userIntent: "Find email tasks for the sample client today",
     timeframeDays: 2,
     maxResults: 5
   });
   assert.equal(plannedQueries.some((query) => query.includes("newer_than:2d")), true);
   assert.equal(plannedQueries.some((query) => query.includes("-category:promotions")), true);
-  assert.equal(plannedQueries.some((query) => query.includes('"quality"')), true);
+  assert.equal(plannedQueries.some((query) => query.includes('"sample"')), true);
   assert.equal(plannedQueries.some((query) => query.trim() === "newer_than:7d"), false);
   const fallbackQueries = connectors.planGmailFallbackMetadataSearches({
-    userIntent: "Find email tasks for Quality Nails today",
+    userIntent: "Find email tasks for the sample client today",
     timeframeDays: 2
   });
   assert.equal(fallbackQueries.some((query) => query === "newer_than:2d -category:promotions -category:social -in:chats"), true);
@@ -68,10 +77,10 @@ try {
   assert.equal(directQueries[0].includes("newer_than:30d"), true);
   assert.equal(directQueries[0].includes("from:alex@example.com invoice"), true);
   const naturalDirectQueries = connectors.planGmailDirectSearches({
-    userIntent: "find Quality Nails receipt email",
+    userIntent: "find the sample client receipt email",
     timeframeDays: 30
   });
-  assert.equal(naturalDirectQueries.some((query) => query.includes('"quality"')), true);
+  assert.equal(naturalDirectQueries.some((query) => query.includes('"sample"')), true);
   assert.equal(naturalDirectQueries.some((query) => query.includes('"receipt"')), true);
 
   execFileSync("/usr/bin/sqlite3", [process.env.OPENASSIST_MESSAGES_DB, [
@@ -125,7 +134,7 @@ try {
   const fakeGwsPath = path.join(tempRoot, "fake-gws-permission-error.sh");
   fs.writeFileSync(fakeGwsPath, [
     "#!/bin/sh",
-    "echo 'error[api]: Caller does not have required permission to use project qualitynailsreporting. Grant the caller the roles/serviceusage.serviceUsageConsumer role, or a custom role with the serviceusage.services.use permission.' 1>&2",
+    "echo 'error[api]: Caller does not have required permission to use project example-project. Grant the caller the roles/serviceusage.serviceUsageConsumer role, or a custom role with the serviceusage.services.use permission.' 1>&2",
     "exit 1",
     ""
   ].join("\n"));
@@ -138,7 +147,7 @@ try {
       requiresApproval: false,
       displayCommand: fakeGwsPath
     }),
-    /Google Cloud permission needed for project "qualitynailsreporting"/
+    /Google Cloud permission needed for project "example-project"/
   );
 
   assert.throws(() => connectors.buildGoogleCommandPlan(google.id, {

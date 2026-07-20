@@ -1592,6 +1592,14 @@ textarea {
   color: var(--text-strong);
 }
 
+.project-row.note-drop-target {
+  color: var(--text-strong);
+  background: color-mix(in srgb, var(--thread-note-accent, #d28a3a) 18%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--thread-note-accent, #d28a3a) 72%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--thread-note-accent, #d28a3a) 12%, transparent);
+}
+
 .project-list {
   flex: 0 1 auto;
   max-height: 330px;
@@ -5453,11 +5461,13 @@ textarea {
 }
 
 /* Today and Notes are work surfaces, so Agent Work stays as a small live pill
-   in the lower-right corner and disappears as soon as the task finishes. */
+   in the lower-right corner and disappears as soon as the task finishes.
+   It sits well above the floating Live Voice HUD (which docks at the bottom
+   centre and reserves the lower band) so the two never overlap. */
 .realtime-work-surface.is-compact-context {
   left: auto;
   right: 18px;
-  bottom: 76px;
+  bottom: 250px;
   width: min(360px, calc(100vw - 48px));
   transform: none;
 }
@@ -5944,6 +5954,22 @@ textarea {
   font-size: 12px;
   line-height: 1.45;
   background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 2%, transparent);
+}
+
+.realtime-work-model {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: -2px 2px 0;
+  color: var(--muted, rgba(224, 230, 238, 0.58));
+  font-size: 10.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.realtime-work-model small {
+  color: inherit;
+  font-size: 10px;
 }
 
 /* Step timeline — clean professional activity log. */
@@ -21751,7 +21777,11 @@ mark.find-highlight.find-active {
 }
 
 .settings-section-tabs.stuck {
-  background: var(--theme-background, var(--base, #0d1117));
+  background: color-mix(in srgb, var(--theme-background, var(--base, #0d1117)) 92%, transparent);
+  /* Blur whatever scrolls beneath so nothing readable bleeds through, even
+     while the 200ms background transition is still fading in. */
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  backdrop-filter: blur(18px) saturate(1.3);
   border-bottom-color: var(--line);
   box-shadow: 0 8px 14px -8px rgba(0, 0, 0, 0.45);
   /* The pinned bar overlaps .window-drag-strip's native drag region; keep the
@@ -23039,7 +23069,7 @@ mark.find-highlight.find-active {
 }
 
 .connector-service-list-compact {
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 8px;
 }
 
@@ -23049,11 +23079,11 @@ mark.find-highlight.find-active {
 
 @media (min-width: 1100px) {
   .settings-stack.connectors .connector-service-list {
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   }
 
   .settings-stack.connectors .connector-service-list-compact {
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   }
 }
 
@@ -23513,8 +23543,8 @@ mark.find-highlight.find-active {
 
 .connector-service-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 11px;
   align-items: center;
   padding: 11px 12px;
   border-radius: 8px;
@@ -23533,10 +23563,31 @@ mark.find-highlight.find-active {
   box-shadow: inset 0 0 0 1px rgba(255, 139, 24, 0.24);
 }
 
+.connector-service-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  align-self: start;
+  margin-top: 1px;
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+
+.connector-service-icon.active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, rgba(255, 255, 255, 0.03));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, rgba(255, 255, 255, 0.05));
+}
+
 .connector-service-title-line {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 8px;
   min-width: 0;
 }
 
@@ -23625,13 +23676,20 @@ mark.find-highlight.find-active {
 }
 
 .connector-service-list-compact .connector-service-row {
-  min-height: 44px;
-  padding: 9px 10px;
+  min-height: 46px;
+  padding: 8px 10px;
 }
 
 .connector-service-list-compact .connector-service-row small,
-.connector-service-list-compact .connector-service-row span {
+.connector-service-list-compact .connector-service-row > div > span:not(.connector-service-title-line) {
   display: none;
+}
+
+.connector-service-list-compact .connector-service-icon {
+  align-self: center;
+  margin-top: 0;
+  width: 28px;
+  height: 28px;
 }
 
 .connector-service-list-compact .connector-service-row strong {

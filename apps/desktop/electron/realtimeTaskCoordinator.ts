@@ -1,3 +1,6 @@
+import { VoiceResultOutbox, type VoiceResultEnvelope } from "./liveVoice/resultOutbox.js";
+import type { DelegatedWorkExecutionProfile, LiveVoiceContextResource, WorkerModelMetadata } from "./liveVoice/contracts.js";
+
 export type RealtimeTaskState = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export type RealtimeTaskDeliveryState = "pending" | "queued" | "speaking" | "delivered";
@@ -20,6 +23,14 @@ export type RealtimeTaskRecord = {
   normalizedPrompt: string;
   workerProvider: string;
   agentLabel: string;
+  executionProfile?: DelegatedWorkExecutionProfile;
+  freshThread?: boolean;
+  contextResources?: LiveVoiceContextResource[];
+  workerModelRole?: WorkerModelMetadata["role"];
+  workerModelID?: string;
+  workerReasoningEffort?: WorkerModelMetadata["reasoningEffort"];
+  workerSelectionReason?: string;
+  workerModelExplicit?: boolean;
   replyMode: "message" | "function";
   kind: RealtimeTaskKind;
   state: RealtimeTaskState;
@@ -46,6 +57,9 @@ export type RealtimeTaskStartInput = {
   userText?: string;
   prompt: string;
   workerProvider?: string;
+  executionProfile?: DelegatedWorkExecutionProfile;
+  freshThread?: boolean;
+  contextResources?: LiveVoiceContextResource[];
   replyMode?: "message" | "function";
   kind?: RealtimeTaskKind;
 };
@@ -64,6 +78,7 @@ export function normalizeRealtimeTaskPrompt(prompt: string) {
 
 export class RealtimeTaskCoordinator {
   private readonly tasks = new Map<string, RealtimeTaskRecord>();
+  private readonly resultOutbox = new VoiceResultOutbox();
 
   constructor(
     private readonly maxActiveTasks = 6,
@@ -97,6 +112,9 @@ export class RealtimeTaskCoordinator {
       normalizedPrompt,
       workerProvider,
       agentLabel: workerProvider,
+      executionProfile: input.executionProfile ? { ...input.executionProfile } : undefined,
+      freshThread: input.freshThread === true,
+      contextResources: input.contextResources?.length ? input.contextResources.map((resource) => ({ ...resource })) : undefined,
       replyMode: input.replyMode ?? "message",
       kind: input.kind ?? "single",
       state: "running",
@@ -188,6 +206,20 @@ export class RealtimeTaskCoordinator {
     return task;
   }
 
+  updateWorkerModel(taskID: string, metadata: WorkerModelMetadata) {
+    const task = this.tasks.get(taskID);
+    if (!task || !this.isActive(task)) return task;
+    task.workerProvider = "Codex";
+    task.agentLabel = "Codex";
+    task.workerModelRole = metadata.role;
+    task.workerModelID = metadata.modelID;
+    task.workerReasoningEffort = metadata.reasoningEffort;
+    task.workerSelectionReason = metadata.selectionReason;
+    task.workerModelExplicit = metadata.explicitlySelected;
+    task.updatedAt = this.now();
+    return task;
+  }
+
   complete(taskID: string, result: string) {
     const text = result.trim();
     if (!text) return this.fail(taskID, "The agent finished without returning an answer.");
@@ -226,6 +258,26 @@ export class RealtimeTaskCoordinator {
     return [...this.tasks.values()]
       .filter((task) => !this.isActive(task) && task.deliveryState !== "delivered" && (!scopeKey || task.scopeKey === scopeKey))
       .sort((left, right) => (left.finishedAt ?? left.updatedAt) - (right.finishedAt ?? right.updatedAt));
+  }
+
+  enqueueResult(input: Omit<VoiceResultEnvelope, "state">) {
+    return this.resultOutbox.enqueue(input);
+  }
+
+  nextResult() {
+    return this.resultOutbox.next();
+  }
+
+  markResultDelivery(deliveryID: string, state: VoiceResultEnvelope["state"]) {
+    return this.resultOutbox.mark(deliveryID, state);
+  }
+
+  pendingResults() {
+    return this.resultOutbox.pending();
+  }
+
+  getResult(deliveryID: string) {
+    return this.resultOutbox.get(deliveryID);
   }
 
   visible(scopeKey?: string, recentFinishedMs = 15_000) {

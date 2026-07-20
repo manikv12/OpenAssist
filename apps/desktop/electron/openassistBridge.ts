@@ -11,14 +11,29 @@ import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
 import {
   CodexRealtimeProxy,
-  type RealtimeDelegationMode,
-  type RealtimeDelegationRouteInput,
-  type RealtimeDelegationRouteResult,
+  type RealtimeWorkerPolicy,
   type RealtimeCloudProvider,
   type RealtimeProxyConfig,
   type RealtimeVisualContext
 } from "./realtimeProxy.js";
+import {
+  defaultOpenAIRealtimeModel,
+  validateOpenAIRealtimeConversationModel
+} from "./openAIRealtimeModels.js";
+import {
+  LocalMCPHarness,
+  type RealtimeMCPServerSummary
+} from "./realtimeMcpHarness.js";
 import { buildLiveVoiceBootstrapContext } from "./liveVoiceContinuity.js";
+import type {
+  DelegatedWorkExecutionProfile,
+  LiveVoiceContextResource,
+  WorkerModelMetadata
+} from "./liveVoice/contracts.js";
+import {
+  decideWorkerModelRole,
+  resolveWorkerModel
+} from "./liveVoice/workerModelPolicy.js";
 import {
   atomicWriteJSON,
   conversationHistorySegmentFiles,
@@ -96,16 +111,21 @@ import {
   completeAppleReminder,
   listAppleCalendarEvents,
   listAppleReminders,
+  searchAppleReminders,
+  updateAppleReminder,
   loadConnectorSnapshot,
   searchGmailMetadata,
   searchLocalMessages,
   syncGmailMetadataToReviewInbox,
   type ConnectorItem,
   type AppleReminderRecord,
+  type AppleReminderRecurrence,
   type GmailSearchOptions,
   type GmailSyncOptions,
   type LocalMessagesSearchOptions
 } from "./connectors.js";
+import { parseAppleRemindersQuickReadTarget } from "./appleReminderRouting.js";
+import { NativePermissionRequiredError } from "./nativeAccess.js";
 
 const execFileAsync = promisify(execFile);
 const macAbsoluteEpochOffset = 978_307_200;
@@ -135,6 +155,7 @@ const personalRecallMaxSessionPreviewBytes = 128 * 1024;
 
 let codexModelListCache: { expiresAt: number; ids: string[] } | null = null;
 let codexProviderModelCache: { expiresAt: number; value: ProviderModelOption[] } | null = null;
+let codexAvailableModelCache: { expiresAt: number; value: ProviderModelOption[] } | null = null;
 
 let threadsChangedListener: (() => void) | null = null;
 export function setThreadsChangedListener(listener: (() => void) | null) {
@@ -308,13 +329,13 @@ const realtimeOpenAIAPIKeychainAccount = "realtime-openai-api-key";
 const knowledgeAccessTokenFileName = "token.txt";
 const knowledgeServerStateFileName = "server.json";
 const defaultKnowledgeServerPort = "45833";
-const defaultRealtimeOpenAIModel = "gpt-realtime-mini";
+const defaultRealtimeOpenAIModel = defaultOpenAIRealtimeModel;
 const defaultRealtimeOpenAIVoice = "marin";
 const defaultRealtimeVoiceProvider = "openaiRealtime";
 const defaultRealtimeGeminiModel = "gemini-3.1-flash-live-preview";
 const defaultRealtimeGeminiVoice = "Aoede";
 const defaultLiveVoiceMode = "openaiRealtime";
-const defaultRealtimeDelegationMode: RealtimeDelegationMode = "autoHardTasksOnly";
+const defaultRealtimeWorkerPolicy: RealtimeWorkerPolicy = "auto";
 const defaultLocalVoiceModel = "gemma4:e2b";
 const defaultSpeechOutputRewriteModel = "gemma4:e2b";
 const defaultPocketTTSVoiceID = "eve";
@@ -326,11 +347,10 @@ const defaultPocketTTSServerHost = "127.0.0.1";
 const defaultPocketTTSServerPort = 45_839;
 const assistantVoiceEnginePocketDefaultMigrationKey = "OpenAssist.assistantVoiceEnginePocketDefaultMigrated";
 
-function normalizeRealtimeDelegationMode(value: unknown): RealtimeDelegationMode {
+function normalizeRealtimeWorkerPolicy(value: unknown): RealtimeWorkerPolicy {
   const mode = String(value ?? "").trim();
-  return mode === "alwaysDelegate" || mode === "neverDelegate" || mode === "autoHardTasksOnly"
-    ? mode
-    : defaultRealtimeDelegationMode;
+  if (mode === "never" || mode === "neverDelegate") return "never";
+  return defaultRealtimeWorkerPolicy;
 }
 const pocketTTSPrewarmPhrases = [
   "Sure, what do you need help with?",
@@ -561,6 +581,7 @@ type ThreadItem = {
   isRunning?: boolean;
   runStatusText?: string;
   active?: boolean;
+  kind?: string;
 };
 
 type ChatMessage = {
@@ -835,7 +856,12 @@ type SettingsSnapshot = {
   liveVoiceEchoGuardEnabled: boolean;
   todayWakeWordEnabled: boolean;
   todayWakeWordPhrase: string;
-  realtimeDelegationMode: RealtimeDelegationMode;
+  realtimeWorkerPolicy: RealtimeWorkerPolicy;
+  realtimeFastWorkerModel: string;
+  realtimeDeepWorkerModel: string;
+  realtimeLocalMCPEnabled: boolean;
+  realtimeLocalMCPAllowedServers: string;
+  realtimeLocalMCPServers: RealtimeMCPServerSummary[];
   localVoiceModel: string;
   speechOutputRewriteModel: string;
   assistantVoiceOutputEnabled: boolean;
@@ -993,7 +1019,11 @@ type SettingsUpdateKey =
   | "liveVoiceEchoGuardEnabled"
   | "todayWakeWordEnabled"
   | "todayWakeWordPhrase"
-  | "realtimeDelegationMode"
+  | "realtimeWorkerPolicy"
+  | "realtimeFastWorkerModel"
+  | "realtimeDeepWorkerModel"
+  | "realtimeLocalMCPEnabled"
+  | "realtimeLocalMCPAllowedServers"
   | "localVoiceModel"
   | "speechOutputRewriteModel"
   | "assistantVoiceOutputEnabled"
@@ -1255,6 +1285,9 @@ type DailyItem = {
   order: number;
   structured?: boolean;
   line?: number;
+  // false when a mutation's returned item could NOT be re-derived from the
+  // freshly saved markdown (the write may not have fully persisted).
+  readBack?: boolean;
 };
 
 type DailyItemInput = Partial<Omit<DailyItem, "id" | "createdAt" | "updatedAt" | "structured" | "line">> & {
@@ -1319,6 +1352,12 @@ type SessionSummary = JsonObject & {
   projectID?: string;
   projectName?: string;
   linkedProjectFolderPath?: string;
+  // "liveVoice" marks a Live Voice day-log thread; identification is by this flag,
+  // not by title, so daily rotation can rename old logs to dated titles safely.
+  kind?: string;
+  // Local planner day ("YYYY-MM-DD") a liveVoice thread belongs to; rotation
+  // triggers when this differs from today at session start.
+  liveVoiceDayID?: string;
 };
 
 type LoadedProjects = {
@@ -1408,6 +1447,8 @@ function bridgeDebugLog(message: string) {
     // Debug logging must never break the provider bridge.
   }
 }
+
+const realtimeLocalMCPHarness = new LocalMCPHarness();
 
 // Verbose per-event tracing (every codex request / tool call / turn phase and
 // each loadAppState step). It is high-volume and only useful when actively
@@ -3453,79 +3494,6 @@ async function classifyLocalVoiceTranscript(input: LocalVoiceClassifyInput): Pro
     assistantVoiceLog(`local voice classifier fallback elapsedMs=${Date.now() - startedAt}: ${error instanceof Error ? error.message : String(error)}`);
     return fallback;
   }
-}
-
-function normalizeRealtimeRouteDecision(value: unknown): RealtimeDelegationRouteResult["decision"] {
-  const decision = String(value ?? "").trim().toLowerCase();
-  return ["delegate", "answer_direct", "clarify", "ignore", "control"].includes(decision)
-    ? decision as RealtimeDelegationRouteResult["decision"]
-    : "answer_direct";
-}
-
-function clampRealtimeRouteConfidence(value: unknown, fallback = 0.5) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.max(0, Math.min(1, number));
-}
-
-async function classifyRealtimeDelegation(
-  input: RealtimeDelegationRouteInput,
-  settings: SettingsSnapshot
-): Promise<RealtimeDelegationRouteResult> {
-  const startedAt = Date.now();
-  const systemPrompt = [
-    "You are OpenAssist's realtime delegation gate.",
-    "Decide if the latest voice request should go to the background agent.",
-    "Return strict JSON only with decision, taskText, responseText, confidence, and reason.",
-    "decision must be one of: delegate, answer_direct, clarify, ignore, control.",
-    "Use delegate only for real work that needs files, code, terminal, browser, computer use, repo/app debugging, or multi-step provider work.",
-    "Do not delegate quick OpenAssist knowledge tasks when realtime tools can handle them: Today planner, Backlog, journal, notes search, open tasks, adding a simple daily/backlog item, or marking a task done.",
-    "Delegate complex notes/planner rewrites only when a simple tool or exact approval preview is not enough.",
-    "Use answer_direct for casual questions, status questions, questions about the previous result, or 'did you already find/do/check it' questions.",
-    "Use clarify for vague help requests or missing target details.",
-    "Use ignore for side conversation, background speech, repeated assistant text, or noise.",
-    "Use control for stop listening, pause, resume, cancel task, or stop speaking.",
-    "If unsure, do not delegate.",
-    "For delegate, taskText must be the clean task for the agent.",
-    "For answer_direct or clarify, responseText should be one short sentence or instruction for the voice model."
-  ].join("\n");
-  const userPrompt = JSON.stringify({
-    source: input.source,
-    provider: input.provider,
-    agentLabel: input.agentLabel,
-    prompt: input.prompt,
-    proposedTaskText: input.proposedTaskText,
-    lastDelegationPrompt: input.lastDelegationPrompt,
-    lastDelegationResult: input.lastDelegationResult,
-    hasActiveHandoff: input.hasActiveHandoff,
-    voiceState: input.voiceState
-  }, null, 2);
-
-  const text = await runLocalOllamaText({
-    model: settings.localVoiceModel || defaultLocalVoiceModel,
-    messages: localVoiceOllamaMessages(systemPrompt, userPrompt),
-    timeoutMs: 400,
-    numPredict: 140,
-    json: true
-  });
-  const object = extractJSONFromText(text);
-  const result: RealtimeDelegationRouteResult = {
-    decision: normalizeRealtimeRouteDecision(object?.decision),
-    taskText: firstRawRuntimeString(object?.taskText, object?.task),
-    responseText: firstRawRuntimeString(object?.responseText, object?.response),
-    confidence: clampRealtimeRouteConfidence(object?.confidence),
-    reason: firstRawRuntimeString(object?.reason).slice(0, 240)
-  };
-  assistantVoiceLog(
-    `realtime delegation router completed decision=${result.decision} confidence=${(result.confidence ?? 0).toFixed(2)} source=${input.source} elapsedMs=${Date.now() - startedAt}`
-  );
-  return result;
-}
-
-function realtimeDelegationRouter(settings: SettingsSnapshot): RealtimeProxyConfig["delegationRouter"] {
-  return {
-    route: (input) => classifyRealtimeDelegation(input, settings)
-  };
 }
 
 async function rewriteSpeechTextForTTS(rawText: string, settings: SettingsSnapshot) {
@@ -5744,6 +5712,12 @@ async function voiceInputConfiguration() {
   const settings = await loadSettings();
   return {
     transcriptionEngine: settings.transcriptionEngine,
+    // Microphone selection must be part of this snapshot: the warm dictation
+    // helper is armed from it, and a missing field made its arm signature
+    // disagree with every renderer-initiated start ("microphone settings
+    // changed" on each press → permanent cold starts).
+    autoDetectMicrophone: settings.autoDetectMicrophone,
+    selectedMicrophoneUID: settings.selectedMicrophoneUID,
     whisperModel: settings.whisperModel,
     whisperUseCoreML: settings.whisperUseCoreML,
     whisperModelInstalled: settings.whisperModelInstalled,
@@ -6636,15 +6610,28 @@ async function loadCodexProviderModels(): Promise<ProviderModelOption[]> {
   const cachedModels = readCodexProviderModelsFromCache();
   let models: ProviderModelOption[] = [];
   try {
-    const raw = await codexTransport.request("model/list", {}, undefined, 15_000);
-    models = uniqueProviderModels(codexModelRows(raw)
-      .map(codexProviderModelFromRow)
-      .filter((model): model is ProviderModelOption => Boolean(model)));
+    models = await loadAvailableCodexProviderModels();
   } catch (error) {
     bridgeDebugLog(`Codex model/list probe failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   models = uniqueProviderModels([...fallbackModelOptionsForBackend("codex"), ...cachedModels, ...models]);
   codexProviderModelCache = { expiresAt: now + codexModelListCacheMs, value: models };
+  return models;
+}
+
+async function loadAvailableCodexProviderModels(): Promise<ProviderModelOption[]> {
+  const now = Date.now();
+  if (codexAvailableModelCache && codexAvailableModelCache.expiresAt > now) {
+    return codexAvailableModelCache.value;
+  }
+  const raw = await codexTransport.request("model/list", {}, undefined, 15_000);
+  const models = uniqueProviderModels(codexModelRows(raw)
+    .map(codexProviderModelFromRow)
+    .filter((model): model is ProviderModelOption => Boolean(model)));
+  if (!models.length) {
+    throw new Error("Codex app-server returned an empty model catalog.");
+  }
+  codexAvailableModelCache = { expiresAt: now + codexModelListCacheMs, value: models };
   codexModelListCache = { expiresAt: now + codexModelListCacheMs, ids: models.map((model) => model.id) };
   return models;
 }
@@ -7460,7 +7447,8 @@ function loadThreads(
       isArchived: registrySession?.isArchived === true,
       archivedAt: storedArchiveDateToMs(registrySession?.archivedAt),
       autoDeleteAfter: storedArchiveDateToMs(registrySession?.autoDeleteAfter) ?? null,
-      isTemporary: registrySession?.isTemporary === true
+      isTemporary: registrySession?.isTemporary === true,
+      kind: registrySession?.kind === "liveVoice" ? "liveVoice" : undefined
     });
   }
   threads.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
@@ -8698,6 +8686,12 @@ function buildNoteURL(target: NoteLinkTarget) {
 function markdownLinkForTarget(title: string | undefined, target: NoteLinkTarget) {
   const safeTitle = (title?.trim() || "Linked note").replace(/\]/g, "\\]");
   return `[${safeTitle}](${buildNoteURL(target)})`;
+}
+
+// Deep link that opens a conversation thread from note markdown (the renderer's
+// link interceptor routes it to selectThread, same as notification clicks).
+function buildThreadURL(threadID: string) {
+  return `oa-thread://open?id=${encodeURIComponent(threadID)}`;
 }
 
 function ensurePlannerSection(markdown: string, heading: string) {
@@ -10098,11 +10092,32 @@ function removePlannerTasksByText(dayID: string, markdown: string, texts: string
   return { markdown: next.replace(/\n{3,}/g, "\n\n"), removed };
 }
 
+// Re-derive the mutated item from the freshly saved markdown, so the success
+// response reports what was actually persisted — never the in-memory object a
+// write path constructed (which can silently differ when fields get dropped).
+function readBackMutatedItem(item: DailyItem | null | undefined, ...itemLists: Array<DailyItem[] | undefined>) {
+  if (!item) return item;
+  for (const items of itemLists) {
+    if (!items?.length) continue;
+    const byID = items.find((candidate) => candidate.id === item.id);
+    if (byID) return byID;
+  }
+  // plain: item ids are positional and may not survive a re-parse; fall back to
+  // an exact-title match before flagging the miss.
+  const title = dailyItemVisibleTitle(item).trim().toLowerCase();
+  for (const items of itemLists) {
+    const byTitle = items?.find((candidate) => dailyItemVisibleTitle(candidate).trim().toLowerCase() === title);
+    if (byTitle) return byTitle;
+  }
+  return { ...item, readBack: false };
+}
+
 function dailyMutationResult(day: PlannerDayDetail, item?: DailyItem | null): DailyItemMutationResult {
+  const items = parseDailyItemsFromMarkdown(day.id, day.markdown);
   return {
     day,
-    items: parseDailyItemsFromMarkdown(day.id, day.markdown),
-    item
+    items,
+    item: readBackMutatedItem(item, items)
   };
 }
 
@@ -10199,28 +10214,106 @@ function completeDailyItem(dayID: string | undefined, query: string, checked = t
   return toggleDailyItem(normalizedDayID, match.id, checked);
 }
 
-function updateDailyItemByText(input: unknown): DailyItemMutationResult {
+type PlannerTaskLocation = {
+  kind: "day" | "backlog";
+  id: string;
+  detail: PlannerDayDetail | PlannerBacklogDetail;
+  items: DailyItem[];
+  item: DailyItem;
+};
+
+function plannerTaskContainers(raw: JsonObject) {
+  const requestedSource = cleanDailyText(raw.dayID ?? raw.date);
+  if (requestedSource) {
+    const sourceID = resolvePlannerDayIDForWrite(requestedSource);
+    if (sourceID === plannerBacklogID) {
+      const detail = loadPlannerBacklog();
+      return [{ kind: "backlog" as const, id: plannerBacklogID, detail }];
+    }
+    const detail = loadPlannerDay(sourceID);
+    return [{ kind: "day" as const, id: sourceID, detail }];
+  }
+
+  const backlog = loadPlannerBacklog();
+  return [
+    { kind: "backlog" as const, id: plannerBacklogID, detail: backlog },
+    ...listPlannerDays(3650, plannerDayID()).map((day) => ({
+      kind: "day" as const,
+      id: day.id,
+      detail: loadPlannerDay(day.id)
+    }))
+  ];
+}
+
+function locatePlannerTask(raw: JsonObject): PlannerTaskLocation {
+  const itemID = cleanDailyText(raw.itemID ?? raw.dailyItemID ?? raw.id);
+  const query = cleanDailyText(
+    raw.query
+      ?? raw.oldTitle
+      ?? raw.currentTitle
+      ?? raw.existingTitle
+      ?? raw.text
+      ?? raw.task
+      ?? raw.title
+  );
+  if (!itemID && !query) throw new Error("Which existing task should I update?");
+  const containers = plannerTaskContainers(raw).map((container) => ({
+    ...container,
+    items: parseDailyItemsFromMarkdown(container.id, container.detail.markdown)
+  }));
+  const candidates = containers.flatMap((container) => container.items.map((item) => ({ container, item })));
+  const matches = itemID
+    ? candidates.filter((candidate) => candidate.item.id === itemID)
+    : (() => {
+      const wanted = query.toLowerCase();
+      const exact = candidates.filter(({ item }) => {
+        return dailyItemVisibleTitle(item).toLowerCase() === wanted
+          || cleanDailyText(item.title).toLowerCase() === wanted;
+      });
+      if (exact.length) return exact;
+      return candidates.filter(({ item }) => dailyItemVisibleTitle(item).toLowerCase().includes(wanted));
+    })();
+
+  if (matches.length > 1) {
+    const names = matches.map(({ container, item }) => `${dailyItemVisibleTitle(item)} (${container.id})`).join("; ");
+    throw new Error(`"${query || itemID}" matches more than one task (${names}). Please say the exact task or date.`);
+  }
+  const match = matches[0];
+  if (!match) {
+    const searched = containers.length === 1 ? containers[0].id : "Backlog and all planner days";
+    throw new Error(`No task matching "${query || itemID}" was found in ${searched}.`);
+  }
+  return {
+    kind: match.container.kind,
+    id: match.container.id,
+    detail: match.container.detail,
+    items: match.container.items,
+    item: match.item
+  };
+}
+
+function saveUpdatedPlannerTaskSource(location: PlannerTaskLocation, markdown: string) {
+  if (location.kind === "backlog") {
+    const backlog = savePlannerBacklog(markdown);
+    emitPlannerBacklogChanged();
+    return backlog;
+  }
+  const day = savePlannerDay(location.id, markdown);
+  emitPlannerDayChanged(day.id);
+  return day;
+}
+
+function updateDailyItemByText(input: unknown): DailyItemMutationResult | BacklogItemMutationResult {
   const raw = dailyItemJSON(input);
-  const sourceDayID = normalizePlannerDayID(String(raw.dayID ?? raw.date ?? ""));
-  const sourceDay = loadPlannerDay(sourceDayID);
-  const sourceItems = parseDailyItemsFromMarkdown(sourceDay.id, sourceDay.markdown);
+  const source = locatePlannerTask(raw);
+  const sourceDayID = source.id;
   const itemID = cleanDailyText(raw.itemID ?? raw.dailyItemID ?? raw.id);
   const matchText = cleanDailyText(raw.query ?? raw.oldTitle ?? raw.currentTitle ?? raw.existingTitle ?? raw.text ?? raw.task);
-  const match = itemID
-    ? sourceItems.find((item) => item.id === itemID)
-    : findDailyItemByText(sourceItems, matchText || String(raw.title ?? ""));
-  if (!match) {
-    const query = cleanDailyText(raw.query ?? raw.oldTitle ?? raw.currentTitle ?? raw.existingTitle ?? raw.text ?? raw.task ?? raw.title ?? itemID);
-    const available = sourceItems.map((item) => dailyItemVisibleTitle(item)).filter(Boolean);
-    throw new Error(`No task matching "${query || itemID}" was found on ${sourceDay.id}. Tasks on that day: ${available.length ? available.join("; ") : "none"}.`);
-  }
+  const match = source.item;
 
   // Strict target resolution: "tomorrow" now works, and an unresolvable date
   // throws instead of silently coercing the move target to today.
   const targetDayID = resolvePlannerDayIDForWrite(String(raw.targetDayID ?? raw.newDayID ?? raw.moveToDayID ?? ""), sourceDayID);
-  if (targetDayID === plannerBacklogID) {
-    throw new Error("Use the move-to-backlog tool to send a task to the Backlog.");
-  }
   const titleValue = cleanDailyText(raw.title);
   const nextTitle = cleanDailyText(raw.newTitle ?? raw.updatedTitle ?? raw.replacementTitle)
     || (matchText || itemID ? titleValue : "")
@@ -10255,20 +10348,22 @@ function updateDailyItemByText(input: unknown): DailyItemMutationResult {
 
   if (targetDayID === sourceDayID) {
     const sourceMarkdown = match.structured
-      ? sourceDay.markdown
-      : removePlainDailyItemLine(sourceDay.markdown, match.id);
-    const savedDay = savePlannerDay(sourceDayID, replaceStructuredDailyItem(sourceMarkdown, item));
-    emitPlannerDayChanged(savedDay.id);
-    return dailyMutationResult(savedDay, item);
+      ? source.detail.markdown
+      : removePlainDailyItemLine(source.detail.markdown, match.id);
+    const saved = saveUpdatedPlannerTaskSource(source, replaceStructuredDailyItem(sourceMarkdown, item));
+    return source.kind === "backlog"
+      ? backlogMutationResult(saved as PlannerBacklogDetail, item)
+      : dailyMutationResult(saved as PlannerDayDetail, item);
   }
 
-  const targetResult = appendMovedDailyItemToDay(item, targetDayID);
+  const targetResult = targetDayID === plannerBacklogID
+    ? appendMovedDailyItemToBacklog(item)
+    : appendMovedDailyItemToDay(item, targetDayID);
   const nextSourceMarkdown = match.structured
-    ? removeStructuredDailyItem(sourceDay.markdown, match.id)
-    : removePlainDailyItemLine(sourceDay.markdown, match.id);
-  if (nextSourceMarkdown !== sourceDay.markdown) {
-    savePlannerDay(sourceDayID, nextSourceMarkdown);
-    emitPlannerDayChanged(sourceDayID);
+    ? removeStructuredDailyItem(source.detail.markdown, match.id)
+    : removePlainDailyItemLine(source.detail.markdown, match.id);
+  if (nextSourceMarkdown !== source.detail.markdown) {
+    saveUpdatedPlannerTaskSource(source, nextSourceMarkdown);
   }
   return targetResult;
 }
@@ -10277,11 +10372,13 @@ function moveDailyItemToDay(dayID: string | undefined, itemID: string, targetDay
   const sourceDayID = normalizePlannerDayID(dayID);
   const destinationDayID = resolvePlannerDayIDForWrite(targetDayID);
   if (!itemID.trim()) throw new Error("Daily item was not found.");
-  return updateDailyItemByText({
+  const result = updateDailyItemByText({
     dayID: sourceDayID,
     itemID,
     targetDayID: destinationDayID
   });
+  if ("day" in result) return result;
+  throw new Error("The target must be a planner day.");
 }
 
 function deleteDailyItem(dayID: string | undefined, itemID: string): DailyItemMutationResult {
@@ -10581,10 +10678,13 @@ function backlogMutationResult(
   scheduledDay?: PlannerDayDetail,
   scheduledItems?: DailyItem[]
 ): BacklogItemMutationResult {
+  const items = parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown);
   return {
     backlog,
-    items: parseDailyItemsFromMarkdown(plannerBacklogID, backlog.markdown),
-    item,
+    items,
+    // A backlog upsert that scheduled the item onto a day persists it in the
+    // day markdown, not the backlog — read back from both.
+    item: readBackMutatedItem(item, items, scheduledItems),
     scheduledDay,
     scheduledItems
   };
@@ -10717,6 +10817,7 @@ type PlannerDailyDigest = {
   leftovers: PlannerDigestLeftover[];
   followUps: PlannerDigestFollowUp[];
   tomorrowPreview: string[];
+  openLoops: string[];
   generatedAt: string;
 } | { ok: false; error: string };
 
@@ -10864,6 +10965,7 @@ async function generatePlannerDailyDigest(rawDayID?: string): Promise<PlannerDai
         .filter((item) => !item.checked)
         .slice(0, 6)
         .map((item) => dailyItemVisibleTitle(item)),
+      openLoops: listOpenLoopEntries(),
       generatedAt: new Date().toISOString()
     };
   } catch (error) {
@@ -10927,6 +11029,177 @@ async function applyPlannerDailyDigestPlan(rawPlan: unknown): Promise<{ ok: bool
   return failures.length
     ? { ok: false, error: failures.join(" "), moved, created }
     : { ok: true, moved, created };
+}
+
+// ---- Live Voice session summaries -------------------------------------------
+// A 3-5 bullet recap (decisions / actions / open items) written into the voice
+// day-log thread's "Session Summary" note. Updated after each session ends and
+// finalized when the day log rotates. Fire-and-forget: a failed summary must
+// never block stopping a session or rotating the log.
+
+const liveVoiceSummaryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const liveVoiceSummaryDebounceMs = 8_000;
+const liveVoiceSummaryMinUserTurns = 3;
+
+function cancelQueuedLiveVoiceSummary(threadID: string) {
+  const timer = liveVoiceSummaryTimers.get(threadID);
+  if (!timer) return;
+  clearTimeout(timer);
+  liveVoiceSummaryTimers.delete(threadID);
+}
+
+function queueLiveVoiceSessionSummary(threadID: string) {
+  if (!threadID.trim()) return;
+  cancelQueuedLiveVoiceSummary(threadID);
+  const timer = setTimeout(() => {
+    liveVoiceSummaryTimers.delete(threadID);
+    void generateLiveVoiceSessionSummary(threadID).catch((error) => {
+      bridgeDebugLog(`[realtime.voice] session summary failed thread=${threadID}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, liveVoiceSummaryDebounceMs);
+  liveVoiceSummaryTimers.set(threadID, timer);
+}
+
+function liveVoiceSummaryTranscriptPayload(threadID: string) {
+  const snapshot = readConversationSnapshotWithHistory(threadID);
+  const entries = (snapshot.transcript ?? [])
+    .map((entry) => ({ role: entry.role, text: cleanDailyText(entry.text).slice(0, 500) }))
+    .filter((entry) => entry.text);
+  const userTurns = entries.filter((entry) => entry.role === "user" && entry.text.length >= 12).length;
+  const lines: string[] = [];
+  let budget = 8_000;
+  for (const entry of entries.slice().reverse()) {
+    const line = `${entry.role === "user" ? "User" : "Assistant"}: ${entry.text}`;
+    if (budget - line.length < 0) break;
+    budget -= line.length + 1;
+    lines.unshift(line);
+  }
+  return { lines, userTurns };
+}
+
+async function generateLiveVoiceSessionSummary(threadID: string, options: { finalize?: boolean } = {}) {
+  const { lines, userTurns } = liveVoiceSummaryTranscriptPayload(threadID);
+  if (userTurns < liveVoiceSummaryMinUserTurns) {
+    bridgeDebugLog(`[realtime.voice] session summary skipped thread=${threadID} userTurns=${userTurns}`);
+    return;
+  }
+  const auth = await resolveCodexTranscriptionAuthContext();
+  const settings = await loadSettings();
+  const model = codexSafeModel(settings.model);
+  const instructions = [
+    "You summarize one day of a user's voice-assistant conversation.",
+    "Return strict JSON only. No prose outside JSON.",
+    "JSON shape: {\"decisions\":[\"...\"],\"actions\":[\"...\"],\"openItems\":[\"...\"]}.",
+    "decisions: choices or conclusions the user made. actions: things the assistant actually did or changed. openItems: questions or work left unfinished.",
+    "0-5 entries per list, each under 140 characters, plain factual language, no markdown."
+  ].join("\n");
+  const payload: JsonObject = {
+    model,
+    store: false,
+    stream: true,
+    instructions,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: instructions }] },
+      { role: "user", content: [{ type: "input_text", text: lines.join("\n") }] }
+    ],
+    reasoning: { effort: "low" }
+  };
+  const response = await fetchWithTimeout("https://chatgpt.com/backend-api/codex/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${auth.token}`,
+      "Content-Type": "application/json",
+      "User-Agent": chatGPTWebUserAgent,
+      "Origin": "https://chatgpt.com"
+    },
+    body: JSON.stringify(payload)
+  }, 90000, "Codex session summary request timed out.");
+  if (!response.ok) {
+    throw new Error(`Codex API request failed: ${response.status} ${await response.text()}`);
+  }
+  const text = await readCodexResponsesText(response);
+  const parsed = JSON.parse(text.replace(/^[\s\S]*?(\{[\s\S]*\})[\s\S]*?$/, "$1")) as JsonObject;
+  const bulletList = (value: unknown) => (Array.isArray(value) ? value : [])
+    .map((entry) => cleanDailyText(entry).slice(0, 160))
+    .filter(Boolean)
+    .slice(0, 5);
+  const decisions = bulletList(parsed.decisions);
+  const actions = bulletList(parsed.actions);
+  const openItems = bulletList(parsed.openItems);
+  if (!decisions.length && !actions.length && !openItems.length) return;
+  const session = findSession(threadID);
+  const dayLabel = session?.liveVoiceDayID ? liveVoiceArchivedTitle(String(session.liveVoiceDayID)).replace(/^Live Voice · /, "") : "";
+  const header = options.finalize
+    ? `_Final summary${dayLabel ? ` for ${dayLabel}` : ""}._`
+    : `_Updated ${new Date().toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}${dayLabel ? ` · ${dayLabel}` : ""}._`;
+  const sectionOf = (title: string, bullets: string[]) =>
+    bullets.length ? [`**${title}**`, ...bullets.map((line) => `- ${line}`)] : [];
+  const content = [
+    header,
+    "",
+    ...sectionOf("Decisions", decisions),
+    ...sectionOf("Actions", actions),
+    ...sectionOf("Open items", openItems)
+  ].join("\n");
+  const target = resolveCanonicalThreadReferenceNote(threadID, "Session Summary");
+  const note = loadThreadReferenceNote(threadID, target.noteID);
+  saveThreadNote(threadID, target.noteID, replaceMarkdownSection(note.markdown, "Summary", content));
+  bridgeDebugLog(`[realtime.voice] session summary written thread=${threadID} finalize=${options.finalize === true}`);
+}
+
+// ---- Open Loops ledger -------------------------------------------------------
+// One durable note ("Open Loops" under the "Assistant" planner list) holding a
+// checkable line per unresolved delegated task, deep-linked to the day log it
+// came from. This is the single "pick up later" surface; the day logs stay the
+// detailed archive.
+
+const openLoopsLedgerListTitle = "Assistant";
+const openLoopsLedgerNoteTitle = "Open Loops";
+
+function ensureOpenLoopsLedger() {
+  const lists = loadProjects().plannerLists;
+  const list = lists.find((entry) => (entry.title ?? "").trim().toLowerCase() === openLoopsLedgerListTitle.toLowerCase())
+    ?? createPlannerList({ name: openLoopsLedgerListTitle }).list;
+  return resolveCanonicalReferenceNote(list.id, openLoopsLedgerNoteTitle);
+}
+
+function appendOpenLoopEntry(entry: { description: string; state: string; voiceThreadID: string }) {
+  try {
+    const target = ensureOpenLoopsLedger();
+    if (target.kind !== "project") return;
+    const note = loadNote(target.projectID, target.noteID);
+    const description = cleanDailyText(entry.description).slice(0, 120) || "Delegated voice task";
+    const dateLabel = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const line = `- [ ] ${description} (${entry.state}) — ${dateLabel} ([day log](${buildThreadURL(entry.voiceThreadID)}))`;
+    const next = appendReferenceLinesToMarkdown(note.markdown, "Open", [line]);
+    if (next !== note.markdown.replace(/\r\n/g, "\n")) {
+      saveProjectNote(target.projectID, target.noteID, next);
+      bridgeDebugLog(`[realtime.voice] open loop recorded state=${entry.state} thread=${entry.voiceThreadID}`);
+    }
+  } catch (error) {
+    bridgeDebugLog(`[realtime.voice] open loop append failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// Unchecked ledger lines, for the daily digest's read-only "unresolved agent
+// tasks" block. Parsed straight from the note; no model involved.
+function listOpenLoopEntries(limit = 10) {
+  try {
+    const lists = loadProjects().plannerLists;
+    const list = lists.find((entry) => (entry.title ?? "").trim().toLowerCase() === openLoopsLedgerListTitle.toLowerCase());
+    if (!list) return [];
+    const existing = findProjectNoteByTitle(list.id, canonicalReferenceNoteCandidates(openLoopsLedgerNoteTitle));
+    if (!existing?.id) return [];
+    const note = loadNote(list.id, String(existing.id));
+    return markdownSection(note.markdown, "Open")
+      .split("\n")
+      .filter((line) => /^\s*[-*]\s*\[ \]\s+/.test(line))
+      .map((line) => cleanDailyText(line.replace(/^\s*[-*]\s*\[ \]\s+/, "").replace(/\(\[day log\]\([^)]*\)\)/, "")).trim())
+      .filter(Boolean)
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
 }
 
 function scheduledBacklogDetailsForDay(detailsMarkdown: string, targetDayID: string) {
@@ -12167,6 +12440,8 @@ function projectStoreSnapshot() {
 function saveProjectStoreSnapshot(filePath: string, snapshot: JsonObject) {
   snapshot.version = Math.max(1, Number(snapshot.version ?? 1));
   writeJSON(filePath, snapshot);
+  loadAppStateCachedResult = null;
+  loadAppStateCachedAt = 0;
 }
 
 function projectRecord(snapshot: { projects?: JsonObject[] }, projectID: string) {
@@ -12208,6 +12483,8 @@ function loadedProjectsState() {
 }
 
 function emitProjectsChanged() {
+  loadAppStateCachedResult = null;
+  loadAppStateCachedAt = 0;
   emitAppStateBackgroundUpdate({ type: "projects", ...loadedProjectsState() });
   scheduleMacSyncSoon();
 }
@@ -12393,7 +12670,7 @@ function hideProject(projectID: string) {
   project.isHidden = true;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
-  scheduleMacSyncSoon();
+  emitProjectsChanged();
   return { ok: true };
 }
 
@@ -12404,7 +12681,7 @@ function unhideProject(projectID: string) {
   project.isHidden = false;
   project.updatedAt = currentSwiftDate();
   saveProjectStoreSnapshot(filePath, snapshot);
-  scheduleMacSyncSoon();
+  emitProjectsChanged();
   return loadedProjectItem(projectID);
 }
 
@@ -12562,8 +12839,8 @@ function createProject(name: string, kind: "project" | "folder" = "project", par
   if (normalizedKind === "project") {
     snapshot.brainByProjectID[projectID] = { projectSummary: "", processedThreadIDs: [], threadDigestsByThreadID: {} };
   }
-  writeJSON(filePath, snapshot);
-  scheduleMacSyncSoon();
+  saveProjectStoreSnapshot(filePath, snapshot);
+  emitProjectsChanged();
   return projectItemFromSnapshot(project);
 }
 
@@ -14073,6 +14350,142 @@ function moveProjectNoteToFolder(projectID: string, noteID: string, folderID: st
   return { projectID: projectID.toUpperCase(), noteID, folderID };
 }
 
+function moveProjectNoteToProject(sourceProjectID: string, noteID: string, destinationProjectID: string) {
+  const sourceID = sourceProjectID.trim().toUpperCase();
+  const destinationID = destinationProjectID.trim().toUpperCase();
+  if (!sourceID || !destinationID) throw new Error("Choose a destination List.");
+  if (sourceID === destinationID) throw new Error("The note is already in that List.");
+
+  const loadedProjects = loadProjects();
+  const destinationProject = projectListForNote(loadedProjects, destinationID);
+  if (!destinationProject || destinationProject.kind === "folder") {
+    throw new Error("The destination List was not found.");
+  }
+
+  const sourceManifest = readNoteManifest(sourceID);
+  const destinationManifest = readNoteManifest(destinationID);
+  const sourceNotes = sourceManifest.notes ?? [];
+  const note = sourceNotes.find((entry) => String(entry.id ?? "") === noteID);
+  if (!note) throw new Error("Note was not found.");
+  if ((destinationManifest.notes ?? []).some((entry) => String(entry.id ?? "") === noteID)) {
+    throw new Error("A note with this ID already exists in the destination List.");
+  }
+
+  const fileName = macSyncSafeNoteFileName(note.fileName, noteID);
+  const sourceFilePath = path.join(noteDirectoryPath(sourceID), fileName);
+  const destinationFilePath = path.join(noteDirectoryPath(destinationID), fileName);
+  const assetsDirectoryName = `${fileName.replace(/\.md$/, "")}.assets`;
+  const sourceAssetsPath = path.join(noteDirectoryPath(sourceID), assetsDirectoryName);
+  const destinationAssetsPath = path.join(noteDirectoryPath(destinationID), assetsDirectoryName);
+  const sourceHistoryPath = projectNoteRecoveryDirectoryPath(sourceID, noteID);
+  const destinationHistoryPath = projectNoteRecoveryDirectoryPath(destinationID, noteID);
+  const copiedPaths: string[] = [];
+
+  const copyMovePath = (sourcePath: string, destinationPath: string) => {
+    if (!fs.existsSync(sourcePath)) return;
+    if (fs.existsSync(destinationPath)) {
+      throw new Error("The destination already contains files for this note.");
+    }
+    fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+    const sourceStat = fs.statSync(sourcePath);
+    if (sourceStat.isDirectory()) {
+      fs.cpSync(sourcePath, destinationPath, { recursive: true, force: false, errorOnExist: true });
+    } else {
+      fs.copyFileSync(sourcePath, destinationPath, fs.constants.COPYFILE_EXCL);
+    }
+    copiedPaths.push(destinationPath);
+  };
+  const removeCopiedPaths = () => {
+    for (const copiedPath of [...copiedPaths].reverse()) {
+      try { fs.rmSync(copiedPath, { recursive: true, force: true }); } catch {}
+    }
+  };
+
+  const now = currentSwiftDate();
+  const movedNote: JsonObject = {
+    ...note,
+    folderID: null,
+    order: (destinationManifest.notes ?? []).length,
+    updatedAt: now
+  };
+  const remainingSourceNotes = sourceNotes.filter((entry) => String(entry.id ?? "") !== noteID);
+  const nextSourceSelectedID = sourceManifest.selectedNoteID === noteID
+    ? String(remainingSourceNotes.find((entry) => entry.isArchived !== true)?.id ?? remainingSourceNotes[0]?.id ?? "") || undefined
+    : sourceManifest.selectedNoteID;
+  const nextSourceManifest = {
+    ...sourceManifest,
+    selectedNoteID: nextSourceSelectedID,
+    notes: remainingSourceNotes
+  };
+  const nextDestinationManifest = {
+    ...destinationManifest,
+    selectedNoteID: noteID,
+    notes: [...(destinationManifest.notes ?? []), movedNote]
+  };
+
+  try {
+    copyMovePath(sourceFilePath, destinationFilePath);
+    copyMovePath(sourceAssetsPath, destinationAssetsPath);
+    copyMovePath(sourceHistoryPath, destinationHistoryPath);
+    if (fs.existsSync(destinationHistoryPath)) {
+      const indexPath = path.join(destinationHistoryPath, "index.json");
+      const entries = readJSON<JsonObject[]>(indexPath, []);
+      if (entries.length) {
+        writeJSON(indexPath, entries.map((entry) => ({ ...entry, ownerID: destinationID })));
+      }
+    }
+    writeNoteManifest(destinationID, nextDestinationManifest);
+    writeNoteManifest(sourceID, nextSourceManifest);
+  } catch (error) {
+    try { writeNoteManifest(sourceID, sourceManifest); } catch {}
+    try { writeNoteManifest(destinationID, destinationManifest); } catch {}
+    removeCopiedPaths();
+    throw error;
+  }
+
+  for (const sourcePath of [sourceFilePath, sourceAssetsPath, sourceHistoryPath]) {
+    try { fs.rmSync(sourcePath, { recursive: true, force: true }); } catch {}
+  }
+  recordMacSyncTombstone("note", noteID, sourceID);
+  scheduleRemoteAccessBroadcast();
+  scheduleMacSyncSoon();
+
+  const markdown = fs.existsSync(destinationFilePath)
+    ? fs.readFileSync(destinationFilePath, "utf8").replace(/\r\n/g, "\n")
+    : "";
+  const metadata = noteMetadataFromRecord(movedNote, loadedProjects, destinationID, markdown);
+  const noteItem: NoteItem = {
+    id: noteID,
+    title: normalizeTitle(movedNote.title, "Untitled note"),
+    subtitle: noteSubtitle(Date.now()),
+    projectID: destinationID,
+    projectName: destinationProject.title,
+    folderID: null,
+    area: metadata.area,
+    tags: metadata.tags,
+    updatedAt: Date.now(),
+    isArchived: movedNote.isArchived === true,
+    archivedAt: storedArchiveDateToMs(movedNote.archivedAt),
+    autoDeleteAfter: storedArchiveDateToMs(movedNote.autoDeleteAfter) ?? null,
+    active: true
+  };
+  const detail: NoteDetail = {
+    id: noteID,
+    title: noteItem.title,
+    markdown,
+    path: destinationFilePath,
+    area: metadata.area,
+    tags: metadata.tags
+  };
+  emitProjectNoteChanged(destinationID, noteID, noteItem.title, markdown);
+  return {
+    sourceProjectID: sourceID,
+    destinationProjectID: destinationID,
+    note: noteItem,
+    detail
+  };
+}
+
 function normalizeNoteLinkTarget(target: unknown): NoteLinkTarget | null {
   if (!target || typeof target !== "object") return null;
   const raw = target as Record<string, unknown>;
@@ -14213,6 +14626,18 @@ function buildNoteLinksSnapshot(target: NoteLinkTarget, currentMarkdown?: string
   const currentKey = noteLinkKey(target);
   const records = scanStoredNoteLinkRecords(target, currentMarkdown);
   const recordsByKey = new Map(records.map((record) => [record.key, record]));
+  const recordsByStableID = new Map<string, StoredNoteLinkRecord | null>();
+  for (const record of records) {
+    const stableID = `${record.ownerKind}:${record.noteId.toLowerCase()}`;
+    recordsByStableID.set(stableID, recordsByStableID.has(stableID) ? null : record);
+  }
+  const canonicalLinkTarget = (linkedTarget: NoteLinkTarget): NoteLinkTarget => {
+    if (recordsByKey.has(noteLinkKey(linkedTarget))) return linkedTarget;
+    const matchingRecord = recordsByStableID.get(`${linkedTarget.ownerKind}:${linkedTarget.noteId.toLowerCase()}`);
+    return matchingRecord
+      ? { ownerKind: matchingRecord.ownerKind, ownerId: matchingRecord.ownerId, noteId: matchingRecord.noteId }
+      : linkedTarget;
+  };
   const currentRecord = recordsByKey.get(currentKey) ?? {
     ...target,
     key: currentKey,
@@ -14222,7 +14647,8 @@ function buildNoteLinksSnapshot(target: NoteLinkTarget, currentMarkdown?: string
   };
 
   const outgoingCounts = new Map<string, { target: NoteLinkTarget; count: number }>();
-  for (const link of extractInternalNoteLinks(currentRecord.markdown)) {
+  for (const rawLink of extractInternalNoteLinks(currentRecord.markdown)) {
+    const link = canonicalLinkTarget(rawLink);
     const key = noteLinkKey(link);
     const previous = outgoingCounts.get(key);
     outgoingCounts.set(key, { target: link, count: (previous?.count ?? 0) + 1 });
@@ -14234,7 +14660,10 @@ function buildNoteLinksSnapshot(target: NoteLinkTarget, currentMarkdown?: string
   const backlinkCounts = new Map<string, { record: StoredNoteLinkRecord; count: number }>();
   for (const record of records) {
     if (record.key === currentKey) continue;
-    const count = extractInternalNoteLinks(record.markdown).filter((link) => noteLinkKey(link) === currentKey).length;
+    const count = extractInternalNoteLinks(record.markdown)
+      .map(canonicalLinkTarget)
+      .filter((link) => noteLinkKey(link) === currentKey)
+      .length;
     if (count > 0) backlinkCounts.set(record.key, { record, count });
   }
   const backlinks = [...backlinkCounts.values()]
@@ -15887,58 +16316,8 @@ function retrievePersonalRecallEvidence(
   };
 }
 
-function cleanPersonalRecallSnippetForAnswer(result: KnowledgeTimelineSearchResult) {
-  let snippet = sanitizePersonalRecallSnippet(shortSearchText(result.snippet || result.title, 320), 260)
-    .replace(/^Question:\s*.+?\s+Answer:\s*/i, "")
-    .replace(/\bthread id:\s*[a-z0-9- ]{20,}/i, "")
-    .replace(/\brollout path:\s*\S+/i, "")
-    .replace(/\bcwd=\S+/i, "")
-    .replace(/\bupdated at:\s*\d{4}[- T0-9:+]+/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  snippet = snippet.replace(/^(Remember for\s+)?/i, "");
-  return snippet;
-}
-
-function personalRecallAnswerResultScore(result: KnowledgeTimelineSearchResult) {
-  const label = cleanDailyText(result.sourceLabel || result.sourceType).toLowerCase();
-  const snippet = cleanPersonalRecallSnippetForAnswer(result).toLowerCase();
-  let score = result.score ?? 0;
-  if (/^(thread id|rollout path|updated at|cwd=)/i.test(snippet)) score -= 100;
-  if (/\bremember for\b|\bcorrect\b|\burl\b|\bstatus\b|\bwebsite\b|\bfacebook\b|\bdashboard\b/i.test(snippet)) score += 20;
-  if (label.includes("codex memory") || label.includes("claude code memory")) score += 8;
-  return score;
-}
-
-function naturalPersonalRecallLead(question: string, results: KnowledgeTimelineSearchResult[] = []) {
-  const normalized = question.toLowerCase().replace(/\s+/g, " ").trim();
-  if (personalRecallNeedsChatSearch(question) || results.some((result) => personalRecallChatSourceTypes.has(result.sourceType))) return "I found this:";
-  if (/\b(any|have|saved)\b.{0,40}\b(memory|memories)\b/.test(normalized)) return "Yes. I found saved memory:";
-  return "I found this in memory:";
-}
-
-function renderRetrievedPersonalRecallAnswer(question: string, results: KnowledgeTimelineSearchResult[]) {
-  const usableResults = results
-    .map((result) => ({ result, snippet: cleanPersonalRecallSnippetForAnswer(result), score: personalRecallAnswerResultScore(result) }))
-    .filter((entry) => entry.snippet && !/^question:\b/i.test(entry.snippet))
-    .sort((left, right) => right.score - left.score || timelineDocDate(right.result) - timelineDocDate(left.result))
-    .slice(0, 3);
-  if (!usableResults.length) return "";
-  const lines = usableResults.map(({ result, snippet }, index) => {
-    const label = cleanDailyText(result.sourceLabel || result.sourceType);
-    return `${index + 1}. ${label}: ${snippet}`;
-  });
-  return [
-    naturalPersonalRecallLead(question, usableResults.map((entry) => entry.result)),
-    ...lines
-  ].join("\n");
-}
-
 function spokenPersonalRecallAnswer(answer: string) {
-  // The lead line may itself start with "Yes. " (see naturalPersonalRecallLead)
-  // — strip it BEFORE the lead phrases, otherwise the lead survives as the
-  // "first item" and the spoken answer becomes "Yes. Yes. I found saved
-  // memory: Also, ...".
+  // Remove storage-oriented lead text before producing a concise spoken answer.
   const clean = normalizeSearchText(answer, 1_200)
     .replace(/^Yes\.\s*/i, "")
     .replace(/^I found saved memory for\s+"[^"]+":\s*/i, "")
@@ -15996,19 +16375,7 @@ async function codexModelIDsForRecall() {
   const now = Date.now();
   if (codexModelListCache && codexModelListCache.expiresAt > now) return codexModelListCache.ids;
   try {
-    const raw = await codexTransport.request("model/list", {}, undefined, 15_000) as JsonObject;
-    const rows = Array.isArray(raw.data)
-      ? raw.data
-      : Array.isArray(raw.models)
-        ? raw.models
-        : Array.isArray(raw)
-          ? raw
-          : [];
-    const ids = rows
-      .map((row) => pluginString(runtimeObject(row)?.id, runtimeObject(row)?.model))
-      .filter((id): id is string => Boolean(id));
-    codexModelListCache = { expiresAt: now + codexModelListCacheMs, ids };
-    return ids;
+    return (await loadAvailableCodexProviderModels()).map((model) => model.id);
   } catch (error) {
     bridgeDebugLog(`Spark recall model/list probe failed: ${error instanceof Error ? error.message : String(error)}`);
     return [] as string[];
@@ -16215,26 +16582,10 @@ async function runSparkPersonalRecall(args: JsonObject) {
     };
   }
 
-  const localFallback = (model: string | undefined, sparkUnavailable: boolean) => {
-    const answer = renderRetrievedPersonalRecallAnswer(question, retrieved.results);
-    return {
-      ok: true,
-      answer,
-      spokenAnswer: spokenPersonalRecallAnswer(answer),
-      model,
-      reasoningEffort,
-      confidence: "medium",
-      searched: retrieved.chats.length ? ["memory", "chats"] : ["memory"],
-      sources: retrieved.sources,
-      sparkUnavailable,
-      ...(sparkUnavailable ? { statusMessage: "Spark synthesis was unavailable, so OpenAssist used local recall results." } : {})
-    };
-  };
-
   const model = Date.now() < sparkRecallModelUnavailableUntil ? undefined : await personalRecallModelID(args.model);
   if (!model) {
     bridgeDebugLog(`Spark recall skipped request=${requestID} reason=no-available-model`);
-    return localFallback(undefined, true);
+    throw new Error("Spark recall is unavailable because no compatible Spark model is configured.");
   }
 
   const startedAt = Date.now();
@@ -16307,13 +16658,10 @@ async function runSparkPersonalRecall(args: JsonObject) {
 
     const parsed = parsePersonalRecallJSON(responseText);
     const parsedSources = personalRecallSourcesFromValue(parsed?.sources, retrieved.sourceMap);
-    let answer = firstNonEmptyString(parsed?.answer, responseText) || "";
-    let sources = parsedSources;
-    if (!sources.length || isWeakPersonalRecallAnswer(answer, sources)) {
-      answer = renderRetrievedPersonalRecallAnswer(question, retrieved.results);
-      sources = retrieved.sources;
-    }
+    const answer = firstNonEmptyString(parsed?.answer, responseText) || "";
+    const sources = parsedSources;
     if (!answer || !sources.length) throw new Error("Spark recall returned no sourced answer.");
+    if (isWeakPersonalRecallAnswer(answer, sources)) throw new Error("Spark recall returned an unsupported answer.");
     return {
       ok: true,
       answer,
@@ -16336,8 +16684,9 @@ async function runSparkPersonalRecall(args: JsonObject) {
     if (/invalid argument|model.*(?:unavailable|not found|unsupported|invalid)|unknown model/i.test(errorMessage)) {
       sparkRecallModelUnavailableUntil = Date.now() + codexModelListCacheMs;
       codexModelListCache = null;
+      codexAvailableModelCache = null;
     }
-    return localFallback(model, true);
+    throw error instanceof Error ? error : new Error("Spark recall failed.");
   } finally {
     if (providerThreadID) {
       const threadID = providerThreadID;
@@ -17163,12 +17512,15 @@ function plannerDayDateRange(dayID: string) {
   return { dueAfter: start.toISOString(), dueBefore: end.toISOString() };
 }
 
-async function createCombinedTodayTaskVoiceResponse(prompt: string) {
-  const selection = todayTaskSourceSelection(prompt);
-  if (!selection.matches) return null;
-  const dayID = parsePlannerDayIDFromPrompt(prompt) || plannerDayID();
+async function combinedTodayTaskKnowledgeResult(options: {
+  dayID?: string;
+  includeOpenAssist: boolean;
+  includeAppleReminders: boolean;
+}) {
+  const dayID = normalizePlannerDayID(options.dayID || plannerDayID());
   const entries = new Map<string, { title: string; sources: Set<string>; detail?: string }>();
-  const notes: string[] = [];
+  const warnings: string[] = [];
+  const sourceErrors: Array<{ source: string; errorCode: string; message: string; permissionID?: string; action?: string }> = [];
   const addEntry = (title: string, source: string, detail?: string) => {
     const cleanTitle = title.replace(/\s+/g, " ").trim();
     const key = cleanTitle.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -17182,7 +17534,7 @@ async function createCombinedTodayTaskVoiceResponse(prompt: string) {
     entries.set(key, { title: cleanTitle, sources: new Set([source]), detail });
   };
 
-  if (selection.includeOpenAssist) {
+  if (options.includeOpenAssist) {
     const items = listDailyItems(dayID).filter((item) => !item.checked);
     const freeTextLines = items.length ? [] : plannerDayFreeTextLines(dayID);
     if (items.length) {
@@ -17192,7 +17544,7 @@ async function createCombinedTodayTaskVoiceResponse(prompt: string) {
     }
   }
 
-  if (selection.includeAppleReminders) {
+  if (options.includeAppleReminders) {
     try {
       const range = plannerDayDateRange(dayID);
       const reminders = (await listAppleReminders({
@@ -17211,19 +17563,60 @@ async function createCombinedTodayTaskVoiceResponse(prompt: string) {
         const detail = [time ? `at ${time}` : "", reminder.calendar?.trim() ? `in ${reminder.calendar.trim()}` : ""].filter(Boolean).join(" ");
         addEntry(reminder.title, "Apple Reminders", detail || undefined);
       });
-    } catch {
-      notes.push("Apple Reminders could not be checked. Allow Reminders access for OpenAssist in System Settings.");
+    } catch (error) {
+      const permissionError = error instanceof NativePermissionRequiredError ? error : null;
+      const message = permissionError?.message || (error instanceof Error ? error.message : "Apple Reminders could not be checked.");
+      sourceErrors.push({
+        source: "Apple Reminders",
+        errorCode: permissionError ? "native_permission_required" : "source_failed",
+        message,
+        permissionID: permissionError?.permissionID,
+        action: permissionError
+          ? permissionError.snapshot.needsRestart
+            ? "restart_app"
+            : permissionError.snapshot.state === "notDetermined"
+              ? "request_permission"
+              : "open_settings"
+          : undefined
+      });
+      warnings.push(`Apple Reminders: ${message}`);
     }
   }
 
-  const visibleEntries = [...entries.values()].slice(0, 10);
-  const taskText = visibleEntries.length
-    ? visibleEntries.map((entry, index) => {
-        const source = [...entry.sources].join(" + ");
+  const items = [...entries.values()].slice(0, 24).map((entry) => ({
+    title: entry.title,
+    sources: [...entry.sources],
+    detail: entry.detail
+  }));
+  return {
+    ok: true,
+    dayID,
+    resultCount: items.length,
+    sources: {
+      openAssist: options.includeOpenAssist,
+      appleReminders: options.includeAppleReminders
+    },
+    items,
+    warnings,
+    sourceErrors
+  };
+}
+
+async function createCombinedTodayTaskVoiceResponse(prompt: string) {
+  const selection = todayTaskSourceSelection(prompt);
+  if (!selection.matches) return null;
+  const result = await combinedTodayTaskKnowledgeResult({
+    dayID: parsePlannerDayIDFromPrompt(prompt) || plannerDayID(),
+    includeOpenAssist: selection.includeOpenAssist,
+    includeAppleReminders: selection.includeAppleReminders
+  });
+  const taskText = result.items.length
+    ? result.items.slice(0, 10).map((entry, index) => {
+        const source = entry.sources.join(" + ");
         return `${index + 1}. ${entry.title}${entry.detail ? ` (${entry.detail})` : ""} — ${source}`;
       }).join("\n")
     : "No open tasks were found.";
-  const sections = [`For ${formattedPlannerDay(dayID)}:\n${taskText}`, ...notes];
+  const sections = [`For ${formattedPlannerDay(result.dayID)}:\n${taskText}`, ...result.warnings];
 
   return {
     route: "today_tasks_combined",
@@ -17264,6 +17657,39 @@ function createDirectKnowledgeVoiceResponse(prompt: string, settings: SettingsSn
   const routeIntent = classifyVoiceRoute(trimmed);
   if (routeIntent.kind === "control" || routeIntent.kind === "recall" || routeIntent.kind === "ignore" || routeIntent.kind === "parallel" || routeIntent.kind === "delegate") {
     return null;
+  }
+
+  const namedNoteRead = /\b(notes?|saved note|project note|thread note)\b/.test(lowered)
+    && /\b(summarize|summary|read|open|show|find|search|check|pull up|tell me about|what does|what is in|do we have|any)\b/.test(lowered)
+    && !/\b(add|create|write|edit|change|update|delete|remove|move|rename|organize|reorganize|format|rewrite)\b/.test(lowered);
+  if (namedNoteRead) {
+    const result = quickReadKnowledgeTarget({ target: trimmed, limit: 5 }) as {
+      matched?: boolean;
+      needsClarification?: boolean;
+      message?: string;
+      item?: KnowledgeItem;
+      results?: KnowledgeSearchResult[];
+    };
+    if (result.matched && result.item) {
+      return {
+        route: "named_note_read",
+        responseText: [
+          `Answer from the OpenAssist note titled "${result.item.title}".`,
+          "Follow the user's request; summarize it if they asked for a summary.",
+          "",
+          result.item.markdown
+        ].join("\n")
+      };
+    }
+    if (result.needsClarification) {
+      const titles = (result.results ?? []).map((item) => item.title).slice(0, 5);
+      return {
+        route: "named_note_clarification",
+        responseText: titles.length
+          ? `I found more than one matching note: ${titles.join(", ")}. Which one do you mean?`
+          : (result.message || "I found more than one matching note. Which one do you mean?")
+      };
+    }
   }
 
   if (allowWrites) {
@@ -17368,7 +17794,7 @@ async function createDirectKnowledgeVoiceResponseAsync(
 
 async function handleLocalVoiceDirectKnowledge(input: { transcript?: string; taskText?: string }) {
   const settings = await loadSettings();
-  if (settings.realtimeDelegationMode === "neverDelegate") {
+  if (settings.realtimeWorkerPolicy === "never") {
     const response = await createDirectKnowledgeVoiceResponseAsync(input.taskText || input.transcript || "", settings, "voice");
     return response
       ? { handled: true, route: response.route, responseText: response.responseText }
@@ -17966,6 +18392,30 @@ function resolveExistingWriteTarget(intent: KnowledgeWriteIntent, payload: JsonO
 }
 
 function prepareSafeKnowledgeWrite(intent: KnowledgeWriteIntent, payload: JsonObject, action = ""): KnowledgeWriteDecision {
+  // Existing task updates own their target resolution. They must not pass
+  // through the create/reference router, which can reinterpret an echoed note
+  // or List name as a new destination and lose the item being updated.
+  if (intent === "update") {
+    const resolvedLinks = resolveTaskLinkTargetsFromPayload(payload);
+    const payloadWithoutNoteNameScope = removeLinkedNoteNameListScope(payload, resolvedLinks);
+    const preparedPayload = compactLinkedTaskDetails({
+      ...payloadWithoutNoteNameScope,
+      links: normalizeDailyLinks([
+        ...(Array.isArray(payloadWithoutNoteNameScope.links) ? payloadWithoutNoteNameScope.links : []),
+        ...resolvedLinks
+      ])
+    }, resolvedLinks);
+    return {
+      intent,
+      target: "existing_task",
+      confidence: 0.9,
+      requiresApproval: false,
+      reason: "The task store will locate the existing item by stable ID or a unique title, then update it in place.",
+      preparedPayload,
+      proposedToolCall: { name: "oa_update_daily_item", arguments: preparedPayload }
+    };
+  }
+
   const explicit = resolveExistingWriteTarget(intent, payload, action);
   if (explicit) return explicit;
 
@@ -17985,18 +18435,6 @@ function prepareSafeKnowledgeWrite(intent: KnowledgeWriteIntent, payload: JsonOb
         : "The task contains detailed note-like content but no existing linked note could be resolved. Save or approve the note first, then link the task.",
       proposedToolCall: { name: "oa_request_reference", arguments: { ...payload, text: detailsMarkdown, title: payload.noteTitle ?? payload.title } },
       preparedPayload
-    };
-  }
-
-  if (intent === "update") {
-    return {
-      intent,
-      target: "existing_task",
-      confidence: 0.75,
-      requiresApproval: false,
-      reason: "This is an update to an existing planner item; it can apply when the item match is unique.",
-      preparedPayload,
-      proposedToolCall: { name: "oa_update_daily_item", arguments: preparedPayload }
     };
   }
 
@@ -18119,6 +18557,59 @@ function quickReadKnowledgeTarget(args: JsonObject) {
   })();
   if (dayID && dayID !== plannerBacklogID) {
     return readKnowledgeItem(`planner_day:planner:global:${dayID}`);
+  }
+  const noteQuery = target
+    .toLowerCase()
+    .replace(/\b(can|could|would|will)\s+you\b/g, " ")
+    .replace(/\b(please|summarize|summary|read|open|show|find|search|check|pull up|tell me about|what does|what is in|do we have|that we have|for me)\b/g, " ")
+    .replace(/\b(my|the|a|an|any|saved|project|thread|notes?)\b/g, " ")
+    .replace(/[^a-z0-9'&+-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const noteTerms = noteQuery.split(/\s+/).filter((term) => term.length > 1);
+  if (noteTerms.length) {
+    const noteMatches = knowledgeItems()
+      .filter((item) => item.kind === "project_note" || item.kind === "thread_note")
+      .map((item) => {
+        const title = item.title.toLowerCase();
+        const titleHits = noteTerms.filter((term) => title.includes(term)).length;
+        const exact = title === noteQuery || title.replace(/\bnote\b/g, " ").replace(/\s+/g, " ").trim() === noteQuery;
+        return { item, titleHits, exact, score: (exact ? 100 : 0) + titleHits * 10 };
+      })
+      .filter((entry) => entry.titleHits === noteTerms.length || entry.exact)
+      .sort((a, b) => b.score - a.score || (b.item.updatedAt ?? 0) - (a.item.updatedAt ?? 0));
+    const topTitle = noteMatches[0]?.item.title.trim().toLowerCase();
+    const duplicateNamedTitles = Boolean(topTitle && topTitle !== "untitled note")
+      && noteMatches.length > 1
+      && noteMatches.every((entry) =>
+        entry.score === noteMatches[0].score
+        && entry.item.title.trim().toLowerCase() === topTitle
+      );
+    if (
+      noteMatches.length === 1
+      || duplicateNamedTitles
+      || (noteMatches[0] && noteMatches[0].score > (noteMatches[1]?.score ?? -1))
+    ) {
+      const match = noteMatches[0].item;
+      return {
+        matched: true,
+        item: readKnowledgeItem(match.id)
+      };
+    }
+    if (noteMatches.length > 1) {
+      return {
+        matched: false,
+        needsClarification: true,
+        message: "More than one note matches. Ask which note the user means.",
+        results: noteMatches.slice(0, Math.max(2, Math.min(8, Number(args.limit ?? 5)))).map(({ item }) => ({
+          id: item.id,
+          kind: item.kind,
+          title: item.title,
+          sourceLabel: item.sourceLabel,
+          updatedAt: item.updatedAt
+        }))
+      };
+    }
   }
   return { results: searchKnowledge(target, Number(args.limit ?? 8), typeof args.source === "string" ? args.source : undefined) };
 }
@@ -18378,7 +18869,12 @@ function knowledgeToolResult(action: string, args: JsonObject, source: Knowledge
     case "oa_update_daily_item":
     case "knowledge_update_daily_item": {
       const result = updateDailyItemByText(assertSafeImmediateKnowledgeWrite(args, "oa_update_daily_item"));
-      return { status: "applied", item: result.item, items: result.items, dayID: result.day.id };
+      return {
+        status: "applied",
+        item: result.item,
+        items: result.items,
+        dayID: "day" in result ? result.day.id : result.backlog.id
+      };
     }
     case "oa_backlinks":
       return knowledgeBacklinks(String(args.itemID ?? args.id ?? ""));
@@ -18479,8 +18975,66 @@ function connectorMessageResultItems(items: Awaited<ReturnType<typeof searchLoca
   }));
 }
 
+const appleReminderRecurrenceFrequencies = new Set(["daily", "weekly", "monthly", "yearly"]);
+
+function appleReminderRecurrenceArg(value: unknown): Partial<AppleReminderRecurrence> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as JsonObject;
+  const recurrence: Partial<AppleReminderRecurrence> = {};
+  const frequency = String(raw.frequency ?? "").trim().toLowerCase();
+  if (appleReminderRecurrenceFrequencies.has(frequency)) {
+    recurrence.frequency = frequency as AppleReminderRecurrence["frequency"];
+  }
+  const interval = finitePositiveNumber(raw.interval);
+  if (interval) recurrence.interval = interval;
+  const endDate = String(raw.endDate ?? "").trim();
+  if (endDate) recurrence.endDate = endDate;
+  const occurrenceCount = finitePositiveNumber(raw.occurrenceCount);
+  if (occurrenceCount) recurrence.occurrenceCount = occurrenceCount;
+  return Object.keys(recurrence).length ? recurrence : undefined;
+}
+
 async function knowledgeToolResultAsync(action: string, args: JsonObject, source: KnowledgeWriteRequest["source"] = "mcp") {
   switch (action) {
+    case "oa_quick_read":
+    case "knowledge_quick_read": {
+      // Targets that name Apple Reminders used to fall through to notes/knowledge
+      // search and wrongly report "not found"; route them to the real Reminders store.
+      const plan = parseAppleRemindersQuickReadTarget(String(args.target ?? args.query ?? args.text ?? ""));
+      if (plan) {
+        const limit = finitePositiveNumber(args.limit) ?? 25;
+        if (plan.query) {
+          const result = await searchAppleReminders({
+            query: plan.query,
+            includeCompleted: plan.includeCompleted,
+            completedOnly: plan.completedOnly,
+            limit
+          });
+          return {
+            ok: true,
+            source: "apple_reminders",
+            resultCount: result.reminders.length,
+            totalMatches: result.totalMatches,
+            completedMatches: result.completedMatches,
+            incompleteMatches: result.incompleteMatches,
+            reminders: result.reminders
+          };
+        }
+        const reminders = await listAppleReminders({ includeCompleted: plan.includeCompleted, limit });
+        const filtered = plan.completedOnly ? reminders.filter((reminder) => reminder.completed) : reminders;
+        return { ok: true, source: "apple_reminders", resultCount: filtered.length, reminders: filtered };
+      }
+      return knowledgeToolResult(action, args, source);
+    }
+    case "oa_today_tasks_combined":
+    case "knowledge_today_tasks_combined": {
+      const requestedDayID = String(args.dayID ?? args.date ?? "").trim();
+      return combinedTodayTaskKnowledgeResult({
+        dayID: requestedDayID || plannerDayID(),
+        includeOpenAssist: args.includeOpenAssist !== false,
+        includeAppleReminders: args.includeAppleReminders !== false
+      });
+    }
     case "oa_personal_recall":
     case "knowledge_personal_recall":
       return runSparkPersonalRecall(args);
@@ -18587,11 +19141,13 @@ async function knowledgeToolResultAsync(action: string, args: JsonObject, source
     case "knowledge_apple_add_reminder": {
       const title = String(args.title ?? "").trim();
       if (!title) throw new Error("What should I add to Apple Reminders?");
+      const recurrence = appleReminderRecurrenceArg(args.recurrence);
       const reminder = await addAppleReminder({
         title,
         notes: String(args.notes ?? args.details ?? "").trim() || undefined,
         dueDate: String(args.dueDate ?? args.due ?? "").trim() || undefined,
-        calendar: String(args.calendar ?? args.list ?? "").trim() || undefined
+        calendar: String(args.calendar ?? args.list ?? "").trim() || undefined,
+        recurrence: recurrence && recurrence.frequency ? recurrence as AppleReminderRecurrence : undefined
       });
       return { ok: true, status: "applied", reminder };
     }
@@ -18606,10 +19162,56 @@ async function knowledgeToolResultAsync(action: string, args: JsonObject, source
       });
       return { ok: true, resultCount: reminders.length, reminders };
     }
+    case "oa_apple_search_reminders":
+    case "knowledge_apple_search_reminders": {
+      const query = String(args.query ?? args.title ?? args.target ?? "").trim();
+      if (!query) throw new Error("What Apple Reminder title should I search for?");
+      const result = await searchAppleReminders({
+        query,
+        calendar: String(args.calendar ?? args.list ?? "").trim() || undefined,
+        includeCompleted: args.includeCompleted !== false,
+        completedOnly: args.completedOnly === true,
+        limit: finitePositiveNumber(args.limit ?? args.maxResults)
+      });
+      return {
+        ok: true,
+        resultCount: result.reminders.length,
+        totalMatches: result.totalMatches,
+        completedMatches: result.completedMatches,
+        incompleteMatches: result.incompleteMatches,
+        reminders: result.reminders
+      };
+    }
+    case "oa_apple_update_reminder":
+    case "knowledge_apple_update_reminder": {
+      const id = String(args.id ?? args.reminderID ?? "").trim();
+      if (!id) throw new Error("Which Apple Reminder should I update? Search reminders first if you need the ID.");
+      const title = String(args.title ?? args.newTitle ?? "").trim();
+      const notes = String(args.notes ?? args.details ?? "").trim();
+      const dueDate = String(args.dueDate ?? args.due ?? "").trim();
+      const clearNotes = args.clearNotes === true;
+      const clearDueDate = args.clearDueDate === true;
+      const recurrence = appleReminderRecurrenceArg(args.recurrence);
+      const clearRecurrence = args.clearRecurrence === true;
+      if (!title && !notes && !dueDate && !clearNotes && !clearDueDate && !recurrence && !clearRecurrence) {
+        throw new Error("What should I change on this Apple Reminder?");
+      }
+      const reminder = await updateAppleReminder({
+        id,
+        title: title || undefined,
+        notes: notes || undefined,
+        dueDate: dueDate || undefined,
+        clearNotes,
+        clearDueDate,
+        recurrence,
+        clearRecurrence
+      });
+      return { ok: true, status: "applied", reminder };
+    }
     case "oa_apple_complete_reminder":
     case "knowledge_apple_complete_reminder": {
       const id = String(args.id ?? args.reminderID ?? "").trim();
-      if (!id) throw new Error("Which Apple Reminder should I update? List reminders first if you need the ID.");
+      if (!id) throw new Error("Which Apple Reminder should I update? Search reminders first if you need the ID.");
       const reminder = await completeAppleReminder(id, args.completed !== false);
       return { ok: true, status: "applied", reminder };
     }
@@ -20158,6 +20760,21 @@ async function readOpenAssistInfoPlist(key: string, fallback: string) {
   return readPromise;
 }
 
+function realtimeLocalMCPAllowedServerNames(value: string) {
+  const normalized = String(value || "auto").trim();
+  if (!normalized || normalized.toLowerCase() === "auto") return [];
+  return [...new Set(normalized.split(",").map((name) => name.trim()).filter(Boolean))];
+}
+
+function configureRealtimeLocalMCPHarness(enabled: boolean, allowedServers: string) {
+  realtimeLocalMCPHarness.configure({
+    enabled,
+    allowedServers: realtimeLocalMCPAllowedServerNames(allowedServers),
+    autoAllowLocalPackages: allowedServers.trim().toLowerCase() === "auto" || !allowedServers.trim(),
+    log: bridgeDebugLog
+  });
+}
+
 async function loadSettings(): Promise<SettingsSnapshot> {
   removeLegacyPersonalRecallRecords();
   await ensureLiquidGlassDefaultMigrated();
@@ -20225,6 +20842,10 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     )
   );
   const knowledgeAccessEnabled = await readBoolDefault("OpenAssist.knowledgeAccess.enabled", true);
+  const realtimeLocalMCPEnabled = await readBoolDefault("OpenAssist.realtimeVoice.localMCPEnabled", true);
+  const realtimeLocalMCPAllowedServers = await readDefault("OpenAssist.realtimeVoice.localMCPAllowedServers", "auto");
+  configureRealtimeLocalMCPHarness(realtimeLocalMCPEnabled, realtimeLocalMCPAllowedServers);
+  const realtimeLocalMCPServers = await realtimeLocalMCPHarness.serverSummaries();
   const knowledgeServerPort = await readDefault("OpenAssist.knowledgeAccess.port", defaultKnowledgeServerPort);
   const knowledgeTokenConfigured = knowledgeAccessEnabled
     ? Boolean(ensureKnowledgeAccessToken())
@@ -20297,7 +20918,12 @@ async function loadSettings(): Promise<SettingsSnapshot> {
     liveVoiceEchoGuardEnabled: await readBoolDefault("OpenAssist.liveVoice.echoGuardEnabled", true),
     todayWakeWordEnabled: await readBoolDefault("OpenAssist.todayWakeWord.enabled", false),
     todayWakeWordPhrase: await readDefault("OpenAssist.todayWakeWord.phrase", "Hey Open Assist"),
-    realtimeDelegationMode: normalizeRealtimeDelegationMode(await readDefault("OpenAssist.realtimeVoice.delegationMode", "autoHardTasksOnly")),
+    realtimeWorkerPolicy: normalizeRealtimeWorkerPolicy(await readDefault("OpenAssist.realtimeVoice.delegationMode", "auto")),
+    realtimeFastWorkerModel: await readDefault("OpenAssist.realtimeVoice.fastWorkerModel", "auto"),
+    realtimeDeepWorkerModel: await readDefault("OpenAssist.realtimeVoice.deepWorkerModel", "auto"),
+    realtimeLocalMCPEnabled,
+    realtimeLocalMCPAllowedServers,
+    realtimeLocalMCPServers,
     localVoiceModel: await readDefault("OpenAssist.localVoice.model", defaultLocalVoiceModel),
     speechOutputRewriteModel: await readDefault("OpenAssist.speechOutputRewrite.model", defaultSpeechOutputRewriteModel),
     assistantVoiceOutputEnabled: await readBoolDefault("OpenAssist.assistantVoiceOutputEnabled", false),
@@ -20441,7 +21067,11 @@ const writableSettingKeys: Record<SettingsUpdateKey, { defaultsKey: string; type
   liveVoiceEchoGuardEnabled: { defaultsKey: "OpenAssist.liveVoice.echoGuardEnabled", type: "bool" },
   todayWakeWordEnabled: { defaultsKey: "OpenAssist.todayWakeWord.enabled", type: "bool" },
   todayWakeWordPhrase: { defaultsKey: "OpenAssist.todayWakeWord.phrase", type: "string" },
-  realtimeDelegationMode: { defaultsKey: "OpenAssist.realtimeVoice.delegationMode", type: "string" },
+  realtimeWorkerPolicy: { defaultsKey: "OpenAssist.realtimeVoice.delegationMode", type: "string" },
+  realtimeFastWorkerModel: { defaultsKey: "OpenAssist.realtimeVoice.fastWorkerModel", type: "string" },
+  realtimeDeepWorkerModel: { defaultsKey: "OpenAssist.realtimeVoice.deepWorkerModel", type: "string" },
+  realtimeLocalMCPEnabled: { defaultsKey: "OpenAssist.realtimeVoice.localMCPEnabled", type: "bool" },
+  realtimeLocalMCPAllowedServers: { defaultsKey: "OpenAssist.realtimeVoice.localMCPAllowedServers", type: "string" },
   localVoiceModel: { defaultsKey: "OpenAssist.localVoice.model", type: "string" },
   speechOutputRewriteModel: { defaultsKey: "OpenAssist.speechOutputRewrite.model", type: "string" },
   assistantVoiceOutputEnabled: { defaultsKey: "OpenAssist.assistantVoiceOutputEnabled", type: "bool" },
@@ -20600,8 +21230,19 @@ async function writeSettingValue(key: SettingsUpdateKey, value: boolean | string
         throw new Error("Wake phrase cannot be empty.");
       }
       await writeStringDefault(setting.defaultsKey, nextPhrase.slice(0, 80));
-    } else if (key === "realtimeDelegationMode") {
-      await writeStringDefault(setting.defaultsKey, normalizeRealtimeDelegationMode(value));
+    } else if (key === "realtimeWorkerPolicy") {
+      await writeStringDefault(setting.defaultsKey, normalizeRealtimeWorkerPolicy(value));
+    } else if (key === "realtimeFastWorkerModel" || key === "realtimeDeepWorkerModel") {
+      const requested = String(value).trim();
+      const normalized = requested.toLowerCase();
+      const nextModel = !requested || normalized === "auto" || normalized === "automatic" ? "auto" : requested;
+      if (nextModel !== "auto") {
+        const available = await loadAvailableCodexProviderModels();
+        if (!available.some((model) => model.id.toLowerCase() === nextModel.toLowerCase())) {
+          throw new Error(`The Codex app-server model "${nextModel}" is not currently available.`);
+        }
+      }
+      await writeStringDefault(setting.defaultsKey, nextModel);
     } else if (key === "localVoiceModel" || key === "speechOutputRewriteModel") {
       const nextModel = String(value).trim();
       await writeStringDefault(
@@ -20672,8 +21313,12 @@ async function finalizeSettingsUpdate(keys: SettingsUpdateKey[]) {
     // Refresh only the mutable access callbacks; the active session keeps its
     // original thread, worker, and continuity callbacks.
     codexRealtimeProxy.configure({
-      knowledge: realtimeKnowledgeProvider(nextSettings),
-      directKnowledgeRequest: realtimeDirectKnowledgeRequestProvider(nextSettings)
+      knowledge: realtimeKnowledgeProvider(nextSettings)
+    });
+  }
+  if (keys.some((key) => key.startsWith("realtimeLocalMCP"))) {
+    codexRealtimeProxy.configure({
+      localMCP: realtimeLocalMCPProvider(nextSettings)
     });
   }
   if (keys.some((key) => key.startsWith("remoteAccess"))) {
@@ -22193,7 +22838,7 @@ const knowledgeMCPTools = [
         accountLabel: { type: "string" },
         query: {
           type: "string",
-          description: "Natural-language keywords or Gmail search syntax for the exact email being searched, for example: from:alex invoice, subject:receipt, or Quality Nails invoice."
+          description: "Natural-language keywords or Gmail search syntax for the exact email being searched, for example: from:alex invoice, subject:receipt, or client invoice."
         },
         gmailQuery: {
           type: "string",
@@ -22245,7 +22890,7 @@ const knowledgeMCPTools = [
   },
   {
     name: "oa_apple_add_reminder",
-    description: "Create a real Apple Reminders reminder on this Mac. Use only when the user explicitly says Apple Reminders, Reminders app, iCloud reminders, or asks for an Apple reminder. Do not use for OpenAssist planner reminders.",
+    description: "Create a real Apple Reminders reminder on this Mac. Use only when the user explicitly says Apple Reminders, Reminders app, iCloud reminders, or asks for an Apple reminder. Do not use for OpenAssist planner reminders. A recurring reminder requires a dueDate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22253,7 +22898,19 @@ const knowledgeMCPTools = [
         notes: { type: "string" },
         dueDate: { type: "string", description: "Optional ISO date or datetime. Use local-date ISO when the user gives a day." },
         calendar: { type: "string", description: "Optional Apple Reminders list/calendar name." },
-        list: { type: "string", description: "Alias for calendar." }
+        list: { type: "string", description: "Alias for calendar." },
+        recurrence: {
+          type: "object",
+          description: "Optional repeat rule. Requires dueDate.",
+          properties: {
+            frequency: { type: "string", enum: ["daily", "weekly", "monthly", "yearly"] },
+            interval: { type: "number", description: "Every N periods. Default 1." },
+            endDate: { type: "string", description: "ISO date when the series stops repeating." },
+            occurrenceCount: { type: "number", description: "Alternative to endDate: stop after N occurrences." }
+          },
+          required: ["frequency"],
+          additionalProperties: false
+        }
       },
       required: ["title"],
       additionalProperties: false
@@ -22261,7 +22918,7 @@ const knowledgeMCPTools = [
   },
   {
     name: "oa_apple_list_reminders",
-    description: "List real Apple Reminders reminders on this Mac. Read-only. Use when the user asks what is in Apple Reminders or asks about native reminders.",
+    description: "List real Apple Reminders reminders on this Mac. Read-only. Use when the user asks what is in Apple Reminders or asks about native reminders. To find a SPECIFIC reminder by name, use oa_apple_search_reminders instead; large lists get cut off here.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22276,8 +22933,53 @@ const knowledgeMCPTools = [
     }
   },
   {
+    name: "oa_apple_search_reminders",
+    description: "Search real Apple Reminders on this Mac by title keywords, across ALL lists, INCLUDING completed reminders by default. Prefer this over oa_apple_list_reminders when looking for a specific reminder by name (for example to check whether it was completed, or to get its id). Returns ids for oa_apple_update_reminder / oa_apple_complete_reminder, plus each reminder's repeat schedule (recurrence) when present. Restart recipes: re-open a completed reminder with oa_apple_complete_reminder {completed:false} (keeps its repeat rule); then optionally oa_apple_update_reminder to set a new dueDate or extend recurrence.endDate; or create a fresh copy with oa_apple_add_reminder using the same title/notes/calendar and an optional recurrence. Note: a completed recurring series shows many completed copies plus one series head carrying the recurrence rule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Title keywords. Case-insensitive; every word must appear in the reminder title." },
+        calendar: { type: "string", description: "Optional list name. Omit to search all lists (duplicate list names are all searched)." },
+        includeCompleted: { type: "boolean", description: "Default true." },
+        completedOnly: { type: "boolean" },
+        limit: { type: "number", description: "Default 25, max 100. totalMatches reports the pre-limit count." }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "oa_apple_update_reminder",
+    description: "Update the title, notes, due date, or repeat rule of a real Apple Reminder by ID. Use this for edits and renames; never complete a reminder to rename it. Can set, replace, extend (recurrence.endDate alone inherits frequency/interval from the existing rule), or clear (clearRecurrence) the repeat rule. Search reminders first if you do not know the exact ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+        notes: { type: "string" },
+        dueDate: { type: "string" },
+        clearNotes: { type: "boolean" },
+        clearDueDate: { type: "boolean" },
+        recurrence: {
+          type: "object",
+          description: "Repeat rule. Omitted fields inherit from the existing rule, so {endDate} alone extends a series.",
+          properties: {
+            frequency: { type: "string", enum: ["daily", "weekly", "monthly", "yearly"] },
+            interval: { type: "number", description: "Every N periods. Default 1." },
+            endDate: { type: "string", description: "ISO date when the series stops repeating." },
+            occurrenceCount: { type: "number", description: "Alternative to endDate: stop after N occurrences." }
+          },
+          additionalProperties: false
+        },
+        clearRecurrence: { type: "boolean", description: "True removes the repeat rule." }
+      },
+      required: ["id"],
+      additionalProperties: false
+    }
+  },
+  {
     name: "oa_apple_complete_reminder",
-    description: "Mark a real Apple Reminders reminder complete or incomplete by ID. List reminders first if you do not know the exact ID.",
+    description: "Mark a real Apple Reminders reminder complete or incomplete by ID. Passing completed:false re-opens a completed reminder: it clears the completion date and keeps any repeat rule. Completing a recurring series head rolls it forward to the next occurrence instead of staying completed (normal Apple behavior). Use oa_apple_search_reminders to find the id, including for completed items.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22679,7 +23381,7 @@ function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
     case "oa_request_daily_item":
       return {
         ...tool,
-        description: "Add one dated planner task. Keep it short; detailed specs, dimensions, and long checklists belong in a linked note. For fastest external-agent use, prefer oa_quick_add_task.",
+        description: "Add one dated planner task. Keep it short; detailed specs, dimensions, and long checklists belong in a linked note. If the user gives an alert time, set reminderAt so OpenAssist notifies them. For fastest external-agent use, prefer oa_quick_add_task.",
         inputSchema: {
           type: "object",
           properties: {
@@ -22687,6 +23389,8 @@ function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
             dayID: { type: "string", description: "today, tomorrow, weekday, or YYYY-MM-DD." },
             listName: { type: "string" },
             category: { type: "string" },
+            reminderAt: { type: "string", description: "ISO datetime for an OpenAssist local notification. Set when the user asks to be reminded at a time." },
+            reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
             detailsMarkdown: { type: "string", description: "Short action context only. Put detailed checklists/specs/dimensions in a linked note." },
             noteItemID: { type: "string" },
             noteTitle: { type: "string" },
@@ -22699,7 +23403,7 @@ function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
     case "oa_request_backlog_item":
       return {
         ...tool,
-        description: "Add one undated task to Backlog. Keep it short; detailed specs, dimensions, and long checklists belong in a linked note. For fastest external-agent use, prefer oa_quick_add_task with when=backlog or omitted.",
+        description: "Add one undated task to Backlog. Keep it short; detailed specs, dimensions, and long checklists belong in a linked note. If the user gives an alert time, set reminderAt so OpenAssist notifies them. For fastest external-agent use, prefer oa_quick_add_task with when=backlog or omitted.",
         inputSchema: {
           type: "object",
           properties: {
@@ -22707,6 +23411,8 @@ function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
             listName: { type: "string" },
             category: { type: "string" },
             section: { type: "string" },
+            reminderAt: { type: "string", description: "ISO datetime for an OpenAssist local notification. Set when the user asks to be reminded at a time." },
+            reminderTimezone: { type: "string", description: "IANA timezone for reminderAt, if known." },
             detailsMarkdown: { type: "string", description: "Short action context only. Put detailed checklists/specs/dimensions in a linked note." },
             detailsMode: { type: "string", enum: ["replace", "append"] },
             replaceDetails: { type: "boolean" },
@@ -22737,7 +23443,7 @@ function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
     case "oa_update_daily_item":
       return {
         ...tool,
-        description: "Update or move one existing planner task by itemID or current text. Keep details short; put detailed specs/dimensions/checklists in a linked note. Use after listing only when the exact item is unclear.",
+        description: "Update or move one existing planner task by itemID or current text. Also sets or clears the task's reminder time via reminderAt. Keep details short; put detailed specs/dimensions/checklists in a linked note. Use after listing only when the exact item is unclear.",
         inputSchema: {
           type: "object",
           properties: {
@@ -22748,6 +23454,8 @@ function simpleKnowledgeMCPTool(tool: typeof knowledgeMCPTools[number]) {
             targetDayID: { type: "string" },
             listName: { type: "string" },
             category: { type: "string" },
+            reminderAt: { type: ["string", "null"], description: "ISO datetime for an OpenAssist local notification. Set when the user asks to be reminded at a time; null clears the reminder." },
+            reminderTimezone: { type: ["string", "null"], description: "IANA timezone for reminderAt, if known." },
             detailsMarkdown: { type: "string", description: "Short action context only. Put detailed checklists/specs/dimensions in a linked note." },
             detailsMode: { type: "string", enum: ["replace", "append"] },
             replaceDetails: { type: "boolean" },
@@ -25779,24 +26487,88 @@ function compactRemoteVoiceText(value: unknown, limit = 2_000) {
   return `${text.slice(0, Math.max(0, limit - 3)).trimEnd()}...`;
 }
 
+function isLiveVoiceSession(session: SessionSummary | undefined): session is SessionSummary {
+  return !!session && (
+    session.kind === "liveVoice"
+    || session.title?.trim().toLowerCase() === todayLiveVoiceThreadTitle.toLowerCase()
+  );
+}
+
+function liveVoiceArchivedTitle(dayID: string) {
+  const parsed = new Date(`${dayID}T12:00:00`);
+  const label = Number.isNaN(parsed.getTime())
+    ? dayID
+    : parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `Live Voice · ${label}`;
+}
+
+// Keep only the most recent rotated voice-log archives so daily rotation cannot
+// slowly consume the session registry's 200-slot cap.
+const maxArchivedLiveVoiceThreads = 30;
+
+function pruneArchivedLiveVoiceThreads() {
+  const archives = loadSessionRegistry().sessions
+    .filter((session) => session.source === "openAssist" && session.kind === "liveVoice" && session.isArchived === true)
+    .sort((left, right) => Number(right.updatedAt ?? right.createdAt ?? 0) - Number(left.updatedAt ?? left.createdAt ?? 0));
+  for (const stale of archives.slice(maxArchivedLiveVoiceThreads)) {
+    try {
+      deleteSessionPermanently(stale.id);
+    } catch (error) {
+      bridgeDebugLog(`[realtime.voice] voice archive prune failed thread=${stale.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 function ensureRemoteLiveVoiceThread(requestedThreadID?: string) {
   const requested = requestedThreadID ? findSession(requestedThreadID) : undefined;
-  const existing = requested?.isArchived !== true
-    && requested?.title?.trim().toLowerCase() === todayLiveVoiceThreadTitle.toLowerCase()
+  const existing = requested?.isArchived !== true && isLiveVoiceSession(requested)
     ? requested
     : loadSessionRegistry().sessions
         .filter((session) =>
           session.source === "openAssist"
           && session.isArchived !== true
-          && session.title?.trim().toLowerCase() === todayLiveVoiceThreadTitle.toLowerCase()
+          && isLiveVoiceSession(session)
         )
         .sort((left, right) => Number(right.updatedAt ?? right.createdAt ?? 0) - Number(left.updatedAt ?? left.createdAt ?? 0))[0];
-  let session = existing;
+  let session: SessionSummary | undefined = existing;
+  const todayDayID = plannerDayID();
+  if (session) {
+    // Migration: legacy title-matched threads get the flag stamped on first touch;
+    // the continuous pre-rotation thread becomes "today's" log once, then rotates.
+    if (session.kind !== "liveVoice" || !session.liveVoiceDayID) {
+      session.kind = "liveVoice";
+      session.liveVoiceDayID = session.liveVoiceDayID || todayDayID;
+      session = updateSession(session);
+    }
+    // Daily rotation: only at session START (never mid-session), so a session that
+    // spans midnight keeps writing to the day it started on.
+    if (session.liveVoiceDayID !== todayDayID) {
+      const rotatedID = session.id;
+      const rotatedDayID = String(session.liveVoiceDayID);
+      finalizeLiveVoiceDayLog(rotatedID);
+      // Archive synchronously in the registry so a racing second start cannot
+      // resolve (and re-rotate) the same thread; the provider-side archive is
+      // best-effort in the background.
+      session.title = liveVoiceArchivedTitle(rotatedDayID);
+      session.isArchived = true;
+      session.archivedAt = currentSwiftDate();
+      session.autoDeleteAfter = null;
+      updateSession(session);
+      void archiveCodexProviderThread(codexProviderThreadID(session)).catch((error) => {
+        bridgeDebugLog(`[realtime.voice] voice log provider archive failed thread=${rotatedID}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      pruneArchivedLiveVoiceThreads();
+      bridgeDebugLog(`[realtime.voice] rotated voice log thread=${rotatedID} day=${rotatedDayID} -> new day ${todayDayID}`);
+      session = undefined;
+    }
+  }
   if (!session) {
     const created = createOpenAssistThread(undefined, true, false).session;
     session = ensureOpenAssistSessionRecord(created.id, "codex");
     session.title = todayLiveVoiceThreadTitle;
     session.activeProvider = "codex";
+    session.kind = "liveVoice";
+    session.liveVoiceDayID = todayDayID;
     session = updateSession(session);
   } else if (session.isTemporary === true || session.conversationPersistence === 0) {
     promoteTemporarySession(session.id);
@@ -25805,6 +26577,15 @@ function ensureRemoteLiveVoiceThread(requestedThreadID?: string) {
   const conversationPath = path.join(conversationStoreRoot(), session.id, "conversation.json");
   if (!fs.existsSync(conversationPath)) createEmptyConversation(session.id);
   return session;
+}
+
+// Finalize the closing day's summary before the log is archived. Fire-and-forget:
+// rotation must never wait on (or fail because of) a summary.
+function finalizeLiveVoiceDayLog(threadID: string) {
+  cancelQueuedLiveVoiceSummary(threadID);
+  void generateLiveVoiceSessionSummary(threadID, { finalize: true }).catch((error) => {
+    bridgeDebugLog(`[realtime.voice] final day summary failed thread=${threadID}: ${error instanceof Error ? error.message : String(error)}`);
+  });
 }
 
 function remoteLiveVoiceBootstrap(threadID: string) {
@@ -27754,11 +28535,18 @@ function tomlString(value: string) {
   return JSON.stringify(value);
 }
 
+// Codex launches MCP servers without the user's shell PATH, so a bare "node"
+// command can fail; prefer an absolute path to the node binary.
+function resolveNodeBinaryPath() {
+  const candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || "node";
+}
+
 function codexIntegrationTomlBlock() {
   const proxyPath = resolveKnowledgeProxyPath();
   return [
     `[mcp_servers.${openAssistIntegrationServerName}]`,
-    `command = ${tomlString("node")}`,
+    `command = ${tomlString(resolveNodeBinaryPath())}`,
     `args = [${tomlString(proxyPath)}, ${tomlString("mcp")}, ${tomlString("--stdio")}]`
   ].join("\n");
 }
@@ -27794,10 +28582,71 @@ function mergeJsonIntegrationConfig(filePath: string, targetID: OpenAssistIntegr
   return `${JSON.stringify({ ...parsed, mcpServers: servers }, null, 2)}\n`;
 }
 
+const openAssistTomlHeaderPattern = new RegExp(`^\\s*\\[mcp_servers\\.${openAssistIntegrationServerName}\\]\\s*(#.*)?$`);
+
+function tomlLineReferencesKnowledgeProxy(line: string) {
+  return /^\s*(args|command)\s*=/.test(line) && line.includes("openassist-knowledge.mjs");
+}
+
+// The OpenAssist entry must be removed line-by-line: a lazy regex with a
+// multiline `$` once truncated the removal mid-block and left an orphaned
+// `args = [...]` line attached to the neighboring server entry. Duplicate
+// entries under other names (e.g. a hand-added `openassist-knowledge` with a
+// dash) are consolidated too, while orphaned proxy lines inside unrelated
+// url-based server blocks are dropped without touching the block itself.
+function stripOpenAssistTomlEntries(raw: string) {
+  const lines = raw.split(/\r?\n/);
+  const segments: string[][] = [[]];
+  for (const line of lines) {
+    if (/^\s*\[/.test(line)) segments.push([line]);
+    else segments[segments.length - 1].push(line);
+  }
+  const kept: string[] = [];
+  for (const segment of segments) {
+    const header = segment[0] && /^\s*\[/.test(segment[0]) ? segment[0] : undefined;
+    if (header && openAssistTomlHeaderPattern.test(header)) continue;
+    const referencesProxy = segment.some(tomlLineReferencesKnowledgeProxy);
+    if (header && /^\s*\[mcp_servers\./.test(header) && referencesProxy) {
+      const isRemoteServer = segment.some((line) => /^\s*url\s*=/.test(line));
+      // A local block that launches the knowledge proxy is an OpenAssist
+      // duplicate under another name; a remote block only carries orphans.
+      if (!isRemoteServer) continue;
+      kept.push(...segment.filter((line) => !tomlLineReferencesKnowledgeProxy(line)));
+      continue;
+    }
+    if (!header && referencesProxy) {
+      kept.push(...segment.filter((line) => !tomlLineReferencesKnowledgeProxy(line)));
+      continue;
+    }
+    kept.push(...segment);
+  }
+  return kept.join("\n");
+}
+
+function extractOpenAssistTomlBlock(raw: string) {
+  const lines = raw.split(/\r?\n/);
+  const start = lines.findIndex((line) => openAssistTomlHeaderPattern.test(line));
+  if (start === -1) return undefined;
+  const block = [`[mcp_servers.${openAssistIntegrationServerName}]`];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\s*\[/.test(lines[index])) break;
+    const trimmed = lines[index].trim();
+    if (trimmed) block.push(trimmed);
+  }
+  return block.join("\n");
+}
+
+function tomlIntegrationEntryIsCurrent(raw: string) {
+  const block = extractOpenAssistTomlBlock(raw);
+  if (!block || block !== codexIntegrationTomlBlock()) return false;
+  // Duplicate entries under other names or stray orphaned lines both surface
+  // as extra proxy references; a healthy file has exactly the one in our block.
+  return raw.split("openassist-knowledge.mjs").length - 1 === 1;
+}
+
 function mergeTomlIntegrationConfig(filePath: string) {
   const raw = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
-  const blockPattern = new RegExp(`\\n?\\[mcp_servers\\.${openAssistIntegrationServerName}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`, "m");
-  const withoutOpenAssist = raw.replace(blockPattern, "").trimEnd();
+  const withoutOpenAssist = stripOpenAssistTomlEntries(raw).trimEnd();
   const separator = withoutOpenAssist ? "\n\n" : "";
   return `${withoutOpenAssist}${separator}${codexIntegrationTomlBlock()}\n`;
 }
@@ -27835,17 +28684,29 @@ async function loadOpenAssistIntegrationStatus() {
   const externalMode = settings.knowledgeExternalAccessMode;
   const toolCount = knowledgeMCPToolsForSettings(settings).length;
   return {
-    targets: targets.map((target) => ({
-      id: target.id,
-      title: target.title,
-      description: target.description,
-      configPath: target.configPath,
-      skillPath: target.skillPath,
-      detected: Boolean(target.configPath && fs.existsSync(target.configPath)),
-      connected: integrationConfigHasOpenAssist(target),
-      configKind: target.configKind,
-      skillMode: target.skillMode
-    })),
+    targets: targets.map((target) => {
+      const connected = integrationConfigHasOpenAssist(target);
+      let healthy = connected;
+      if (connected && target.configKind === "toml" && target.configPath) {
+        try {
+          healthy = tomlIntegrationEntryIsCurrent(fs.readFileSync(target.configPath, "utf8"));
+        } catch {
+          healthy = false;
+        }
+      }
+      return {
+        id: target.id,
+        title: target.title,
+        description: target.description,
+        configPath: target.configPath,
+        skillPath: target.skillPath,
+        detected: Boolean(target.configPath && fs.existsSync(target.configPath)),
+        connected,
+        healthy,
+        configKind: target.configKind,
+        skillMode: target.skillMode
+      };
+    }),
     proxyPath: resolveKnowledgeProxyPath(),
     externalMode,
     exposedToolCount: toolCount,
@@ -27854,10 +28715,35 @@ async function loadOpenAssistIntegrationStatus() {
   };
 }
 
+function jsonIntegrationEntryIsCurrent(raw: string, targetID: OpenAssistIntegrationTargetID, access: KnowledgeRuntimeAccess) {
+  try {
+    const parsed = JSON.parse(raw) as JsonObject;
+    const servers = parsed.mcpServers;
+    if (!servers || typeof servers !== "object" || Array.isArray(servers)) return false;
+    const existing = (servers as Record<string, unknown>)[openAssistIntegrationServerName];
+    return JSON.stringify(existing) === JSON.stringify(jsonIntegrationEntry(targetID, access));
+  } catch {
+    return false;
+  }
+}
+
 async function connectOpenAssistIntegration(targetID: unknown) {
   const target = openAssistIntegrationTarget(sanitizeIntegrationTargetID(targetID));
   if (!target.configPath) throw new Error("This integration target only supports copying config.");
   const { access } = await ensureKnowledgeIntegrationAccess();
+  const raw = fs.existsSync(target.configPath) ? fs.readFileSync(target.configPath, "utf8") : "";
+  const hadEntry = integrationConfigHasOpenAssist(target);
+  const alreadyCurrent = target.configKind === "toml"
+    ? tomlIntegrationEntryIsCurrent(raw)
+    : jsonIntegrationEntryIsCurrent(raw, target.id, access);
+  if (alreadyCurrent) {
+    return {
+      ok: true,
+      targetID: target.id,
+      action: "already-connected" as const,
+      configPath: target.configPath
+    };
+  }
   const backupPath = backupFileIfPresent(target.configPath);
   const nextConfig = target.configKind === "toml"
     ? mergeTomlIntegrationConfig(target.configPath)
@@ -27866,7 +28752,7 @@ async function connectOpenAssistIntegration(targetID: unknown) {
   return {
     ok: true,
     targetID: target.id,
-    action: backupPath ? "written" : "created",
+    action: hadEntry ? ("repaired" as const) : ("created" as const),
     configPath: target.configPath,
     backupPath
   };
@@ -28010,6 +28896,14 @@ function installOpenAssistIntegrationSkill(targetID: unknown) {
 // See docs/computer-use-troubleshooting.md.
 const codexProxyMCPServerName = "codex_computer_use";
 
+function computerUseNativeHome() {
+  try {
+    return os.userInfo().homedir || os.homedir();
+  } catch {
+    return os.homedir();
+  }
+}
+
 function codexComputerUseProxyEnv(): Record<string, string> {
   // Pass the env vars codex needs (originator gate + unbuffered IO) and PATH/HOME
   // so the spawned `codex mcp-server` can run. We deliberately do NOT dump the
@@ -28024,7 +28918,10 @@ function codexComputerUseProxyEnv(): Record<string, string> {
     // Finder-launched app's stripped PATH doesn't break the spawned codex.
     PATH: assistantPATH()
   };
-  if (process.env.HOME) env.HOME = process.env.HOME;
+  // Computer Use locates its shared macOS socket below HOME. OpenAssist demo
+  // builds may intentionally use a temporary HOME for data isolation, but
+  // passing that path here makes the client miss the real shared service.
+  env.HOME = computerUseNativeHome();
   return env;
 }
 
@@ -28166,7 +29063,7 @@ function openAssistKnowledgeAgentInstructions(providerName = "the agent") {
     "After the user requests or confirms it, call `oa_create_project` with `confirmed: true`. A folder only groups projects and cannot directly contain notes or chats, so create or select a project inside the folder and use the returned projectID for the next note, thread, or task call. Never silently place new work in an unrelated existing project.",
     "For questions like today's plan, today's list, or what's on today, call `oa_read_today` first so you see the full planner markdown, including free-text lines under sections like Notes. If `oa_list_daily_items` returns no structured items but freeTextItems or noteMarkdown is present, report those. Never tell the user today is empty based only on an empty `oa_list_daily_items` result.",
     "For connected services such as Gmail, Messages, Apple Reminders, and Apple Calendar, first call `oa_connector_status`. If the user asks to find/show/search for a specific email or email type, use `oa_connector_search_gmail` with a narrow `query`; it returns metadata snippets directly and must not sync Review Inbox. If the user asks to check iMessage, Messages, texts, or SMS for a person, appointment, or follow-up, use `oa_connector_search_messages` with a narrow `query`; do not ask what they mean by Messages. If the user asks for to-dos, backlog items, follow-ups, waiting-for items, or tasks from Gmail, use `oa_connector_sync_gmail` with `userIntent` set to the user's exact request; it places metadata-only candidates in Review Inbox. Never run a broad Gmail sync for a specific email search. Do not fetch full email bodies, run raw gws commands, or ask for all mail.",
-    "For a general day task read, use both `oa_list_daily_items` and `oa_apple_list_reminders`. Apple Reminders writes still require the user to explicitly name Apple Reminders, the Reminders app, iCloud reminders, or an Apple reminder. Use `oa_apple_add_reminder` and `oa_apple_complete_reminder` only for those explicit native-reminder writes. If the user explicitly asks for Apple Calendar, the Calendar app, iCloud calendar, or a native calendar event, use `oa_apple_add_event` or `oa_apple_list_events`. If macOS access is not granted, report that clearly while still returning the OpenAssist Today result.",
+    "For a general day task read, use both `oa_list_daily_items` and `oa_apple_list_reminders`. To find a SPECIFIC Apple reminder by name (including completed ones, or to get its id), use `oa_apple_search_reminders` — never conclude a reminder does not exist from a limited list read. Apple Reminders writes still require the user to explicitly name Apple Reminders, the Reminders app, iCloud reminders, or an Apple reminder. Use `oa_apple_add_reminder`, `oa_apple_update_reminder`, and `oa_apple_complete_reminder` only for those explicit native-reminder writes. `oa_apple_complete_reminder` with completed:false re-opens a completed reminder; `oa_apple_update_reminder` can set, extend, or clear its repeat rule. Updating a title or details must use the update tool, never the complete tool. If the user explicitly asks for Apple Calendar, the Calendar app, iCloud calendar, or a native calendar event, use `oa_apple_add_event` or `oa_apple_list_events`. If macOS access is not granted, report that clearly while still returning the OpenAssist Today result.",
     "For personal memory/history questions like `when did we`, `where did I mention`, `what did we decide`, `what happened in an earlier thread`, `what did Codex/Claude/Spark say`, or `find the previous discussion`, use `oa_personal_recall_search` with phase `memory` first. If memory is not enough, or the user asks for latest/recent conversations, Codex/Claude/Spark results, chats, threads, or sessions, search phase `chats`, then read only the best result with `oa_personal_recall_read`. Use `oa_search_everything` only for older broad OpenAssist-only searches.",
     "If the user asks to add a reminder, task, or to-do inside OpenAssist, create a planner request. By default it goes to the Backlog: only put it on a planner day (Today or a date) when the user explicitly names a date or says today, tonight, tomorrow, or a specific weekday. If they give an alert time, set `reminderAt` as an ISO datetime and `reminderTimezone` when known; do not store the reminder time only as plain details. If they just say `add X` or `add X to @List` with no timing, use `oa_request_backlog_item`, not `oa_request_daily_item`. Do not say you lack planner access.",
     "Reference info is NOT a task: measurements/dimensions, links/URLs, model or SKU numbers, prices, addresses, phone/email, specs, product details, realtor info, and `save this` facts must go to the List/thread reference note with `oa_request_reference`, not Today or Backlog.",
@@ -28244,9 +29141,17 @@ function realtimeKnowledgeProvider(settings: SettingsSnapshot, context?: Persona
   };
 }
 
-function realtimeDirectKnowledgeRequestProvider(settings: SettingsSnapshot): NonNullable<RealtimeProxyConfig["directKnowledgeRequest"]> {
+function realtimeLocalMCPProvider(
+  settings: SettingsSnapshot,
+  provider: RealtimeCloudProvider = settings.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime"
+): RealtimeProxyConfig["localMCP"] {
+  void provider;
+  configureRealtimeLocalMCPHarness(settings.realtimeLocalMCPEnabled, settings.realtimeLocalMCPAllowedServers);
+  if (!settings.realtimeLocalMCPEnabled) return undefined;
   return {
-    run: async ({ prompt }) => (await createDirectKnowledgeVoiceResponseAsync(prompt, settings, "voice"))?.responseText
+    enabled: true,
+    findTools: (args) => realtimeLocalMCPHarness.findTools(args),
+    callTool: (args) => realtimeLocalMCPHarness.callTool(args)
   };
 }
 
@@ -28270,7 +29175,8 @@ async function configureCodexRealtimeProxy(
 	  parallelDelegation?: RealtimeProxyConfig["parallelDelegation"],
 	  codexImageGeneration?: RealtimeProxyConfig["codexImageGeneration"],
 	  continuity?: RealtimeProxyConfig["continuity"],
-	  recallContext?: PersonalRecallContextScope
+	  recallContext?: PersonalRecallContextScope,
+	  contextResources?: LiveVoiceContextResource[]
 	) {
   const snapshot = settings ?? await loadSettings();
   const provider = snapshot.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
@@ -28289,6 +29195,7 @@ async function configureCodexRealtimeProxy(
     organizationID: process.env.OPENAI_ORG_ID,
     projectID: process.env.OPENAI_PROJECT_ID,
     safetyIdentifier: process.env.OPENAI_SAFETY_IDENTIFIER,
+    contextResources,
     handoff,
     directWork,
 	    connection,
@@ -28296,9 +29203,8 @@ async function configureCodexRealtimeProxy(
 	    codexImageGeneration,
 	    continuity,
 	    knowledge: realtimeKnowledgeProvider(snapshot, recallContext),
-    directKnowledgeRequest: realtimeDirectKnowledgeRequestProvider(snapshot),
-    delegationRouter: realtimeDelegationRouter(snapshot),
-    delegationMode: snapshot.realtimeDelegationMode
+    localMCP: realtimeLocalMCPProvider(snapshot, provider),
+    workerPolicy: snapshot.realtimeWorkerPolicy
   });
   return codexRealtimeProxy.ensureStarted();
 }
@@ -28361,6 +29267,14 @@ class CodexAppServerTransport extends EventEmitter {
     }
     const appServerEnv = {
       ...process.env,
+      // Finder-launched apps do not inherit the user's shell PATH. The npm
+      // Codex entrypoint uses `#!/usr/bin/env node`, so include Homebrew and
+      // the other supported CLI locations before spawning it.
+      PATH: assistantPATH(),
+      // The bundled Computer Use runtime uses HOME to discover the shared
+      // macOS service socket. Keep this on the real account home even when an
+      // OpenAssist demo/test isolates its own data under a temporary HOME.
+      HOME: computerUseNativeHome(),
       OPENAI_API_KEY: process.env.LOCAL_REALTIME_CODEX_PLACEHOLDER_API_KEY?.trim() || codexRealtimePlaceholderAPIKey,
       ...(knowledgeAccess ? { OPENASSIST_KNOWLEDGE_TOKEN: knowledgeAccess.token } : {}),
       // Match Codex.app's own environment so the Computer Use MCP plugin (and
@@ -28407,7 +29321,10 @@ class CodexAppServerTransport extends EventEmitter {
       bridgeDebugLog(`Codex app-server process error: ${error.stack ?? error.message}`);
       if (this.process === child) {
         this.process = undefined;
-        this.rejectPending(new Error(`Codex App Server failed to start: ${error.message}`));
+        const friendly = (error as NodeJS.ErrnoException).code === "ENOENT"
+          ? "Codex CLI was not found on this Mac. Install it with `npm install -g @openai/codex`, sign in with `codex login`, then send your message again. No app restart needed. Settings > Models & Connections has guided setup."
+          : `Codex App Server failed to start: ${error.message}`;
+        this.rejectPending(new Error(friendly));
       }
     });
     child.on("exit", (code, signal) => {
@@ -28596,6 +29513,7 @@ type ActiveRealtimeSession = {
   provider: string;
   voiceProvider: RealtimeCloudProvider;
   voiceProviderLabel: string;
+  voiceModel: string;
   workerProvider: string;
   providerBackend: AssistantBackend;
   realtimeTransportClosed?: boolean;
@@ -28727,23 +29645,6 @@ function realtimeErrorMessage(method: string, params: JsonObject) {
     : "Live Voice failed to connect."));
 }
 
-function realtimeDelegationPromptFromItem(params: JsonObject) {
-  const item = runtimeObject(params.item);
-  if (!item) return "";
-  const name = firstRuntimeString(item.name, item.tool, item.toolName);
-  if (name !== "background_agent") return "";
-  const rawArguments = firstRawRuntimeString(item.arguments);
-  let parsedArguments: JsonObject | undefined;
-  if (rawArguments) {
-    try {
-      parsedArguments = runtimeObject(JSON.parse(rawArguments));
-    } catch {
-      parsedArguments = undefined;
-    }
-  }
-  return firstRawRuntimeString(parsedArguments?.prompt, parsedArguments?.task, rawArguments);
-}
-
 function liveVoiceStartTimeout<T>(promise: Promise<T>) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
@@ -28757,7 +29658,11 @@ function liveVoiceStartTimeout<T>(promise: Promise<T>) {
 async function stopActiveRealtimeSession(reason = "stopped") {
   const active = activeRealtimeSession;
   if (!active) return { ok: true };
+	// A user-facing Stop closes the voice transport immediately. Delegated
+	// Codex/Claude work remains owned by the task coordinator.
+	codexRealtimeProxy.closeActiveVoice();
   activeRealtimeSession = null;
+  queueLiveVoiceSessionSummary(active.openAssistThreadID);
   active.realtimeTransportClosed = true;
   codexTransport.off("notification", active.onNotification);
   try {
@@ -28775,6 +29680,7 @@ async function stopActiveRealtimeSession(reason = "stopped") {
       provider: active.voiceProviderLabel,
       voiceProvider: active.voiceProvider,
       voiceProviderLabel: active.voiceProviderLabel,
+      voiceModel: active.voiceModel,
       workerProvider: active.workerProvider,
       delegationActive: false,
       reason
@@ -28810,19 +29716,44 @@ function resolveProjectIDByNameOrID(nameOrID: string | undefined): string | unde
 // Runs several voice-delegated tasks at the same time. Each task gets its own hidden,
 // temporary provider thread so workers cannot overwrite one another or clutter the
 // sidebar. Results still belong to the one visible Voice Log thread.
-function realtimeWorkerExecutionPrompt(prompt: string) {
+async function resolveRealtimeWorkerModel(
+  profile: DelegatedWorkExecutionProfile | undefined,
+  userText: string,
+  settings: Awaited<ReturnType<typeof loadSettings>>
+): Promise<WorkerModelMetadata> {
+  const decision = decideWorkerModelRole({ profile, userText });
+  const catalog = await loadAvailableCodexProviderModels();
+  return resolveWorkerModel({
+    decision,
+    catalog,
+    fastOverride: settings.realtimeFastWorkerModel,
+    deepOverride: settings.realtimeDeepWorkerModel
+  });
+}
+
+function realtimeWorkerExecutionPrompt(prompt: string, worker: WorkerModelMetadata, contextResources?: LiveVoiceContextResource[]) {
+  const executionInstruction = worker.role === "deep"
+    ? "Cross-check authoritative sources, resolve conflicting evidence, state important uncertainty, and return one concise sourced result."
+    : "Use the fastest relevant tools and return one concise sourced result. Stop once you have enough reliable evidence.";
+  const knownContext = (contextResources ?? [])
+    .slice(0, 8)
+    .map((resource) => `- ${resource.kind} ${resource.id}${resource.title ? ` — ${resource.title}` : ""}`);
   return [
     prompt.trim(),
+    "",
+    executionInstruction,
+    "For OpenAssist data (notes, planner, threads, projects) and Apple data (Reminders, Calendar, Messages, Mail), use the oa_* tools only. Never use AppleScript/osascript, and never read databases or app files directly for user data. If a tool fails or lacks permission, stop and report the exact error; do not invent an alternate path or an answer.",
+    "Structure the final answer with these plain-text headings: Result, Sources, Actions taken, and Open questions (include Open questions only if any exist). No JSON.",
+    ...(knownContext.length ? ["", "Known context (ids you can use directly):", ...knownContext] : []),
     "",
     "Return one clear, user-facing final answer. Include the useful result and any required next action. Do not include internal progress messages, tool payloads, queue events, debug logs, or a play-by-play of your work."
   ].join("\n");
 }
 
 async function runRealtimeParallelDelegation(input: {
-  tasks: Array<{ prompt: string; provider?: string; project?: string }>;
+  tasks: Array<{ prompt: string; provider?: string; project?: string; executionProfile?: DelegatedWorkExecutionProfile }>;
   voiceThreadID: string;
   providerThreadID: string;
-  defaultBackend: AssistantBackend;
   options: {
     interactionMode?: string;
     permissionMode?: string;
@@ -28831,6 +29762,7 @@ async function runRealtimeParallelDelegation(input: {
     skillIDs?: string[];
   };
   eventSink?: (event: { type: string; payload?: unknown }) => void;
+  onTaskWorkerResolved: (index: number, metadata: WorkerModelMetadata) => void;
   reportTaskResult: (result: {
     index: number;
     label: string;
@@ -28842,9 +29774,10 @@ async function runRealtimeParallelDelegation(input: {
     failed: boolean;
   }) => void;
 }): Promise<{ accepted: number; skipped: number; note?: string }> {
-  const { tasks, voiceThreadID, providerThreadID, defaultBackend, options, eventSink, reportTaskResult } = input;
+  const { tasks, voiceThreadID, providerThreadID, options, eventSink, onTaskWorkerResolved, reportTaskResult } = input;
   const voiceSession = findSession(voiceThreadID);
   const defaultProjectID = voiceSession?.projectID;
+  const settings = await loadSettings();
   const accepted = tasks.slice(0, MAX_PARALLEL_REALTIME_DELEGATION);
   const skipped = tasks.length - accepted.length;
   bridgeDebugLog(`[realtime.voice] parallel delegation accepted=${accepted.length} skipped=${skipped}`);
@@ -28852,7 +29785,21 @@ async function runRealtimeParallelDelegation(input: {
   await Promise.allSettled(
     accepted.map(async (task, index) => {
       const label = `Task ${String.fromCharCode(65 + index)}`; // Task A, Task B, ...
-      const backend = normalizeBackend(task.provider ?? String(defaultBackend));
+      const requestedBackend = task.provider ? normalizeBackend(task.provider) : "codex";
+      if (task.provider && requestedBackend !== "codex") {
+        reportTaskResult({
+          index,
+          label,
+          agentLabel: "Codex",
+          provider: "Codex",
+          project: task.project,
+          prompt: task.prompt,
+          text: "Live Voice delegated work uses the Codex app-server. Use typed chat for a different provider.",
+          failed: true
+        });
+        return;
+      }
+      const backend: AssistantBackend = "codex";
       const agentLabel = providerLabel(backend);
       const requestedProjectID = task.project ? resolveProjectIDByNameOrID(task.project) : undefined;
       if (task.project && !requestedProjectID) {
@@ -28869,6 +29816,23 @@ async function runRealtimeParallelDelegation(input: {
         return;
       }
       const projectID = requestedProjectID ?? defaultProjectID;
+      let worker: WorkerModelMetadata;
+      try {
+        worker = await resolveRealtimeWorkerModel(task.executionProfile, task.prompt, settings);
+        onTaskWorkerResolved(index, worker);
+      } catch (error) {
+        reportTaskResult({
+          index,
+          label,
+          agentLabel,
+          provider: agentLabel,
+          project: task.project,
+          prompt: task.prompt,
+          text: error instanceof Error ? error.message : "The Codex worker model could not be selected.",
+          failed: true
+        });
+        return;
+      }
       const childThreadID = createOpenAssistThread(projectID, true, true).session.id;
       try {
         await setThreadProvider(childThreadID, backend);
@@ -28876,6 +29840,12 @@ async function runRealtimeParallelDelegation(input: {
         bridgeDebugLog(`[realtime.voice] parallel ${label} setThreadProvider failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       const childSession = findSession(childThreadID);
+      if (childSession) {
+        childSession.modelID = worker.modelID;
+        childSession.latestModel = worker.modelID;
+        childSession.latestReasoningEffort = worker.reasoningEffort;
+        updateSession(childSession);
+      }
       const projectName = childSession?.projectName;
       const runID = `realtime-parallel-${backend}-${index}-${randomUUID().toLowerCase()}`;
 
@@ -28895,6 +29865,11 @@ async function runRealtimeParallelDelegation(input: {
             voiceProvider: activeRealtimeSession?.voiceProvider,
             voiceProviderLabel: activeRealtimeSession?.voiceProviderLabel,
             workerProvider: agentLabel,
+            workerModelRole: worker.role,
+            workerModelID: worker.modelID,
+            workerReasoningEffort: worker.reasoningEffort,
+            workerSelectionReason: worker.selectionReason,
+            workerModelExplicit: worker.explicitlySelected,
             childThreadId: childThreadID,
             voiceThreadId: voiceThreadID,
             prompt: displayPrompt,
@@ -28922,11 +29897,11 @@ async function runRealtimeParallelDelegation(input: {
       emitDelegation("thread/realtime/delegation/started", {});
       try {
         const result = await sendCodexMessage(
-          realtimeWorkerExecutionPrompt(task.prompt),
+          realtimeWorkerExecutionPrompt(task.prompt, worker),
           childThreadID,
           options.pluginIDs ?? [],
           "",
-          options.reasoningEffort,
+          worker.reasoningEffort,
           options.interactionMode,
           options.permissionMode,
           options.skillIDs ?? [],
@@ -28984,6 +29959,7 @@ async function startCodexRealtimeVoice(
     pluginIDs?: string[];
     skillIDs?: string[];
     contextHint?: string;
+    contextResources?: LiveVoiceContextResource[];
     contextProjectID?: string;
     contextProjectName?: string;
     contextThreadID?: string;
@@ -28999,19 +29975,32 @@ async function startCodexRealtimeVoice(
   }
   const realtimeVoiceProvider = settings.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
   const realtimeVoiceProviderLabel = realtimeVoiceProvider === "geminiLive" ? "Gemini Live" : "OpenAI Realtime";
+  const realtimeVoiceModel = realtimeVoiceProvider === "geminiLive"
+    ? settings.realtimeGeminiModel || defaultRealtimeGeminiModel
+    : settings.realtimeOpenAIModel || defaultRealtimeOpenAIModel;
   if (realtimeVoiceProvider === "geminiLive" && !settings.realtimeGeminiAPIKeyConfigured) {
     bridgeDebugLog("[realtime.voice] start blocked: missing Gemini realtime API key");
-    return { ok: false, error: "Add a Google Gemini API key in Settings > Voice & Dictation." };
+    return { ok: false, error: "Add a Google Gemini API key in Settings > Voice & Dictation, then start Live Voice again. No restart needed." };
   }
   if (realtimeVoiceProvider === "openaiRealtime" && !settings.realtimeOpenAIAPIKeyConfigured) {
     bridgeDebugLog("[realtime.voice] start blocked: missing OpenAI realtime API key");
-    return { ok: false, error: "Add an OpenAI API key in Settings > Voice & Dictation." };
+    return { ok: false, error: "Add an OpenAI API key in Settings > Voice & Dictation, then start Live Voice again. No restart needed." };
+  }
+  if (realtimeVoiceProvider === "openaiRealtime") {
+    const modelValidation = validateOpenAIRealtimeConversationModel(realtimeVoiceModel);
+    if (!modelValidation.ok) {
+      bridgeDebugLog(`[realtime.voice] start blocked: unsupported OpenAI realtime model=${realtimeVoiceModel}`);
+      return { ok: false, error: modelValidation.message };
+    }
   }
 
   // The selected chat is context, not storage. Every Live Voice session writes
   // to the one ongoing Voice Log so normal project threads are never polluted.
   let session = ensureRemoteLiveVoiceThread(options.threadID);
   const openAssistThreadID = session.id;
+  // A new session on this thread supersedes any pending end-of-session summary;
+  // it will be re-queued when this session ends.
+  cancelQueuedLiveVoiceSummary(openAssistThreadID);
   if (session.isTemporary === true || session.conversationPersistence === 0) {
     promoteTemporarySession(openAssistThreadID);
     session = findSession(openAssistThreadID) ?? { ...session, isTemporary: false, conversationPersistence: 2 };
@@ -29069,7 +30058,11 @@ async function startCodexRealtimeVoice(
         bridgeDebugLog(`[realtime.voice] Computer Use stale helper cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     }
-    const providerSession = await liveVoiceStartTimeout(ensureCodexProviderSession(openAssistThreadID, realtimeCodexModelID, realtimeRuntimeOptions));
+    // Live Voice restores completed text turns from the Voice Log itself. Its
+    // Codex transport must therefore be fresh and temporary: reusing a normal
+    // Codex task can carry unfinished tool calls into a new voice session and
+    // make every non-trivial response silently fail.
+    const providerSession = await liveVoiceStartTimeout(startCodexRealtimeTransportSession(openAssistThreadID, realtimeCodexModelID, realtimeRuntimeOptions));
     providerThreadID = providerSession.providerSessionID;
     insertedSystemMessage = providerSession.insertedSystemMessage;
     if (backend !== "codex") {
@@ -29093,8 +30086,24 @@ async function startCodexRealtimeVoice(
   const cleanupStartFailure = () => {
     rejectStart = undefined;
   };
+  // One shared Codex worker thread per Live Voice session, so follow-up delegated
+  // tasks keep the context of earlier ones instead of starting cold in a brand-new
+  // thread. It is destroyed when the voice session ends (or when the user asks for
+  // a fresh thread). While it is busy, an overlapping task falls back to its own
+  // one-off thread, which is destroyed right after that task.
+  let liveVoiceWorkerThreadID: string | null = null;
+  let liveVoiceWorkerBusy = false;
+  let liveVoiceWorkerClosed = false;
+  const retireLiveVoiceWorkerThread = () => {
+    const threadID = liveVoiceWorkerThreadID;
+    liveVoiceWorkerThreadID = null;
+    // If a task is still running on it, the task's finally block destroys it.
+    if (threadID && !liveVoiceWorkerBusy) destroyTemporaryThread(threadID);
+  };
   const cleanupRealtimeStart = () => {
     codexTransport.off("notification", onNotification);
+    liveVoiceWorkerClosed = true;
+    retireLiveVoiceWorkerThread();
     const active = activeRealtimeSession;
     if (active?.providerThreadID === providerThreadID) {
       activeRealtimeSession = null;
@@ -29105,7 +30114,7 @@ async function startCodexRealtimeVoice(
   const currentDelegationPrompt = () => lastUserTranscript;
   const emitDelegationRefresh = (type: string, extra: JsonObject = {}) => {
     const taskID = firstRuntimeString(extra.taskID, extra.providerTurnId) || `live-task-${randomUUID().toLowerCase()}`;
-    const workerProvider = firstRuntimeString(extra.workerProvider) || providerDisplayName;
+    const workerProvider = firstRuntimeString(extra.workerProvider) || "Codex";
     eventSink?.({
       type,
       payload: {
@@ -29115,6 +30124,7 @@ async function startCodexRealtimeVoice(
         provider: realtimeVoiceProviderLabel,
         voiceProvider: realtimeVoiceProvider,
         voiceProviderLabel: realtimeVoiceProviderLabel,
+        voiceModel: realtimeVoiceModel,
         workerProvider,
         realtimeTransportClosed: activeRealtimeSession?.realtimeTransportClosed === true,
         ...extra
@@ -29200,18 +30210,41 @@ async function startCodexRealtimeVoice(
   };
 
   const externalRealtimeHandoff: RealtimeProxyConfig["handoff"] = {
-    agentLabel: providerDisplayName,
-    run: async ({ taskID, prompt, signal, onProgress }) => {
+    agentLabel: "Codex",
+    run: async ({ taskID, prompt, userText, executionProfile, freshThread, contextResources, signal, onProgress, onWorkerResolved }) => {
       const promptText = prompt.trim() || "Continue the user's requested task.";
       const latestSettings = await loadSettings();
       const latestSession = findSession(openAssistThreadID) ?? session;
-      const currentBackend = normalizeBackend(String(latestSession?.activeProvider ?? latestSettings.assistantBackend ?? backend));
+      const currentBackend: AssistantBackend = "codex";
       const currentProviderLabel = providerLabel(currentBackend);
-      const temporaryThread = createOpenAssistThread(latestSession?.projectID, true, true).session;
+      const worker = await resolveRealtimeWorkerModel(executionProfile, userText || promptText, latestSettings);
+      onWorkerResolved(worker);
+      // The user asked to start over: drop the shared worker thread and its context.
+      if (freshThread) retireLiveVoiceWorkerThread();
+      let temporaryThread: ReturnType<typeof createOpenAssistThread>["session"] | undefined;
+      let usesSessionWorkerThread = false;
+      if (!liveVoiceWorkerClosed && !liveVoiceWorkerBusy && liveVoiceWorkerThreadID) {
+        const existingThread = findSession(liveVoiceWorkerThreadID);
+        if (existingThread) {
+          temporaryThread = existingThread;
+          usesSessionWorkerThread = true;
+        } else {
+          liveVoiceWorkerThreadID = null;
+        }
+      }
+      if (!temporaryThread) {
+        temporaryThread = createOpenAssistThread(latestSession?.projectID, true, true).session;
+        if (!liveVoiceWorkerClosed && !liveVoiceWorkerBusy && !liveVoiceWorkerThreadID) {
+          liveVoiceWorkerThreadID = temporaryThread.id;
+          usesSessionWorkerThread = true;
+        }
+      }
+      if (usesSessionWorkerThread) liveVoiceWorkerBusy = true;
       temporaryThread.activeProvider = currentBackend;
-      const temporaryModelID = modelForBackend(currentBackend, latestSettings, latestSession);
+      const temporaryModelID = worker.modelID;
       temporaryThread.modelID = temporaryModelID;
       temporaryThread.latestModel = temporaryModelID;
+      temporaryThread.latestReasoningEffort = worker.reasoningEffort;
       temporaryThread.latestInteractionMode = options.interactionMode ?? latestSession?.latestInteractionMode;
       temporaryThread.latestPermissionMode = options.permissionMode ?? latestSession?.latestPermissionMode;
       updateSession(temporaryThread);
@@ -29232,7 +30265,12 @@ async function startCodexRealtimeVoice(
       emitDelegationRefresh("thread/realtime/delegation/started", {
         taskID,
         prompt: promptText,
-        workerProvider: currentProviderLabel
+        workerProvider: currentProviderLabel,
+        workerModelRole: worker.role,
+        workerModelID: worker.modelID,
+        workerReasoningEffort: worker.reasoningEffort,
+        workerSelectionReason: worker.selectionReason,
+        workerModelExplicit: worker.explicitlySelected
       });
 
       const providerEventSink = (providerEvent: ProviderRunEvent) => {
@@ -29248,11 +30286,11 @@ async function startCodexRealtimeVoice(
 
       try {
         const result = await sendCodexMessage(
-          realtimeWorkerExecutionPrompt(promptText),
+          realtimeWorkerExecutionPrompt(promptText, worker, contextResources),
           temporaryThread.id,
           realtimeRuntimeOptions.pluginIDs ?? [],
           "",
-          options.reasoningEffort ?? latestSession?.latestReasoningEffort,
+          worker.reasoningEffort,
           options.interactionMode ?? latestSession?.latestInteractionMode,
           options.permissionMode ?? latestSession?.latestPermissionMode,
           options.skillIDs ?? [],
@@ -29268,6 +30306,11 @@ async function startCodexRealtimeVoice(
           prompt: promptText,
           failed: false,
           workerProvider: currentProviderLabel,
+          workerModelRole: worker.role,
+          workerModelID: worker.modelID,
+          workerReasoningEffort: worker.reasoningEffort,
+          workerSelectionReason: worker.selectionReason,
+          workerModelExplicit: worker.explicitlySelected,
           responseText: output
         });
         return { output, workerProvider: currentProviderLabel };
@@ -29284,7 +30327,16 @@ async function startCodexRealtimeVoice(
         throw error;
       } finally {
         signal.removeEventListener("abort", abort);
-        destroyTemporaryThread(temporaryThread.id);
+        if (usesSessionWorkerThread) {
+          liveVoiceWorkerBusy = false;
+          // Destroy it only if the session ended or the thread was retired mid-task.
+          if (liveVoiceWorkerClosed || liveVoiceWorkerThreadID !== temporaryThread.id) {
+            destroyTemporaryThread(temporaryThread.id);
+            if (liveVoiceWorkerThreadID === temporaryThread.id) liveVoiceWorkerThreadID = null;
+          }
+        } else {
+          destroyTemporaryThread(temporaryThread.id);
+        }
       }
     },
     cancel: (taskID) => stopProviderRun(taskID).then(() => undefined)
@@ -29296,8 +30348,9 @@ async function startCodexRealtimeVoice(
     provider: realtimeVoiceProviderLabel,
     voiceProvider: realtimeVoiceProvider,
     voiceProviderLabel: realtimeVoiceProviderLabel,
-    workerProvider: providerDisplayName,
-    providerBackend: backend,
+    voiceModel: realtimeVoiceModel,
+    workerProvider: "Codex",
+    providerBackend: "codex",
     onNotification,
     eventSink
   };
@@ -29408,7 +30461,8 @@ async function startCodexRealtimeVoice(
 	            provider: realtimeVoiceProviderLabel,
 	            voiceProvider: realtimeVoiceProvider,
 	            voiceProviderLabel: realtimeVoiceProviderLabel,
-	            workerProvider: providerDisplayName,
+	            voiceModel: realtimeVoiceModel,
+	            workerProvider: "Codex",
 	            state: connectionEvent.state,
 	            previousState: connectionEvent.previousState,
 	            reason,
@@ -29441,6 +30495,7 @@ async function startCodexRealtimeVoice(
       if (active?.providerThreadID !== providerThreadID) return;
       active.realtimeTransportClosed = true;
       cleanupRealtimeStart();
+      queueLiveVoiceSessionSummary(openAssistThreadID);
       eventSink?.({
         type: "thread/realtime/closed",
         payload: {
@@ -29460,12 +30515,11 @@ async function startCodexRealtimeVoice(
 
 	  const realtimeParallelDelegation: RealtimeProxyConfig["parallelDelegation"] = {
 	    maxTasks: MAX_PARALLEL_REALTIME_DELEGATION,
-	    run: ({ tasks, reportTaskResult }) =>
+	    run: ({ tasks, onTaskWorkerResolved, reportTaskResult }) =>
 	      runRealtimeParallelDelegation({
         tasks,
         voiceThreadID: openAssistThreadID,
         providerThreadID,
-        defaultBackend: backend,
         options: {
           interactionMode: options.interactionMode,
           permissionMode: options.permissionMode,
@@ -29474,6 +30528,7 @@ async function startCodexRealtimeVoice(
           skillIDs: options.skillIDs
         },
         eventSink,
+		        onTaskWorkerResolved,
 		        reportTaskResult
 	      })
 	  };
@@ -29496,6 +30551,15 @@ async function startCodexRealtimeVoice(
       threadKey: openAssistThreadID,
       bootstrap: liveVoiceBootstrap,
       onCompletedTurn: async (turn) => {
+        // Every finished delegated task passes through here; unresolved ones
+        // become one checkable line in the Open Loops ledger note.
+        if (turn.source === "delegated" && (turn.taskState === "failed" || turn.taskState === "cancelled")) {
+          appendOpenLoopEntry({
+            description: turn.userText,
+            state: turn.taskState,
+            voiceThreadID: openAssistThreadID
+          });
+        }
         const result = persistCompletedTurn({
           threadID: openAssistThreadID,
           backend,
@@ -29510,8 +30574,13 @@ async function startCodexRealtimeVoice(
           interactionMode: realtimeRuntimeOptions.interactionMode,
           permissionMode: realtimeRuntimeOptions.permissionMode,
           realtimeWork: turn.source === "delegated" ? {
-            workerProvider: turn.workerProvider || providerDisplayName,
+            workerProvider: turn.workerProvider || "Codex",
             state: turn.taskState || "completed",
+            workerModelRole: turn.workerModelRole,
+            workerModelID: turn.workerModelID,
+            workerReasoningEffort: turn.workerReasoningEffort,
+            workerSelectionReason: turn.workerSelectionReason,
+            workerModelExplicit: turn.workerModelExplicit,
             startedAt: turn.taskStartedAt,
             finishedAt: turn.taskFinishedAt,
             progressEntries: Array.isArray(turn.progressEntries)
@@ -29541,7 +30610,7 @@ async function startCodexRealtimeVoice(
             provider: turn.provider === "geminiLive" ? "Gemini Live" : "OpenAI Realtime",
             voiceProvider: turn.provider,
             voiceProviderLabel: turn.provider === "geminiLive" ? "Gemini Live" : "OpenAI Realtime",
-            workerProvider: turn.workerProvider || providerDisplayName,
+            workerProvider: turn.workerProvider || "Codex",
             source: turn.source || "direct",
             prompt: turn.source === "delegated" ? turn.userText : "",
             responseText: turn.source === "delegated" ? turn.assistantText : ""
@@ -29573,14 +30642,14 @@ async function startCodexRealtimeVoice(
 	  };
 
 	  try {
-	    const proxyURL = await configureCodexRealtimeProxy(settings, externalRealtimeHandoff, directRealtimeWork, realtimeConnectionEvents, realtimeParallelDelegation, realtimeCodexImageGeneration, realtimeContinuity, recallContext);
+	    const proxyURL = await configureCodexRealtimeProxy(settings, externalRealtimeHandoff, directRealtimeWork, realtimeConnectionEvents, realtimeParallelDelegation, realtimeCodexImageGeneration, realtimeContinuity, recallContext, options.contextResources);
 	    bridgeDebugLog(`[realtime.voice] proxy ready url=${proxyURL} handoff=${providerDisplayName}`);
 	    const realtimeStartPrompt = [
 	      `Start a live voice session for this OpenAssist ${providerDisplayName} thread.`,
 	      openAssistLocalDateInstructions(),
 	      typeof options.contextHint === "string" ? options.contextHint.trim().slice(0, 2400) : "",
 	      codexImageWorkerSelected
-	        ? "Codex Image Worker is selected for this Live session. For image generation or image edits, call request_codex_image_generation directly and do not call background_agent."
+	        ? "Codex Image Worker is selected for this Live session. Use assistant_capability for image generation or image edits; do not delegate image work."
 	        : "",
 	      await pluginSelectionGuidanceText(realtimeRuntimeOptions.pluginIDs ?? [])
 	    ].filter(Boolean).join("\n\n");
@@ -29608,7 +30677,8 @@ async function startCodexRealtimeVoice(
         provider: realtimeVoiceProviderLabel,
         voiceProvider: realtimeVoiceProvider,
         voiceProviderLabel: realtimeVoiceProviderLabel,
-        workerProvider: providerDisplayName,
+        voiceModel: realtimeVoiceModel,
+        workerProvider: "Codex",
         version: "v2"
       }
     });
@@ -30303,7 +31373,8 @@ function threadItemForCompletedSession(session: SessionSummary) {
     age: relativeAge(updatedAt),
     updatedAt,
     isArchived: session.isArchived === true,
-    isTemporary: session.isTemporary === true
+    isTemporary: session.isTemporary === true,
+    kind: session.kind === "liveVoice" ? "liveVoice" : undefined
   } satisfies ThreadItem;
 }
 
@@ -31741,6 +32812,11 @@ function persistCompletedTurn({
   realtimeWork?: {
     workerProvider: string;
     state: "completed" | "failed" | "cancelled";
+    workerModelRole?: "fast" | "deep";
+    workerModelID?: string;
+    workerReasoningEffort?: "medium" | "high";
+    workerSelectionReason?: string;
+    workerModelExplicit?: boolean;
     startedAt?: number;
     finishedAt?: number;
     progressEntries?: Array<{ id: string; text: string; createdAt: number }>;
@@ -31817,6 +32893,11 @@ function persistCompletedTurn({
       realtimeWork: {
         workerProvider: realtimeWork.workerProvider,
         state: realtimeWork.state,
+        workerModelRole: realtimeWork.workerModelRole,
+        workerModelID: realtimeWork.workerModelID,
+        workerReasoningEffort: realtimeWork.workerReasoningEffort,
+        workerSelectionReason: realtimeWork.workerSelectionReason,
+        workerModelExplicit: realtimeWork.workerModelExplicit,
         startedAt: realtimeWork.startedAt,
         finishedAt: realtimeWork.finishedAt,
         prompt: prompt.replace(/\s+/g, " ").trim().slice(0, 700),
@@ -31942,6 +33023,20 @@ async function ensureCodexProviderSession(threadID: string, modelID: string, opt
     }
   }
   return startFreshProviderSession();
+}
+
+async function startCodexRealtimeTransportSession(threadID: string, modelID: string, options: CodexRuntimeOptions = {}) {
+  const session = findSession(threadID) ?? ensureOpenAssistSessionRecord(threadID, "codex", modelID);
+  const params = codexThreadStartParams(session, modelID, options);
+  const started = await codexTransport.request("thread/start", {
+    ...params,
+    ephemeral: true,
+    serviceName: "OpenAssist Live Voice Transport"
+  }) as JsonObject;
+  const thread = started.thread as JsonObject | undefined;
+  const providerSessionID = String(thread?.id ?? "").trim();
+  if (!providerSessionID) throw new Error("Codex did not return a Live Voice transport thread id.");
+  return { providerSessionID, insertedSystemMessage: true };
 }
 
 type OllamaToolContext = {
@@ -32166,6 +33261,17 @@ function canonicalOllamaToolName(name: string) {
     case "list_apple_reminders":
     case "knowledge_apple_list_reminders":
       return "oa_apple_list_reminders";
+    case "apple_search_reminders":
+    case "search_apple_reminders":
+    case "find_apple_reminder":
+    case "knowledge_apple_search_reminders":
+      return "oa_apple_search_reminders";
+    case "apple_update_reminder":
+    case "update_apple_reminder":
+    case "edit_apple_reminder":
+    case "rename_apple_reminder":
+    case "knowledge_apple_update_reminder":
+      return "oa_apple_update_reminder";
     case "apple_complete_reminder":
     case "complete_apple_reminder":
     case "knowledge_apple_complete_reminder":
@@ -32300,6 +33406,7 @@ function ollamaToolIsMutating(name: string) {
 	    || normalizedName === "oa_reject_approval"
 	    || normalizedName === "oa_request_codex_image_generation"
 	    || normalizedName === "oa_apple_add_reminder"
+    || normalizedName === "oa_apple_update_reminder"
     || normalizedName === "oa_apple_complete_reminder"
     || normalizedName === "oa_apple_add_event"
     || normalizedName === "oa_agent_files_write"
@@ -32409,6 +33516,17 @@ function stableToolKey(name: string, args: JsonObject) {
       cleanDailyText(args.calendar ?? "")
     ].join("|");
   }
+  if (normalizedName === "oa_apple_update_reminder") {
+    return [
+      normalizedName,
+      cleanDailyText(args.id ?? args.reminderID ?? ""),
+      dailyItemDedupeCore(args.title ?? args.newTitle ?? ""),
+      cleanDailyText(args.notes ?? args.details ?? ""),
+      cleanDailyText(args.dueDate ?? args.due ?? ""),
+      args.clearNotes === true ? "clear-notes" : "keep-notes",
+      args.clearDueDate === true ? "clear-due" : "keep-due"
+    ].join("|");
+  }
   if (normalizedName === "oa_apple_complete_reminder") {
     return [
       normalizedName,
@@ -32513,7 +33631,7 @@ function filterOllamaToolsForPrompt(
     add("oa_list_approvals", "oa_apply_approval", "oa_reject_approval");
   }
   if (/\b(apple reminders|reminders app|icloud reminders|apple calendar|calendar app|icloud calendar|native calendar)\b/.test(normalized)) {
-    add("oa_connector_status", "oa_apple_add_reminder", "oa_apple_list_reminders", "oa_apple_complete_reminder", "oa_apple_add_event", "oa_apple_list_events");
+    add("oa_connector_status", "oa_apple_add_reminder", "oa_apple_list_reminders", "oa_apple_update_reminder", "oa_apple_complete_reminder", "oa_apple_add_event", "oa_apple_list_events");
   }
 	  if (/\b(agent files|save|write|file|report|dashboard|csv|json|html|artifact|export)\b/.test(normalized)) {
 	    add("oa_agent_files_list", "oa_agent_files_read", "oa_agent_files_write");
@@ -34509,7 +35627,8 @@ function diagnosticString(value: unknown) {
 
 function responseIndicatesComputerUseTimeout(text: string) {
   const compact = text.replace(/\s+/g, " ");
-  return /\b(screen read|list apps|computer\s*use|notes|google chrome|chrome|brave(?:\s+browser)?|safari|firefox|microsoft\s+edge|edge|arc|vivaldi|opera)\b.{0,240}\btimed out after 120 seconds\b/i.test(compact);
+  return /\b(screen read|list apps|computer\s*use|notes|google chrome|chrome|brave(?:\s+browser)?|safari|firefox|microsoft\s+edge|edge|arc|vivaldi|opera)\b.{0,240}\btimed out after 120 seconds\b/i.test(compact)
+    || /\bnative pipe startup failed\b/i.test(compact);
 }
 
 function notificationIsFailedComputerUseToolCall(method: string, params: JsonObject) {
@@ -35359,6 +36478,7 @@ export {
   deleteProjectNotePermanently,
   deleteProjectNoteFolder,
   moveProjectNoteFolder,
+  moveProjectNoteToProject,
   moveProjectNoteToFolder,
   renameProjectNoteFolder,
   deleteSessionPermanently,

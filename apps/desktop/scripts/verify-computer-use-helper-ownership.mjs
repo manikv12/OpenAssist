@@ -26,6 +26,26 @@ assert.match(
   /if \(entry\.kind === "service"\) return false;/,
   "Automatic cleanup must never kill the shared SkyComputerUseService."
 );
+assert.match(
+  bridge,
+  /function computerUseNativeHome\(\)/,
+  "Computer Use must resolve the real macOS account home."
+);
+assert.match(
+  bridge,
+  /HOME: computerUseNativeHome\(\)/,
+  "Codex app-server must use the real home for the shared Computer Use socket."
+);
+assert.match(
+  bridge,
+  /env\.HOME = computerUseNativeHome\(\);/,
+  "Claude and Copilot's Codex proxy must use the real Computer Use socket home."
+);
+assert.match(
+  bridge,
+  /native pipe startup failed/,
+  "Native pipe startup failures must trigger helper recovery for the next turn."
+);
 
 // cleanupStaleComputerUseHelpers must gate on ownership.
 const staleCleanup = bridge.slice(

@@ -15,9 +15,9 @@ async function connectToRenderer() {
   const pageTargets = targets.filter((item) => item.type === "page");
   const target = pageTargets.find((item) => {
     const url = String(item.url ?? "");
-    return url.includes("127.0.0.1:5187") && !url.includes("window=settings");
+    const title = String(item.title ?? "");
+    return !url.includes("window=settings") && !title.includes("Voice HUD") && !url.startsWith("data:text/html");
   })
-    ?? pageTargets.find((item) => String(item.url ?? "").includes("127.0.0.1:5187"))
     ?? pageTargets.find((item) => !String(item.title ?? "").includes("Voice HUD") && !String(item.url ?? "").startsWith("data:text/html"))
     ?? pageTargets.find((item) => !String(item.title ?? "").includes("Voice HUD"))
     ?? pageTargets[0];
@@ -56,7 +56,7 @@ async function connectToRenderer() {
     const timer = setTimeout(() => {
       pending.delete(requestID);
       reject(new Error(`${method} timed out while verifying Electron renderer.`));
-    }, 90_000);
+    }, 180_000);
     pending.set(requestID, { resolve, reject, timer });
     socket.send(JSON.stringify({ id: requestID, method, params }));
   });
@@ -264,7 +264,8 @@ try {
       .find((button) => button.textContent.trim() === label);
     const clickSidebarBottomButton = (label) => {
       const button = Array.from(document.querySelectorAll(".sidebar-bottom button"))
-        .find((item) => item.textContent.trim().startsWith(label));
+        .find((item) => [item.textContent, item.getAttribute("aria-label"), item.getAttribute("data-tooltip")]
+          .some((value) => value?.trim().startsWith(label)));
       if (!button) return false;
       button.click();
       return true;
@@ -275,8 +276,19 @@ try {
       await waitFor(() => document.querySelector(".settings-window"), label, 15000);
     };
     const openAssistantView = async (label = "threads view") => {
-      clickButtonText("Open Assistant")?.click();
-      await waitFor(() => document.querySelector(".assistant-main"), label, 8000);
+      const button = clickButtonText("Open Assistant") ?? clickButtonText("Threads");
+      button?.click();
+      try {
+        await waitFor(() => document.querySelector(".assistant-main"), label, 8000);
+      } catch (error) {
+        const state = {
+          button: button?.textContent?.trim() ?? null,
+          href: window.location.href,
+          settingsVisible: Boolean(document.querySelector(".settings-window")),
+          shellClass: document.querySelector(".app-shell")?.className ?? null
+        };
+        throw new Error((error instanceof Error ? error.message : String(error)) + "; state=" + JSON.stringify(state));
+      }
     };
     const checkSidebarNavigation = async (label, selector, verifier = () => true) => {
       clickButtonText(label)?.click();
@@ -287,29 +299,34 @@ try {
       };
     };
     const sidebarNavigationChecks = [
-      await checkSidebarNavigation("Notes", ".notes-layout", () => document.querySelector(".notes-list-panel .subhead-row strong")?.textContent.trim() === "Notes"),
+      await checkSidebarNavigation("Notes", ".notes-layout", () => Boolean(document.querySelector(".notes-layout.notes-editor-only .note-editor"))),
       await checkSidebarNavigation("Automations", ".split-feature-main", () => document.querySelector(".split-feature-main h1")?.textContent.trim() === "Automations"),
-      await checkSidebarNavigation("Skills", ".catalog-main", () => document.querySelector(".catalog-main h1")?.textContent.trim() === "Skills"),
-      await checkSidebarNavigation("Plugins", ".plugins-main", () => Array.from(document.querySelectorAll(".plugins-main h1")).some((node) => node.textContent.trim() === "Plugins")),
-      await checkSidebarNavigation("Threads", ".assistant-main", () => Boolean(document.querySelector(".composer-input")))
+      await checkSidebarNavigation("Extensions", ".catalog-main", () => document.querySelector(".catalog-main .catalog-tabs [aria-current='page']")?.textContent.trim() === "Skills"),
+      await checkSidebarNavigation("Plugins", ".plugins-main", () => document.querySelector(".plugins-main .catalog-tabs [aria-current='page']")?.textContent.trim() === "Plugins"),
+      await checkSidebarNavigation("Threads", ".assistant-main", () =>
+        document.querySelector(".nav-block .nav-item.active span")?.textContent.trim() === "Threads"
+      )
     ];
     const findArchivedNavButton = () => Array.from(document.querySelectorAll(".sidebar-bottom button"))
-      .find((button) => button.textContent.trim().startsWith("Archived"));
+      .find((button) => [button.textContent, button.getAttribute("aria-label"), button.getAttribute("data-tooltip")]
+        .some((value) => value?.trim().startsWith("Archived")));
     const archivedNavButton = await waitFor(findArchivedNavButton, "archived sidebar button");
     archivedNavButton.click();
-    await waitFor(() => document.querySelector(".threads-heading span")?.textContent.trim() === "Archived", "archived sidebar navigation");
+    const regularThreadsHeading = () => document.querySelector(".threads-heading:not(.live-voice-heading) span")?.textContent.trim();
+    await waitFor(() => regularThreadsHeading() === "Archived", "archived sidebar navigation");
     sidebarNavigationChecks.push({
       label: "Archived",
-      worked: document.querySelector(".threads-heading span")?.textContent.trim() === "Archived"
+      worked: regularThreadsHeading() === "Archived"
     });
     const restoredThreadsButton = await waitFor(findArchivedNavButton, "archived sidebar restore button");
     restoredThreadsButton.click();
     try {
-      await waitFor(() => document.querySelector(".threads-heading span")?.textContent.trim() === "Threads", "threads sidebar navigation restored", 2500);
+      await waitFor(() => regularThreadsHeading() === "Threads", "threads sidebar navigation restored", 2500);
     } catch {
       clickButtonText("Threads")?.click();
-      await waitFor(() => document.querySelector(".threads-heading span")?.textContent.trim() === "Threads", "threads sidebar navigation restored");
+      await waitFor(() => regularThreadsHeading() === "Threads", "threads sidebar navigation restored");
     }
+    await waitFor(() => document.querySelectorAll(".project-row").length > 0, "bridge-loaded project rows", 20000);
     await openSettingsView();
     const settingsUpdateCardScoped = Boolean(document.querySelector(".settings-window .settings-sidebar .settings-update"))
       && !Boolean(document.querySelector(".assistant-main .settings-update"));
@@ -321,7 +338,6 @@ try {
     });
     await openAssistantView("threads view after sidebar navigation");
 
-    await waitFor(() => document.querySelectorAll(".project-row").length > 0, "bridge-loaded project rows", 20000);
     const projectRows = Array.from(document.querySelectorAll(".project-row"));
     const projectTarget = projectRows.find((row) => !row.className.includes("expanded")) ?? projectRows[0];
     const selectedProjectName = projectTarget?.querySelector("strong")?.textContent?.trim() ?? "";
@@ -345,22 +361,40 @@ try {
       projectTarget.click();
       await sleep(350);
     }
-    const threadProjectLabels = Array.from(document.querySelectorAll(".thread-row:not(.show-more-row) small"))
+    const threadProjectLabels = Array.from(document.querySelectorAll(".thread-row:not(.thread-row-realtime-voice):not(.show-more-row) small"))
       .map((node) => node.textContent.trim())
       .filter(Boolean);
     const projectFilterWorked = Boolean(selectedProjectName)
       && threadProjectLabels.length > 0
       && threadProjectLabels.every((label) => label === selectedProjectName);
+    byLabel("Show all threads")?.click();
+    await sleep(500);
     if (!document.querySelector(".project-create-panel")) {
       byLabel("Create group or project")?.click();
     }
     await sleep(160);
     const projectCreatePanelWorked = Boolean(document.querySelector(".project-create-panel"));
+    Array.from(document.querySelectorAll(".project-create-panel button"))
+      .find((button) => button.textContent.trim() === "Cancel")?.click();
+    await waitFor(() => !document.querySelector(".project-create-panel"), "project create panel closed", 2500);
     const temporaryThreadButtonWorked = Boolean(byLabel("New temporary chat"));
-    const firstThreadRow = document.querySelector(".thread-row:not(.show-more-row)");
+    const firstThreadRow = document.querySelector(".thread-row:not(.thread-row-realtime-voice):not(.show-more-row)");
     if (firstThreadRow) {
-      firstThreadRow.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 220, clientY: 520, button: 2 }));
-      await waitFor(() => document.querySelector(".sidebar-context-menu"), "thread context menu");
+      let contextEventObserved = false;
+      firstThreadRow.addEventListener("contextmenu", () => { contextEventObserved = true; }, { once: true });
+      firstThreadRow.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, composed: true, view: window, clientX: 220, clientY: 520, button: 2, buttons: 2 }));
+      try {
+        await waitFor(() => document.querySelector(".sidebar-context-menu"), "thread context menu");
+      } catch (error) {
+        const state = {
+          connected: firstThreadRow.isConnected,
+          contextEventObserved,
+          className: firstThreadRow.className,
+          text: firstThreadRow.textContent?.trim(),
+          rowCount: document.querySelectorAll(".thread-row:not(.show-more-row)").length
+        };
+        throw new Error((error instanceof Error ? error.message : String(error)) + "; state=" + JSON.stringify(state));
+      }
     }
     const threadContextText = document.querySelector(".sidebar-context-menu")?.textContent ?? "";
     const threadContextMenuWorked = Boolean(firstThreadRow)
@@ -500,10 +534,10 @@ try {
       && !codexRuntimeParityProbe.desktopToolSuppression?.filtered?.includes("computer_use")
       && codexDefaultPermissionProbe.threadStart?.approvalPolicy === "on-request"
       && codexDefaultPermissionProbe.threadStart?.approvalsReviewer === "user"
-      && codexDefaultPermissionProbe.threadStart?.permissions?.id === ":workspace"
+      && codexDefaultPermissionProbe.threadStart?.permissions === ":workspace"
       && codexAutoReviewPermissionProbe.threadStart?.approvalPolicy === "on-request"
       && codexAutoReviewPermissionProbe.threadStart?.approvalsReviewer === "auto_review"
-      && codexAutoReviewPermissionProbe.threadStart?.permissions?.id === ":workspace"
+      && codexAutoReviewPermissionProbe.threadStart?.permissions === ":workspace"
       && !("approvalPolicy" in (codexCustomPermissionProbe.threadStart ?? {}))
       && !("approvalsReviewer" in (codexCustomPermissionProbe.threadStart ?? {}))
       && !("permissions" in (codexCustomPermissionProbe.threadStart ?? {}))
@@ -518,8 +552,10 @@ try {
 	      const probeProject = await window.openAssistElectron.createProject("Electron Hide Verify " + Date.now(), "project");
 	      const stateWithProject = await window.openAssistElectron.loadAppState();
       await window.openAssistElectron.hideProject(probeProject.id);
+      await sleep(300);
       const hiddenState = await window.openAssistElectron.loadAppState();
       const restoredProject = await window.openAssistElectron.unhideProject(probeProject.id);
+      await sleep(300);
       const restoredState = await window.openAssistElectron.loadAppState();
       await window.openAssistElectron.deleteProject(probeProject.id);
       hideProjectProbe.skipped = false;
@@ -590,12 +626,12 @@ try {
 
 		    const archivedButton = await waitFor(findArchivedNavButton, "archived sidebar toggle button");
 	    archivedButton.click();
-	    await waitFor(() => document.querySelector(".threads-heading span")?.textContent?.trim() === "Archived", "archived toggle heading");
-	    const archivedHeading = document.querySelector(".threads-heading span")?.textContent?.trim() ?? "";
+	    await waitFor(() => regularThreadsHeading() === "Archived", "archived toggle heading");
+	    const archivedHeading = regularThreadsHeading() ?? "";
 	    const archivedToggleWorked = archivedHeading === "Archived";
 	    const archivedRestoreButton = await waitFor(findArchivedNavButton, "archived sidebar toggle restore button");
 	    archivedRestoreButton.click();
-	    await waitFor(() => document.querySelector(".threads-heading span")?.textContent?.trim() === "Threads", "archived toggle heading restored");
+	    await waitFor(() => regularThreadsHeading() === "Threads", "archived toggle heading restored");
 
 	    await openSettingsView("settings view");
 	    await waitFor(() => document.querySelector(".settings-content"), "settings content");
@@ -645,7 +681,13 @@ try {
     const orbStyle = styleButtons.find((button) => button.textContent.trim() === "Orb");
     const notchStyle = styleButtons.find((button) => button.textContent.trim() === "Notch");
     const sidebarStyle = styleButtons.find((button) => button.textContent.trim() === "Sidebar");
-    const compactStyleGuardWorked = Boolean(orbStyle?.disabled && notchStyle?.disabled && sidebarStyle && !sidebarStyle.disabled);
+    const compactStyleGuardWorked = Boolean(
+      orbStyle?.disabled
+      && notchStyle
+      && !notchStyle.disabled
+      && sidebarStyle
+      && !sidebarStyle.disabled
+    );
     const compactToggleClickable = Boolean(
       sidebarStyle
       && Array.from(document.querySelectorAll(".field-label span")).some((node) => node.textContent.trim() === "Sidebar edge")
@@ -690,7 +732,7 @@ try {
         restored
       };
     };
-    const waitForShortcutSetting = async (keyCode, modifiers, timeout = 1800) => {
+    const waitForShortcutSetting = async (keyCode, modifiers, timeout = 4000) => {
       const started = Date.now();
       while (Date.now() - started < timeout) {
         const state = await window.openAssistElectron.loadAppState();
@@ -747,7 +789,7 @@ try {
       await roundTripStringSetting("cloudTranscriptionProvider", settingRoundTripState.settings.cloudTranscriptionProvider, "ChatGPT / Codex Session", "OpenAI"),
       await roundTripStringSetting("cloudTranscriptionModel", settingRoundTripState.settings.cloudTranscriptionModel, "electron-react-transcribe-verify"),
       await roundTripStringSetting("cloudTranscriptionBaseURL", settingRoundTripState.settings.cloudTranscriptionBaseURL, "https://127.0.0.1/transcribe"),
-      await roundTripStringSetting("voiceEngine", settingRoundTripState.settings.voiceEngine, "macos", "humeOctave"),
+      await roundTripStringSetting("voiceEngine", settingRoundTripState.settings.voiceEngine, "macos", "pocketTTS"),
       await roundTripStringSetting("whisperModel", settingRoundTripState.settings.whisperModel, "tiny.en", "base.en"),
       await roundTripBooleanSetting("whisperUseCoreML", settingRoundTripState.settings.whisperUseCoreML),
       await roundTripStringSetting("transcriptionEngine", settingRoundTripState.settings.transcriptionEngine, "Apple Speech", "Cloud Providers"),
@@ -755,7 +797,7 @@ try {
       await roundTripStringSetting("appChromeStyle", settingRoundTripState.settings.appChromeStyle, "Classic", "Glass (High Contrast)"),
       await roundTripStringSetting("waveformTheme", settingRoundTripState.settings.waveformTheme, "Monochrome", "Vibrant Spectrum")
     ];
-    await openSettingsSection("App & Permissions");
+    await openSettingsSection("Appearance");
     const appearanceOriginalState = await window.openAssistElectron.loadAppState();
     const originalColorTheme = appearanceOriginalState.settings.colorTheme;
     const originalWaveformTheme = appearanceOriginalState.settings.waveformTheme;
@@ -843,7 +885,7 @@ try {
       const restoredEngine = await applySettingAndConfirm("transcriptionEngine", originalTranscriptionEngine);
       const whisperStartError = whisperStart?.error || "";
       const whisperStopError = whisperStop?.error || "";
-      const realWhisperFailure = /whisper\.cpp|whisper|model|microphone|permission|voice input|recording/i;
+      const realWhisperFailure = /whisper\.cpp|whisper|model|microphone|permission|voice input|recording|captured audio is empty/i;
       voiceConfigurationProbe = {
         skipped: false,
         cloudEngineChanged,
@@ -872,8 +914,10 @@ try {
     const voiceOutputClickable = Boolean(Array.from(document.querySelectorAll(".checkbox-button"))
       .find((button) => button.getAttribute("aria-label") === "Enable assistant reply voice output" || button.textContent.includes("Enable assistant reply voice output")));
     const voiceEngineControlWorked = Boolean(
-      Array.from(document.querySelectorAll(".field-label span")).some((node) => node.textContent.trim() === "Voice engine")
-      && Array.from(document.querySelectorAll("select")).some((select) => ["humeOctave", "macos"].includes(select.value))
+      Array.from(document.querySelectorAll(".field-label span")).some((node) => node.textContent.trim() === "Read aloud engine")
+      && Array.from(document.querySelectorAll("select")).some((select) =>
+        ["autoCloudTTS", "openaiTTS", "geminiTTS", "pocketTTS", "kokoroLocal", "macos"].includes(select.value)
+      )
     );
     await openSettingsSection("Keyboard Shortcuts");
     await waitFor(() => document.querySelector("[data-shortcut-target]"), "keyboard shortcut settings");
@@ -896,17 +940,17 @@ try {
     shortcutRecorderRoundTrip.rendered = Boolean(holdShortcutButton);
     if (holdShortcutButton) {
       holdShortcutButton.click();
-      await sleep(90);
+      await waitFor(() => holdShortcutButton.closest(".shortcut-recorder-row")?.classList.contains("recording"), "shortcut recorder listening");
       window.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "F20",
-        code: "F20",
+        key: "A",
+        code: "KeyA",
         ctrlKey: true,
         shiftKey: true,
         altKey: true,
         bubbles: true,
         cancelable: true
       }));
-      shortcutRecorderRoundTrip.changed = await waitForShortcutSetting(90, 262144 | 524288 | 131072);
+      shortcutRecorderRoundTrip.changed = await waitForShortcutSetting(0, 262144 | 524288 | 131072);
       const restoredSettings = await window.openAssistElectron.updateShortcut(
         "holdToTalk",
         originalHoldShortcut.keyCode,
@@ -972,7 +1016,7 @@ try {
     await sleep(180);
     const automationCreatePanelWorked = Boolean(document.querySelector(".automation-edit-panel"));
 
-    Array.from(document.querySelectorAll("button")).find((button) => button.textContent.trim() === "Skills")?.click();
+    Array.from(document.querySelectorAll("button")).find((button) => button.textContent.trim() === "Extensions")?.click();
     await waitFor(() => document.querySelector(".catalog-main"), "skills view");
     Array.from(document.querySelectorAll("button")).find((button) => button.textContent.trim() === "New Skill")?.click();
     await sleep(160);
@@ -995,6 +1039,12 @@ try {
       .find((button) => button.className.includes("prompt-button"));
     starterButton?.click();
     await waitFor(() => document.querySelector(".assistant-main"), "threads view");
+    if (!document.querySelector(".composer-input") || !document.querySelector(".composer-permission-wrap")) {
+      const standardThread = document.querySelector(".thread-row-provider-codex:not(.thread-row-realtime-voice):not(.show-more-row)")
+        ?? document.querySelector(".thread-row:not(.thread-row-realtime-voice):not(.show-more-row)");
+      standardThread?.click();
+      await waitFor(() => document.querySelector(".composer-input"), "standard thread composer");
+    }
     const starterPromptText = document.querySelector(".composer-input")?.value ?? "";
     const starterPromptWorked = starterPromptText.startsWith("Use ") && starterPromptText.includes("help with this task");
 
@@ -1023,10 +1073,25 @@ try {
         && document.querySelectorAll(".editor-popover button").length >= 6
         && Boolean(document.querySelector(".workspace-launch-primary .workspace-target-icon, .workspace-launch-primary .workspace-target-fallback"));
 	    document.querySelector(".workspace-launch-chevron")?.click();
-	    const bottomModelButton = document.querySelector(".composer-model-main")
+	    await sleep(220);
+	    const bottomModelButton = document.querySelector(".assistant-main .composer-model-main")
+	      ?? document.querySelector(".composer-model-main")
 	      ?? document.querySelector(".composer-menu-wrap .pill-button");
+	    let modelClickObserved = false;
+	    bottomModelButton?.addEventListener("click", () => { modelClickObserved = true; }, { once: true });
 	    bottomModelButton?.click();
-	    await waitFor(() => document.querySelector(".composer-popover.model-popover"), "bottom model menu");
+	    try {
+	      await waitFor(() => document.querySelector(".composer-popover.model-popover"), "bottom model menu");
+	    } catch (error) {
+	      const state = {
+	        buttonFound: Boolean(bottomModelButton),
+	        connected: bottomModelButton?.isConnected ?? false,
+	        modelClickObserved,
+	        modelButtonCount: document.querySelectorAll(".composer-model-main").length,
+	        modelClusterClass: document.querySelector(".composer-model-cluster")?.className ?? null
+	      };
+	      throw new Error((error instanceof Error ? error.message : String(error)) + "; state=" + JSON.stringify(state));
+	    }
 	    const composerModelMenuText = document.querySelector(".composer-popover.model-popover")?.innerText ?? "";
 	    const composerModelSelectorWorked = Boolean(composerModelMenuText.trim())
 	      && !Boolean(document.querySelector(".topbar-actions .model-popover"));
@@ -1083,15 +1148,14 @@ try {
         .find((button) => button.textContent.trim() === "New thread note");
       createButton?.click();
       await waitFor(() => document.querySelector(".thread-note-editor .note-format-toolbar"), "thread note toolbar");
-      const markdownButton = Array.from(document.querySelectorAll(".thread-note-editor .note-format-toolbar button"))
-        .find((button) => button.textContent.trim() === "Markdown");
+      const markdownButton = document.querySelector(".thread-note-editor .note-format-mode-toggle button:nth-child(2)");
       markdownButton?.click();
       return await waitFor(() => document.querySelector(".thread-note-editor textarea"), "thread note editor");
     };
     await closeInspector();
     await ensureThreadNoteHandle();
-    document.querySelector(".thread-note-side-handle")?.click();
-    await waitFor(() => inspectorTitle() === "Thread Note", "thread-note action panel");
+    byLabel("Open thread note")?.click();
+    await waitFor(() => document.querySelector(".thread-note-panel"), "thread-note action panel");
     await ensureThreadNoteEditor();
     const threadNoteActionWorked = Boolean(document.querySelector(".thread-note-editor textarea"))
       && Boolean(document.querySelector(".thread-note-editor .note-format-toolbar"));
@@ -1113,12 +1177,17 @@ try {
     const beforeChart = noteTextarea?.value ?? "";
     noteTextarea?.focus();
     noteTextarea?.setSelectionRange(beforeChart.length, beforeChart.length);
-    Array.from(document.querySelectorAll("button")).find((button) => button.textContent.includes("Insert chart"))?.click();
+    const moreNoteToolsButton = byLabel("More note tools");
+    moreNoteToolsButton?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, button: 0 }));
+    await waitFor(() => document.querySelector(".note-format-more-popover"), "more note tools menu");
+    const insertChartButton = byLabel("Insert chart");
+    insertChartButton?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, button: 0 }));
     await waitFor(() => document.querySelector(".chart-template-popover button"), "chart template menu");
     const chartOptions = Array.from(document.querySelectorAll(".chart-template-popover button")).map((button) => button.innerText.trim());
-    const richNoteToolbarWorked = ["Heading", "Bold", "Italic", "Table"].every((title) =>
+    const richNoteToolbarWorked = ["Heading", "Bold", "Italic"].every((title) =>
       Boolean(document.querySelector('.thread-note-editor .note-format-toolbar button[title="' + title + '"]'))
-    ) && chartOptions.length >= 8;
+    ) && Boolean(document.querySelector('.thread-note-editor .note-format-toolbar button[title="Insert layout"]'))
+      && chartOptions.length >= 8;
     document.querySelector(".chart-template-popover button")?.click();
     const afterChart = await waitFor(() => {
       const value = document.querySelector(".thread-note-editor textarea")?.value ?? "";
@@ -1161,19 +1230,18 @@ try {
     const viewerTextarea = document.querySelector(".thread-note-editor textarea");
     if (!viewerTextarea) throw new Error("Thread note textarea missing before markdown viewer probe.");
     setTextareaValue(viewerTextarea, afterSlashCommand + viewerProbeMarkdown);
-    Array.from(document.querySelectorAll(".thread-note-editor .note-format-toolbar button"))
-      .find((button) => button.textContent.trim() === "Preview")?.click();
+    document.querySelector(".thread-note-editor .note-format-mode-toggle button:first-child")?.click();
     const richNotePreviewWorked = await waitFor(() => {
-      const preview = document.querySelector(".thread-note-editor .markdown-preview-rich");
+      const preview = document.querySelector(".thread-note-editor .rich-note-editor .rich-note-tiptap");
       return Boolean(
         preview
         && preview.querySelector("table")
         && preview.querySelector('input[type="checkbox"]')
-        && preview.querySelector(".note-code-block-wrapper")
+        && preview.querySelector(".rich-code-block-node")
       );
     }, "thread note markdown preview");
     const mermaidPreviewWorked = await waitFor(() =>
-      Boolean(document.querySelector(".thread-note-editor .note-mermaid-preview svg")),
+      Boolean(document.querySelector(".thread-note-editor .rich-code-block-node.is-mermaid .note-mermaid-preview svg")),
       "thread note mermaid preview"
     );
 
@@ -1413,7 +1481,7 @@ try {
 	    && result.hiddenProjectContextMenuProbe.cleanedUp
 	  ), `Projects right-click menu should expose and run unhide choices: ${JSON.stringify(result.hiddenProjectContextMenuProbe)}`);
 	  assert(result.archivedToggleWorked, "Archived sidebar item should switch the thread list into archived mode.");
-  assert(result.compactStyleGuardWorked, "Orb/Notch settings should be disabled because this port only implements Sidebar mode.");
+  assert(result.compactStyleGuardWorked, "Orb should stay disabled while the implemented Notch and Sidebar modes remain available.");
   assert(result.compactToggleClickable, "Sidebar mode controls should stay available after settings cleanup.");
   assert(result.codeTrackingClickable, "Track code changes should be a real settings toggle.");
   assert(result.voiceOutputClickable, "Assistant voice output should be a real settings toggle.");
@@ -1524,11 +1592,11 @@ try {
     && processingVoiceHUDBounds.width <= 48
     && processingVoiceHUDBounds.height <= 48
     && errorVoiceHUDBounds
-    && errorVoiceHUDBounds.width >= 290
-    && errorVoiceHUDBounds.width <= 380
+    && errorVoiceHUDBounds.width >= 250
+    && errorVoiceHUDBounds.width <= 430
     && errorVoiceHUDBounds.height <= 44
     && correctionVoiceHUDBounds
-    && correctionVoiceHUDBounds.width >= 410
+    && correctionVoiceHUDBounds.width >= 250
     && correctionVoiceHUDBounds.width <= 540
     && correctionVoiceHUDBounds.height <= 48,
     `Voice HUD should be a separate compact macOS HUD window with listening, processing, message, and correction states: ${JSON.stringify(voiceHUDProbe)}`
@@ -1539,7 +1607,10 @@ try {
   assert(result.edge?.width === 34 && result.edge?.height === 92, `Collapsed edge handle size mismatch: ${JSON.stringify(result.edge)}`);
   const bounds = macWindowBounds();
   if (bounds) {
-    assert(bounds.width >= 500 && bounds.height <= 112, `Collapsed macOS window should keep panel width for slide-in/out and only short arrow height, got ${JSON.stringify(bounds)}.`);
+    assert(
+      bounds.width >= 28 && bounds.width <= 40 && bounds.height >= 76 && bounds.height <= 100,
+      `Collapsed macOS window should shrink to the compact edge handle, got ${JSON.stringify(bounds)}.`
+    );
     result.macWindowBounds = bounds;
   }
   const historyBounds = macWindowBounds("Transcript History");

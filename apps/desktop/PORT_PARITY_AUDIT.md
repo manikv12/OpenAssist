@@ -222,7 +222,7 @@ Build a React + Electron version of OpenAssist inside this repo, while matching 
 - A later stricter verifier run exposed flaky Keychain save/clear timing for provider-key probes; the bridge and verifier were hardened, then `npm run verify:running` passed again.
 - The packaged verifier later exposed stale immediate provider-key status and already-invisible temporary-thread cleanup edge cases; both were fixed and `npm run verify:packaged` now passes.
 - Provider-key verification passed: prompt rewrite `OpenRouter` and cloud transcription `Deepgram` temporary keys were saved and cleared through Keychain, then the original providers were restored.
-- Static fake-data check passed: searching the Electron source for old sample/fallback text such as `Hi Manik`, `Downloads folder`, `Amwins NLS`, `Better one`, `Use Binance`, and fallback arrays returned no hits.
+- Static fake-data check passed: searching the Electron source for old sample/fallback text, private project names, and fallback arrays returned no hits.
 - Provider verification specifically confirmed the menu was exactly `Codex`, `Copilot`, `Claude`, `Ollama`, with no forbidden providers visible, and that an attempted `xAI` provider write did not persist as a chat backend.
 - Settings verification now also confirms prompt rewrite provider/model/base URL and transcription engine write to native defaults and restore cleanly.
 - Packaging verification confirms `verification/` screenshots and metadata are excluded from `out/Open Assist-darwin-arm64/Open Assist.app/Contents/Resources/app`.

@@ -135,6 +135,20 @@ const quickTaskFn = bridge.slice(quickTaskFnStart, bridge.indexOf("\nfunction ",
 assertIncludes(quickTaskFn, "args.reminderAt ?? args.dueAt ?? args.notifyAt", "quickTaskPayload reminder passthrough");
 assertIncludes(quickTaskFn, "reminderTimezone", "quickTaskPayload reminder timezone passthrough");
 
+// The simple-mode (external MCP) trimmed schemas must advertise the reminder
+// fields too — the handlers always accepted reminderAt, but agents whose
+// client validates against the trimmed schema silently dropped it, so
+// "remind me at 5" via Codex never saved a time on request/update tools.
+const simpleToolFnStart = bridge.indexOf("function simpleKnowledgeMCPTool");
+const simpleToolFn = bridge.slice(simpleToolFnStart, bridge.indexOf("\ntype KnowledgeAccessSettings", simpleToolFnStart));
+for (const toolCase of ["oa_request_daily_item", "oa_request_backlog_item", "oa_update_daily_item"]) {
+  const caseStart = simpleToolFn.indexOf(`case "${toolCase}"`);
+  const caseEnd = simpleToolFn.indexOf("case \"", caseStart + 1);
+  const caseBlock = simpleToolFn.slice(caseStart, caseEnd === -1 ? undefined : caseEnd);
+  assertIncludes(caseBlock, "reminderAt", `simple-mode ${toolCase} reminderAt schema`);
+  assertIncludes(caseBlock, "reminderTimezone", `simple-mode ${toolCase} reminderTimezone schema`);
+}
+
 if (packageJSON.scripts?.["verify:reminder-notifications"] !== "node scripts/verify-reminder-notifications.mjs") {
   throw new Error("package.json missing verify:reminder-notifications script.");
 }

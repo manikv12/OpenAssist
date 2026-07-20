@@ -16,6 +16,11 @@ export type ConversationHistorySnapshot = {
 export type RealtimeWorkHistoryItem = {
   taskID: string;
   workerProvider: string;
+  workerModelRole?: "fast" | "deep";
+  workerModelID?: string;
+  workerReasoningEffort?: "medium" | "high";
+  workerSelectionReason?: string;
+  workerModelExplicit?: boolean;
   state: "completed" | "failed" | "cancelled";
   prompt: string;
   resultPreview: string;
@@ -143,6 +148,21 @@ export function extractRealtimeWorkHistory(snapshot: ConversationHistorySnapshot
       return [{
         taskID,
         workerProvider: String(record.workerProvider ?? "Agent").trim() || "Agent",
+        ...(record.workerModelRole === "deep" || record.workerModelRole === "fast"
+          ? { workerModelRole: record.workerModelRole }
+          : {}),
+        ...(typeof record.workerModelID === "string" && record.workerModelID.trim()
+          ? { workerModelID: record.workerModelID.trim() }
+          : {}),
+        ...(record.workerReasoningEffort === "high" || record.workerReasoningEffort === "medium"
+          ? { workerReasoningEffort: record.workerReasoningEffort }
+          : {}),
+        ...(typeof record.workerSelectionReason === "string" && record.workerSelectionReason.trim()
+          ? { workerSelectionReason: record.workerSelectionReason.trim() }
+          : {}),
+        ...(typeof record.workerModelExplicit === "boolean"
+          ? { workerModelExplicit: record.workerModelExplicit }
+          : {}),
         state: state as RealtimeWorkHistoryItem["state"],
         prompt,
         resultPreview,

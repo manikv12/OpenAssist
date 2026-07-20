@@ -53,7 +53,11 @@ import {
   ChevronUp,
   ClipboardPaste,
   Activity,
+  AlarmClock,
+  CalendarDays,
+  Contact,
   Command,
+  HardDrive,
   Cpu,
   Eye,
   EyeOff,
@@ -77,7 +81,9 @@ import {
   Layers3,
   List,
   Link2,
+  ListChecks,
   ListTodo,
+  Mail,
   LockKeyhole,
   LockKeyholeOpen,
   MessageSquare,
@@ -105,6 +111,7 @@ import {
   Square,
   SquarePen,
   Star,
+  StickyNote,
   Strikethrough,
   Sun,
   Table2,
@@ -112,6 +119,7 @@ import {
   Type,
   TriangleAlert,
   UserCircle,
+  Users,
   Volume2,
   WandSparkles,
   Waypoints,
@@ -158,8 +166,18 @@ import copilotMark from "./assets/provider-marks/copilot.svg";
 import ollamaMark from "./assets/provider-marks/ollama.svg";
 import appLogo from "../assets/AppLogo.png";
 import { settingsSections } from "./data";
+import {
+  LiveVoiceSettingsLockControl,
+  LiveVoiceSettingsLockNotice,
+  LiveVoiceSettingsLockProvider
+} from "./components/LiveVoiceSettingsLock";
+import {
+  defaultOpenAIRealtimeModel,
+  liveVoiceSettingsAreLocked,
+  openAIRealtimeModels
+} from "../electron/openAIRealtimeModels";
+import { stopRealtimeAudioSources } from "../electron/realtimeInterruption";
 import type {
-  AppleEventKitStatus,
   AutomationItem,
   BacklogItemMutationResult,
   ChatMessage,
@@ -176,6 +194,10 @@ import type {
   GoogleConnectorOperation,
   GoogleCommandPlan,
   GoogleOAuthSetupStatus,
+  NativePermissionBrokerSnapshot,
+  NativePermissionID,
+  NativePermissionSnapshot,
+  NativePermissionState,
   DailyItem,
   DailyItemInput,
   DailyItemMutationResult,
@@ -215,6 +237,7 @@ import type {
   ProviderRunEvent,
   ProviderUsageSnapshot,
   ProjectItem,
+  ProjectNoteMoveResult,
   ReadAloudAudioResult,
   SettingsSnapshot,
   SettingsUpdateKey,
@@ -270,6 +293,13 @@ type RuntimeProviderKey = Extract<ProviderKey, "codex" | "copilot" | "claudeCode
 type CodexPermissionMode = "default" | "autoReview" | "fullAccess" | "custom";
 type VoiceInputStatus = "idle" | "listening" | "processing" | "unsupported" | "error";
 type LiveVoiceStatus = "idle" | "connecting" | "listening" | "transcribing" | "speaking" | "delegating" | "error";
+type LiveVoiceContextResource = {
+  kind: string;
+  id: string;
+  title?: string;
+  source?: string;
+  attributes?: Record<string, unknown>;
+};
 type LiveVoiceStartOptions = {
   threadID?: string;
   provider?: ProviderKey;
@@ -282,6 +312,7 @@ type LiveVoiceStartOptions = {
   keepCurrentSurface?: boolean;
   statusLabel?: string;
   contextHint?: string;
+  contextResources?: LiveVoiceContextResource[];
   contextProjectID?: string;
   contextProjectName?: string;
   contextThreadID?: string;
@@ -421,6 +452,11 @@ type RealtimeWorkTask = {
   sourceTurnID: string;
   prompt: string;
   workerProvider: string;
+  workerModelRole?: "fast" | "deep";
+  workerModelID?: string;
+  workerReasoningEffort?: "medium" | "high";
+  workerSelectionReason?: string;
+  workerModelExplicit?: boolean;
   state: "queued" | "running" | "completed" | "failed" | "cancelled";
   progress: string;
   progressEntries: RealtimeWorkProgress[];
@@ -530,6 +566,7 @@ type OpenAssistRealtimeAPI = {
     pluginIDs?: string[];
     skillIDs?: string[];
     contextHint?: string;
+    contextResources?: LiveVoiceContextResource[];
     contextProjectID?: string;
     contextProjectName?: string;
     contextThreadID?: string;
@@ -603,16 +640,6 @@ const localVoiceSilenceMs = 1100;
 const localVoiceMinSpeechMs = 300;
 const localVoiceMaxSpeechMs = 22_000;
 const localVoicePreRollMs = 520;
-
-// Cloud realtime (OpenAI / Gemini) input noise gate. Mic frames quieter than the
-// start threshold are replaced with clean silence before they reach the provider,
-// so background voices don't trigger or extend a turn. Hysteresis (a lower
-// "continue" threshold), a short hangover, and a small pre-roll keep the user's
-// own speech from being clipped at the edges. Balanced defaults.
-const liveVoiceGateStartThreshold = 0.015;
-const liveVoiceGateContinueThreshold = 0.009;
-const liveVoiceGateHangoverMs = 450;
-const liveVoiceGatePreRollFrames = 3;
 
 function openAssistRealtimeAPI() {
   return (window as unknown as { openAssistRealtime?: OpenAssistRealtimeAPI }).openAssistRealtime;
@@ -1136,6 +1163,26 @@ function parseInternalNoteHref(href?: string | null): NoteLinkTarget | null {
     const noteId = parsed.searchParams.get("noteId")?.trim() ?? "";
     if ((ownerKind !== "project" && ownerKind !== "thread" && ownerKind !== "planner") || !ownerId || !noteId) return null;
     return { ownerKind, ownerId, noteId };
+  } catch {
+    return null;
+  }
+}
+
+const OPEN_THREAD_LINK_EVENT = "openassist:open-thread-link";
+
+function requestOpenThreadLink(threadID: string) {
+  window.dispatchEvent(new CustomEvent(OPEN_THREAD_LINK_EVENT, { detail: threadID }));
+}
+
+// oa-thread://open?id=<threadID> — deep link from note markdown (e.g. Open Loops
+// ledger lines) to a conversation thread.
+function parseInternalThreadHref(href?: string | null): string | null {
+  if (!href) return null;
+  try {
+    const parsed = new URL(href.replace(/&amp;/g, "&"));
+    if (parsed.protocol !== "oa-thread:" || parsed.hostname !== "open") return null;
+    const threadID = parsed.searchParams.get("id")?.trim() ?? "";
+    return threadID || null;
   } catch {
     return null;
   }
@@ -1681,6 +1728,9 @@ function normalizeRendererSettings(settings: SettingsSnapshot): SettingsSnapshot
 	    realtimeGeminiAPIKeyConfigured: Boolean(settings.realtimeGeminiAPIKeyConfigured),
 	    liveVoiceMode: settings.liveVoiceMode || "openaiRealtime",
 	    liveVoiceEchoGuardEnabled: Boolean(settings.liveVoiceEchoGuardEnabled),
+	    realtimeLocalMCPEnabled: settings.realtimeLocalMCPEnabled ?? true,
+	    realtimeLocalMCPAllowedServers: settings.realtimeLocalMCPAllowedServers || "auto",
+	    realtimeLocalMCPServers: settings.realtimeLocalMCPServers ?? [],
 	    localVoiceModel: settings.localVoiceModel || "gemma4:e2b",
     speechOutputRewriteModel: settings.speechOutputRewriteModel || "gemma4:e2b",
     voiceEngine: settings.voiceEngine || "pocketTTS",
@@ -2084,10 +2134,9 @@ const liveVoiceModeOptions = [
   { value: "localVoiceAgent", label: "Local Voice Agent" }
 ];
 
-const realtimeDelegationModeOptions = [
-  { value: "autoHardTasksOnly", label: "Auto: hard tasks only" },
-  { value: "alwaysDelegate", label: "Always delegate" },
-  { value: "neverDelegate", label: "Never delegate" }
+const realtimeWorkerPolicyOptions = [
+  { value: "auto", label: "Automatic" },
+  { value: "never", label: "Never use workers" }
 ];
 const whisperModelOptions = [
   "tiny",
@@ -2430,10 +2479,11 @@ const cloudTranscriptionProviderOptions = [
   "Google Gemini (AI Studio)",
   "ChatGPT / Codex Session"
 ];
-const realtimeOpenAIModelOptions = [
-  { value: "gpt-realtime-mini", label: "gpt-realtime-mini · lower cost" },
-  { value: "gpt-realtime", label: "gpt-realtime · best quality" }
-];
+const realtimeOpenAIModelOptions = openAIRealtimeModels.map((model) => ({
+  value: model.id,
+  label: `${model.label} · ${model.description}`,
+  group: model.group === "recommended" ? "Recommended" : "Older models"
+}));
 const realtimeVoiceProviderOptions = [
   { value: "openaiRealtime", label: "OpenAI Realtime" },
   { value: "geminiLive", label: "Gemini Live" }
@@ -5406,6 +5456,7 @@ function MarkdownPreviewLink({
   }, [href, localFileBaseDirs]);
 
   const noteTarget = parseInternalNoteHref(href);
+  const threadLinkID = parseInternalThreadHref(href);
   const normalizedExternalHref = normalizeExternalMarkdownHref(href);
   const title = resolvedLocalPath || normalizedExternalHref || props.title || href;
   return (
@@ -5418,6 +5469,12 @@ function MarkdownPreviewLink({
           event.preventDefault();
           event.stopPropagation();
           onOpenNoteLink?.(noteTarget);
+          return;
+        }
+        if (threadLinkID) {
+          event.preventDefault();
+          event.stopPropagation();
+          requestOpenThreadLink(threadLinkID);
           return;
         }
         event.preventDefault();
@@ -6231,11 +6288,16 @@ function transformMarkdownBlock(block: string, transform: MarkdownBlockTransform
     .filter((line) => !/^<!--\s*\/?oa:/.test(line) && !/^:::\s*/.test(line));
   const text = plainLines.join("\n").trim() || "Text";
   const firstLine = stripMarkdownLineSyntax(lines[0] ?? "").trim() || "Heading";
+  const remainingLines = lines.slice(1).join("\n").trim();
+  const headingBlock = (level: 1 | 2 | 3) => {
+    const heading = `${"#".repeat(level)} ${firstLine}`;
+    return remainingLines ? `${heading}\n\n${remainingLines}` : heading;
+  };
 
   if (transform === "text") return text;
-  if (transform === "h1") return `# ${firstLine}`;
-  if (transform === "h2") return `## ${firstLine}`;
-  if (transform === "h3") return `### ${firstLine}`;
+  if (transform === "h1") return headingBlock(1);
+  if (transform === "h2") return headingBlock(2);
+  if (transform === "h3") return headingBlock(3);
   if (transform === "todo") return text.split("\n").map((line) => `- [ ] ${line || "Task"}`).join("\n");
   if (transform === "bullet") return text.split("\n").map((line) => `- ${line || "Item"}`).join("\n");
   if (transform === "numbered") return text.split("\n").map((line, index) => `${index + 1}. ${line || "Step"}`).join("\n");
@@ -7910,9 +7972,16 @@ function MarkdownEditorSurface({
       : null;
     const href = target?.getAttribute("href") ?? target?.href ?? null;
     const noteTarget = parseInternalNoteHref(href);
-    if (!noteTarget) return openExternalMarkdownHref(href);
-    onOpenNoteLink?.(noteTarget);
-    return true;
+    if (noteTarget) {
+      onOpenNoteLink?.(noteTarget);
+      return true;
+    }
+    const threadLinkID = parseInternalThreadHref(href);
+    if (threadLinkID) {
+      requestOpenThreadLink(threadLinkID);
+      return true;
+    }
+    return openExternalMarkdownHref(href);
   }, [onOpenNoteLink]);
   const handleRichEditorClick = (event: React.MouseEvent<HTMLDivElement>) => {
     if (!openNoteLinkFromTarget(event.target)) {
@@ -7922,6 +7991,26 @@ function MarkdownEditorSurface({
     event.preventDefault();
     event.stopPropagation();
     event.nativeEvent.stopImmediatePropagation?.();
+  };
+  const handleRichEditorDoubleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!richEditor || richLocked) return;
+    const target = event.target instanceof Element
+      ? event.target.closest<HTMLElement>("h1, h2, h3, h4, h5, h6")
+      : null;
+    const root = richEditorBodyRef.current?.querySelector<HTMLElement>(".rich-note-tiptap");
+    if (!target || !root?.contains(target)) return;
+    try {
+      const from = richEditor.view.posAtDOM(target, 0, 1);
+      const to = richEditor.view.posAtDOM(target, target.childNodes.length, -1);
+      if (to <= from) return;
+      event.preventDefault();
+      event.stopPropagation();
+      richEditor.chain().focus().setTextSelection({ from, to }).run();
+      savedRichSelectionRef.current = { from, to };
+    } catch {
+      // Let the browser keep its normal double-click behavior if the heading
+      // cannot be mapped to the current ProseMirror document.
+    }
   };
   useEffect(() => {
     if (mode !== "inline") return undefined;
@@ -9606,6 +9695,7 @@ function MarkdownEditorSurface({
           ref={richEditorBodyRef}
           className={cx("markdown-editor-body rich-editor-body", richLocked && "is-locked")}
           onClickCapture={handleRichEditorClick}
+          onDoubleClickCapture={handleRichEditorDoubleClick}
           onKeyDown={handleRichKeyDown}
           onKeyUp={handleRichKeyUp}
           onContextMenu={openRichEditorContextMenu}
@@ -12137,6 +12227,19 @@ function NoteRowMeta({ context, timeMs }: { context?: string; timeMs?: number })
   );
 }
 
+const projectNoteDragType = "application/x-openassist-project-note";
+
+function projectNoteDragPayload(dataTransfer: DataTransfer) {
+  try {
+    const parsed = JSON.parse(dataTransfer.getData(projectNoteDragType)) as { projectID?: unknown; noteID?: unknown };
+    const projectID = typeof parsed.projectID === "string" ? parsed.projectID.trim() : "";
+    const noteID = typeof parsed.noteID === "string" ? parsed.noteID.trim() : "";
+    return projectID && noteID ? { projectID, noteID } : null;
+  } catch {
+    return null;
+  }
+}
+
 function SidebarNotesSection({
   projects,
   selectedProjectID,
@@ -12162,7 +12265,8 @@ function SidebarNotesSection({
   onRenameNoteFolder,
   onDeleteNoteFolder,
   onMoveNoteFolder,
-  onMoveNoteToFolder
+  onMoveNoteToFolder,
+  onMoveNoteToProject
 }: {
   projects: ProjectItem[];
   selectedProjectID?: string;
@@ -12189,6 +12293,7 @@ function SidebarNotesSection({
   onDeleteNoteFolder: (folder: NoteFolderItem) => void;
   onMoveNoteFolder: (folder: NoteFolderItem, parentFolderID: string | null) => void;
   onMoveNoteToFolder: (note: NoteItem, folderID: string | null) => void;
+  onMoveNoteToProject: (note: NoteItem, projectID: string) => void;
 }) {
   const [selectedFolderID, setSelectedFolderID] = useState<string | null>(null);
   const [collapsedFolderIDs, setCollapsedFolderIDs] = useState<Set<string>>(() => new Set());
@@ -12345,6 +12450,19 @@ function SidebarNotesSection({
         onSelect: () => onMoveNoteToFolder(note, folder.id)
       });
     });
+    const moveListItems: SidebarMenuItem[] = projects
+      .filter((project) => project.kind !== "folder" && !sameID(project.id, note.projectID))
+      .map((project) => {
+        const parent = project.parentID
+          ? projects.find((candidate) => sameID(candidate.id, project.parentID))
+          : undefined;
+        return {
+          id: `move-note-list-${project.id}`,
+          label: parent ? `${parent.title} / ${project.title}` : project.title,
+          icon: <Folder size={14} />,
+          onSelect: () => onMoveNoteToProject(note, project.id)
+        };
+      });
     setNoteContextMenu({
       ...menuPosition(event),
       title: note.title,
@@ -12353,7 +12471,9 @@ function SidebarNotesSection({
         ...(!showArchived ? [{ id: "rename-note", label: "Rename Note", icon: <Pencil size={14} />, onSelect: () => onRenameNote(note) }] : []),
         { id: "copy-note-title", label: "Copy Note Title", icon: <Copy size={14} />, onSelect: () => writeTextToClipboard(note.title) },
         { id: "copy-note-id", label: "Copy Note ID", icon: <Command size={14} />, onSelect: () => writeTextToClipboard(note.id) },
-        ...(moveItems.length ? [{ id: "divider-move-note", label: "" }, ...moveItems] : []),
+        ...(moveListItems.length || moveItems.length ? [{ id: "divider-move-note", label: "" }] : []),
+        ...(moveListItems.length ? [{ id: "move-note-list", label: "Move to List", icon: <Folder size={14} />, children: moveListItems }] : []),
+        ...(moveItems.length ? [{ id: "move-note-folder", label: "Move to Folder", icon: <Folder size={14} />, children: moveItems }] : []),
         { id: "divider-delete-note", label: "" },
         ...(showArchived
           ? [
@@ -12513,6 +12633,12 @@ function SidebarNotesSection({
               data-note-focus-key={focusKey ?? undefined}
               className={cx("note-row", activeNoteTarget?.scope === "project" && sameID(note.id, activeNoteTarget.noteID) && "active", isRealtimeFocused && "realtime-focus-flash")}
               style={isRealtimeFocused && realtimeFocus ? realtimeFocusVarStyle(realtimeFocus.color) : undefined}
+              draggable={!showArchived}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData(projectNoteDragType, JSON.stringify({ projectID: note.projectID, noteID: note.id }));
+                event.dataTransfer.setData("text/plain", note.title);
+              }}
               onClick={() => onSelectNote(note)}
               onContextMenu={(event) => openProjectNoteMenu(event, note)}
             >
@@ -12803,6 +12929,7 @@ function Sidebar({
   onDeleteNoteFolder,
   onMoveNoteFolder,
   onMoveNoteToFolder,
+  onMoveNoteToProject,
   onToggleArchivedThreads,
   onCreateProject,
   onCreatePlannerList,
@@ -12891,6 +13018,7 @@ function Sidebar({
   onDeleteNoteFolder: (folder: NoteFolderItem) => void;
   onMoveNoteFolder: (folder: NoteFolderItem, parentFolderID: string | null) => void;
   onMoveNoteToFolder: (note: NoteItem, folderID: string | null) => void;
+  onMoveNoteToProject: (note: NoteItem, projectID: string) => void;
   onToggleArchivedThreads: () => void;
   onCreateProject: (name: string, kind: "project" | "folder", parentID?: string) => Promise<void>;
   onCreatePlannerList: (input: { name: string; area?: string }) => Promise<void>;
@@ -12935,6 +13063,7 @@ function Sidebar({
   const [projectDraftKind, setProjectDraftKind] = useState<"project" | "folder">("project");
   const [projectDraftName, setProjectDraftName] = useState("");
   const [listSearch, setListSearch] = useState("");
+  const [noteDropProjectID, setNoteDropProjectID] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<SidebarContextMenuState | null>(null);
   const visibleThreads = useMemo(() => {
     const firstPage = threads.slice(0, threadLimit);
@@ -13163,7 +13292,10 @@ function Sidebar({
   };
 
   return (
-    <aside className={cx("app-sidebar", showNotesSection && "sidebar-notes-mode", showPlannerSection && "sidebar-planner-mode", !(showThreadSection || showNotesSection || showPlannerSection) && "sidebar-projects-only")}>
+    <aside
+      className={cx("app-sidebar", showNotesSection && "sidebar-notes-mode", showPlannerSection && "sidebar-planner-mode", !(showThreadSection || showNotesSection || showPlannerSection) && "sidebar-projects-only")}
+      onDragEndCapture={() => setNoteDropProjectID(null)}
+    >
       <div className="traffic-spacer" />
       <div className="nav-block">
           {viewItems.map((item) => {
@@ -13335,9 +13467,30 @@ function Sidebar({
                   return (
                     <Fragment key={project.id}>
                       <button
-                        className={cx("project-row", selected && "expanded")}
+                        className={cx("project-row", selected && "expanded", sameID(noteDropProjectID, project.id) && "note-drop-target")}
                         style={{ paddingLeft: 8 + depth * 24 }}
                         onClick={() => onSelectProject(project.id)}
+                        onDragOver={(event) => {
+                          if (!showNotesSection || project.kind === "folder" || !Array.from(event.dataTransfer.types).includes(projectNoteDragType)) return;
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = "move";
+                          setNoteDropProjectID(project.id);
+                        }}
+                        onDragLeave={(event) => {
+                          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                          if (sameID(noteDropProjectID, project.id)) setNoteDropProjectID(null);
+                        }}
+                        onDrop={(event) => {
+                          if (!showNotesSection || project.kind === "folder") return;
+                          const payload = projectNoteDragPayload(event.dataTransfer);
+                          if (!payload) return;
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setNoteDropProjectID(null);
+                          if (sameID(payload.projectID, project.id)) return;
+                          const note = notes.find((candidate) => sameID(candidate.id, payload.noteID) && sameID(candidate.projectID, payload.projectID));
+                          if (note) onMoveNoteToProject(note, project.id);
+                        }}
                         onContextMenu={(event) => {
                           if (showNotesSection) return;
                           event.preventDefault();
@@ -13539,6 +13692,7 @@ function Sidebar({
                 onDeleteNoteFolder={onDeleteNoteFolder}
                 onMoveNoteFolder={onMoveNoteFolder}
                 onMoveNoteToFolder={onMoveNoteToFolder}
+                onMoveNoteToProject={onMoveNoteToProject}
               />
             )}
           </>
@@ -16665,6 +16819,15 @@ function RealtimeWorkDrawer({
                 )}
               </div>
               <p className="realtime-work-prompt">{task.prompt || "Delegated Live Voice task"}</p>
+              {task.workerModelID && (
+                <p className="realtime-work-model">
+                  <span>
+                    {task.workerModelRole === "deep" ? "Deep" : "Fast"} · {task.workerModelID} · {task.workerReasoningEffort || "medium"}
+                    {task.workerModelExplicit ? " · user selected" : ""}
+                  </span>
+                  {task.workerSelectionReason && <small>{task.workerSelectionReason}</small>}
+                </p>
+              )}
               {steps.length > 0 && (
                 <div className={cx("realtime-work-progress", stepsExpanded && "is-open", running && "is-live")}>
                   <div className="realtime-work-progress-head">
@@ -22661,6 +22824,17 @@ function PlannerView({
                       <p className="planner-digest-tomorrow">{digest.tomorrowPreview.join(" · ")}</p>
                     </section>
                   )}
+                  {(digest.openLoops?.length ?? 0) > 0 && (
+                    <section>
+                      <h3>Unresolved agent tasks</h3>
+                      <ul className="planner-digest-open-loops">
+                        {digest.openLoops!.map((entry, index) => (
+                          <li key={index}>{entry}</li>
+                        ))}
+                      </ul>
+                      <p className="planner-digest-tomorrow">Full list with links lives in the “Open Loops” note.</p>
+                    </section>
+                  )}
                 </>
               )}
             </div>
@@ -23886,37 +24060,7 @@ function PluginsView({
   );
 }
 
-function SettingsView({
-  initialSection,
-  onOpenAssistant,
-  onOpenTarget,
-  onRefresh,
-  onSaveTelegramBotToken,
-  onClearTelegramBotToken,
-  onApproveTelegramPairing,
-  onDeclineTelegramPairing,
-  onForgetTelegramPairing,
-  onTestTelegramConnection,
-  onRotateRemoteAccessPairingCode,
-  onClearRemoteAccessPairingCode,
-  onStartRemoteAccessEasyQR,
-  onStopRemoteAccessEasyQR,
-  onSavePromptRewriteAPIKey,
-  onClearPromptRewriteAPIKey,
-  onSaveCloudTranscriptionAPIKey,
-  onClearCloudTranscriptionAPIKey,
-  onSaveRealtimeOpenAIAPIKey,
-  onClearRealtimeOpenAIAPIKey,
-  onSaveRealtimeGeminiAPIKey,
-  onClearRealtimeGeminiAPIKey,
-  onUpdateSetting,
-  onUpdateSettings,
-  onUpdateShortcut,
-  onPreviewColorTheme,
-  settings,
-  settingsLoaded,
-  todayWakeWordStatus
-}: {
+function SettingsView(settingsViewProps: {
   initialSection?: SettingsKey;
   onOpenAssistant: () => void;
   onOpenTarget: (target: string) => Promise<{ ok: boolean; path?: string; error?: string } | undefined>;
@@ -23947,6 +24091,37 @@ function SettingsView({
   settingsLoaded: boolean;
   todayWakeWordStatus?: WakeWordStatus;
 }) {
+  const {
+    initialSection,
+    onOpenAssistant,
+    onOpenTarget,
+    onRefresh,
+    onSaveTelegramBotToken,
+    onClearTelegramBotToken,
+    onApproveTelegramPairing,
+    onDeclineTelegramPairing,
+    onForgetTelegramPairing,
+    onTestTelegramConnection,
+    onRotateRemoteAccessPairingCode,
+    onClearRemoteAccessPairingCode,
+    onStartRemoteAccessEasyQR,
+    onStopRemoteAccessEasyQR,
+    onSavePromptRewriteAPIKey,
+    onClearPromptRewriteAPIKey,
+    onSaveCloudTranscriptionAPIKey,
+    onClearCloudTranscriptionAPIKey,
+    onSaveRealtimeOpenAIAPIKey,
+    onClearRealtimeOpenAIAPIKey,
+    onSaveRealtimeGeminiAPIKey,
+    onClearRealtimeGeminiAPIKey,
+    onUpdateSetting,
+    onUpdateSettings,
+    onUpdateShortcut,
+    onPreviewColorTheme,
+    settings,
+    settingsLoaded,
+    todayWakeWordStatus
+  } = settingsViewProps;
   const [section, setSection] = useState<SettingsKey>(initialSection ?? "assistant");
   const [settingsSearch, setSettingsSearch] = useState("");
   // Briefly marks the section the user just picked via search so it gets an
@@ -24192,7 +24367,7 @@ function SettingsContent({
   const [integrationActionMessage, setIntegrationActionMessage] = useState<string | undefined>(undefined);
   const [integrationBusyID, setIntegrationBusyID] = useState<string | undefined>(undefined);
   const [connectorSnapshot, setConnectorSnapshot] = useState<ConnectorSnapshot | null>(null);
-  const [appleEventKitStatus, setAppleEventKitStatus] = useState<AppleEventKitStatus | null>(null);
+  const [nativePermissionSnapshot, setNativePermissionSnapshot] = useState<NativePermissionBrokerSnapshot | null>(null);
   const [connectorActionMessage, setConnectorActionMessage] = useState<string | undefined>(undefined);
   const [connectorAccountLabel, setConnectorAccountLabel] = useState("");
   const [selectedGoogleAccountID, setSelectedGoogleAccountID] = useState<string | undefined>(undefined);
@@ -24329,8 +24504,8 @@ function SettingsContent({
 
   const refreshAppleEventKitStatus = useCallback(async () => {
     try {
-      const status = await window.openAssistElectron?.appleEventKitStatus?.();
-      if (status) setAppleEventKitStatus(status);
+      const status = await window.openAssistElectron?.getNativePermissions?.();
+      if (status) setNativePermissionSnapshot(status);
       await refreshConnectorSnapshot();
       return status;
     } catch (error) {
@@ -24360,6 +24535,11 @@ function SettingsContent({
     void refreshConnectorSnapshot();
     void refreshAppleEventKitStatus();
   }, [refreshAppleEventKitStatus, refreshConnectorSnapshot, section]);
+
+  useEffect(() => window.openAssistElectron?.onNativePermissionsChanged?.((snapshot) => {
+    setNativePermissionSnapshot(snapshot);
+    if (section === "connectors") void refreshConnectorSnapshot();
+  }), [refreshConnectorSnapshot, section]);
 
   useEffect(() => {
     if (section !== "connectors" || !connectorSnapshot) return;
@@ -24720,20 +24900,33 @@ function SettingsContent({
 
   const connectIntegrationTarget = async (target: OpenAssistIntegrationTargetStatus) => {
     if (target.id === "generic") return;
+    const repairing = target.connected;
     const confirmed = window.confirm(
-      `Connect OpenAssist to ${target.title}?\n\nOpenAssist will update ${target.configPath || "the client config"} and save a timestamped backup first.`
+      repairing
+        ? `Check and repair the OpenAssist entry in ${target.title}?\n\nIf the entry is already correct, nothing changes. Otherwise OpenAssist rewrites it after saving a timestamped backup of ${target.configPath || "the client config"}.`
+        : `Connect OpenAssist to ${target.title}?\n\nOpenAssist will update ${target.configPath || "the client config"} and save a timestamped backup first.`
     );
     if (!confirmed) return;
     setIntegrationBusyID(`connect:${target.id}`);
-    setIntegrationActionMessage(`Connecting ${target.title}...`);
+    setIntegrationActionMessage(repairing ? `Checking ${target.title}...` : `Connecting ${target.title}...`);
     try {
       const result = await window.openAssistElectron?.connectIntegration?.(target.id);
       await refreshIntegrationStatus();
-      setIntegrationActionMessage(
-        result?.backupPath
-          ? `${target.title} connected. Backup saved at ${result.backupPath}.`
-          : `${target.title} connected.`
-      );
+      if (result?.action === "already-connected") {
+        setIntegrationActionMessage(`${target.title} already has OpenAssist set up correctly. Nothing was changed.`);
+      } else if (result?.action === "repaired") {
+        setIntegrationActionMessage(
+          result.backupPath
+            ? `${target.title} entry repaired. Backup saved at ${result.backupPath}.`
+            : `${target.title} entry repaired.`
+        );
+      } else {
+        setIntegrationActionMessage(
+          result?.backupPath
+            ? `${target.title} connected. Backup saved at ${result.backupPath}.`
+            : `${target.title} connected.`
+        );
+      }
       onRefresh();
     } catch (error) {
       setIntegrationActionMessage(error instanceof Error ? error.message : `Could not connect ${target.title}.`);
@@ -25251,6 +25444,26 @@ function SettingsContent({
             label="Allow Realtime Voice to read knowledge"
             onToggle={() => onUpdateSetting("knowledgeRealtimeVoiceAccessEnabled", !(settings?.knowledgeRealtimeVoiceAccessEnabled ?? true))}
           />
+          <Checkbox
+            checked={settings?.realtimeLocalMCPEnabled ?? true}
+            label="Allow GPT Realtime to use approved local MCP tools"
+            onToggle={() => onUpdateSetting("realtimeLocalMCPEnabled", !(settings?.realtimeLocalMCPEnabled ?? true))}
+          />
+          <FieldLabel label="Approved local MCP servers">
+            <input
+              value={settings?.realtimeLocalMCPAllowedServers ?? "auto"}
+              placeholder="auto"
+              onChange={(event) => onUpdateSetting("realtimeLocalMCPAllowedServers", event.target.value)}
+            />
+          </FieldLabel>
+          <p className="settings-helper-line">
+            Use <strong>auto</strong> to allow safe local servers installed in the Codex MCP packages folder. Remote and high-risk servers stay blocked.
+          </p>
+          {(settings?.realtimeLocalMCPServers ?? []).filter((server) => server.allowed).map((server) => (
+            <p className="account-line" key={server.name}>
+              <Terminal size={15} /> {server.name} · {server.status}{server.toolCount ? ` · ${server.toolCount} tools` : ""}
+            </p>
+          ))}
           <p className="settings-helper-line">
             Personal recall sends a few relevant, cleaned text snippets to OpenAI Spark. Local paths, audio, and internal events are not sent.
           </p>
@@ -25363,20 +25576,25 @@ function SettingsContent({
           </div>
           <div className="integration-target-list">
             {(integrationStatus?.targets ?? []).map((target) => {
+              const needsRepair = target.connected && target.healthy === false;
               const statusLabel = target.id === "generic"
                 ? "Manual setup"
+                : needsRepair
+                  ? "Needs repair"
+                  : target.connected
+                    ? "Connected"
+                    : target.detected
+                      ? "Needs setup"
+                      : "Not connected";
+              const statusTone = needsRepair
+                ? "detected"
                 : target.connected
-                  ? "Connected"
-                  : target.detected
-                    ? "Needs setup"
-                    : "Not connected";
-              const statusTone = target.connected
-                ? "connected"
-                : target.id === "generic"
-                  ? "manual"
-                  : target.detected
-                    ? "detected"
-                    : "missing";
+                  ? "connected"
+                  : target.id === "generic"
+                    ? "manual"
+                    : target.detected
+                      ? "detected"
+                      : "missing";
               const connectBusy = integrationBusyID === `connect:${target.id}`;
               const copyConfigBusy = integrationBusyID === `copy-config:${target.id}`;
               const revealConfigBusy = integrationBusyID === `reveal-config:${target.id}`;
@@ -25407,7 +25625,11 @@ function SettingsContent({
                         disabled={connectBusy}
                         onClick={() => void connectIntegrationTarget(target)}
                       >
-                        {connectBusy ? "Connecting..." : target.connected ? "Reconnect" : "Connect"}
+                        {connectBusy
+                          ? (target.connected ? "Checking..." : "Connecting...")
+                          : target.connected
+                            ? "Repair"
+                            : "Connect"}
                       </button>
                     ) : (
                       <button
@@ -25556,14 +25778,24 @@ function SettingsContent({
             onChange={(value) => onUpdateSetting("liveVoiceMode", value || "openaiRealtime")}
           />
           <SettingsSelect
-            label="Delegation"
-            value={settings?.realtimeDelegationMode || "autoHardTasksOnly"}
-            options={realtimeDelegationModeOptions}
-            onChange={(value) => onUpdateSetting("realtimeDelegationMode", value || "autoHardTasksOnly")}
+            label="Worker policy"
+            value={settings?.realtimeWorkerPolicy || "auto"}
+            options={realtimeWorkerPolicyOptions}
+            onChange={(value) => onUpdateSetting("realtimeWorkerPolicy", value || "auto")}
+          />
+          <SettingsTextInput
+            label="Fast worker model (auto = latest Spark)"
+            value={settings?.realtimeFastWorkerModel || "auto"}
+            onCommit={(value) => onUpdateSetting("realtimeFastWorkerModel", value || "auto")}
+          />
+          <SettingsTextInput
+            label="Deep worker model (auto = latest Sol)"
+            value={settings?.realtimeDeepWorkerModel || "auto"}
+            onCommit={(value) => onUpdateSetting("realtimeDeepWorkerModel", value || "auto")}
           />
           <Checkbox
             checked={settings?.liveVoiceEchoGuardEnabled ?? true}
-            label="Pause mic while assistant speaks"
+            label="Prevent assistant audio echo"
             onToggle={() => onUpdateSetting("liveVoiceEchoGuardEnabled", !(settings?.liveVoiceEchoGuardEnabled ?? true))}
           />
           {liveVoiceMode === "localVoiceAgent" && (
@@ -25584,26 +25816,33 @@ function SettingsContent({
           )}
           {liveVoiceMode === "openaiRealtime" && (
             <>
-              <SettingsSelect
-                label="Realtime provider"
-                value={realtimeVoiceProvider}
-                options={realtimeVoiceProviderOptions}
-                onChange={(value) => onUpdateSetting("realtimeVoiceProvider", value || "openaiRealtime")}
-              />
+              <LiveVoiceSettingsLockControl>
+                <SettingsSelect
+                  label="Realtime provider"
+                  value={realtimeVoiceProvider}
+                  options={realtimeVoiceProviderOptions}
+                  onChange={(value) => onUpdateSetting("realtimeVoiceProvider", value || "openaiRealtime")}
+                />
+              </LiveVoiceSettingsLockControl>
+              <LiveVoiceSettingsLockNotice />
               {realtimeVoiceProvider === "geminiLive" ? (
                 <>
-                  <SettingsSelect
-                    label="Gemini Live model"
-                    value={settings?.realtimeGeminiModel || "gemini-3.1-flash-live-preview"}
-                    options={realtimeGeminiModelOptions}
-                    onChange={(value) => onUpdateSetting("realtimeGeminiModel", value || "gemini-3.1-flash-live-preview")}
-                  />
-                  <SettingsSelect
-                    label="Gemini voice"
-                    value={settings?.realtimeGeminiVoice || "Aoede"}
-                    options={realtimeGeminiVoiceOptions}
-                    onChange={(value) => onUpdateSetting("realtimeGeminiVoice", value || "Aoede")}
-                  />
+                  <LiveVoiceSettingsLockControl>
+                    <SettingsSelect
+                      label="Gemini Live model"
+                      value={settings?.realtimeGeminiModel || "gemini-3.1-flash-live-preview"}
+                      options={realtimeGeminiModelOptions}
+                      onChange={(value) => onUpdateSetting("realtimeGeminiModel", value || "gemini-3.1-flash-live-preview")}
+                    />
+                  </LiveVoiceSettingsLockControl>
+                  <LiveVoiceSettingsLockControl>
+                    <SettingsSelect
+                      label="Gemini voice"
+                      value={settings?.realtimeGeminiVoice || "Aoede"}
+                      options={realtimeGeminiVoiceOptions}
+                      onChange={(value) => onUpdateSetting("realtimeGeminiVoice", value || "Aoede")}
+                    />
+                  </LiveVoiceSettingsLockControl>
                   <div className="secure-field provider-credential-box">
                     <span>
                       <strong>Google AI key</strong>
@@ -25649,18 +25888,22 @@ function SettingsContent({
                 </>
               ) : (
                 <>
-                  <SettingsSelect
-                    label="Realtime model"
-                    value={settings?.realtimeOpenAIModel || "gpt-realtime-mini"}
-                    options={realtimeOpenAIModelOptions}
-                    onChange={(value) => onUpdateSetting("realtimeOpenAIModel", value || "gpt-realtime-mini")}
-                  />
-                  <SettingsSelect
-                    label="Realtime voice"
-                    value={settings?.realtimeOpenAIVoice || "marin"}
-                    options={realtimeOpenAIVoiceOptions}
-                    onChange={(value) => onUpdateSetting("realtimeOpenAIVoice", value || "marin")}
-                  />
+                  <LiveVoiceSettingsLockControl>
+                    <SettingsSelect
+                      label="Realtime model"
+                      value={settings?.realtimeOpenAIModel || defaultOpenAIRealtimeModel}
+                      options={realtimeOpenAIModelOptions}
+                      onChange={(value) => onUpdateSetting("realtimeOpenAIModel", value || defaultOpenAIRealtimeModel)}
+                    />
+                  </LiveVoiceSettingsLockControl>
+                  <LiveVoiceSettingsLockControl>
+                    <SettingsSelect
+                      label="Realtime voice"
+                      value={settings?.realtimeOpenAIVoice || "marin"}
+                      options={realtimeOpenAIVoiceOptions}
+                      onChange={(value) => onUpdateSetting("realtimeOpenAIVoice", value || "marin")}
+                    />
+                  </LiveVoiceSettingsLockControl>
                   <div className="secure-field provider-credential-box">
                     <span>
                       <strong>Optional realtime override key</strong>
@@ -25793,13 +26036,13 @@ function SettingsContent({
               <div className="inline-actions">
                 <button
                   type="button"
-                  onClick={() => void window.openAssistElectron?.requestMacOSPermission("speechRecognition")}
+                  onClick={() => void window.openAssistElectron?.openNativePermissionSettings("speech.recognition")}
                 >
                   Open Speech Recognition
                 </button>
                 <button
                   type="button"
-                  onClick={() => void window.openAssistElectron?.requestMacOSPermission("microphone")}
+                  onClick={() => void window.openAssistElectron?.openNativePermissionSettings("speech.microphone")}
                 >
                   Open Microphone
                 </button>
@@ -26501,11 +26744,11 @@ function SettingsContent({
     const needsAttentionGoogleCount = googleAccounts.filter((account) => !googleOAuthStatusByAccount[account.id]?.isLoggedIn).length;
     const openLocalConnectorPermission = async (kind: "fullDiskAccess" = "fullDiskAccess") => {
       try {
-        const result = await window.openAssistElectron?.requestMacOSPermission?.(kind);
+        const result = await window.openAssistElectron?.openNativePermissionSettings?.("electron.fullDiskAccess");
         setConnectorActionMessage(
-          result?.opened
+          result
             ? "Opened macOS Full Disk Access. Turn on Open Assist, then restart the app."
-            : result?.error || "Could not open macOS privacy settings."
+            : "Could not open macOS privacy settings."
         );
       } catch (error) {
         setConnectorActionMessage(error instanceof Error ? error.message : "Could not open macOS privacy settings.");
@@ -26515,18 +26758,48 @@ function SettingsContent({
     const requestAppleAccess = async (service: "reminders" | "calendar") => {
       setConnectorBusyID(`apple-access:${service}`);
       try {
-        const status = await window.openAssistElectron?.requestAppleEventKitAccess?.(service);
-        if (status) setAppleEventKitStatus(status);
+        const permissionID = service === "reminders" ? "eventkit.reminders" : "eventkit.calendar";
+        const currentAccess = nativePermissionSnapshot?.permissions.find((permission) => permission.id === permissionID);
+        const shouldRequest = !currentAccess || currentAccess.state === "notDetermined" || currentAccess.state === "unknown";
+        const action = shouldRequest
+          ? window.openAssistElectron?.requestNativePermission
+          : window.openAssistElectron?.openNativePermissionSettings;
+        if (typeof action !== "function") {
+          throw new Error("This Open Assist build is out of date. Quit it fully and start it again.");
+        }
+        const access = await action(permissionID);
+        const status = await window.openAssistElectron?.getNativePermissions?.();
+        if (status) setNativePermissionSnapshot(status);
         await refreshConnectorSnapshot();
-        setConnectorActionMessage(
-          service === "reminders"
-            ? "Checked Apple Reminders access."
-            : "Checked Apple Calendar access."
-        );
+        const displayName = service === "reminders" ? "Apple Reminders" : "Apple Calendar";
+        setConnectorActionMessage(!shouldRequest
+          ? `Opened ${displayName} settings.`
+          : access.state === "granted"
+          ? `${displayName} access is ready.`
+          : access.state === "devUnsigned"
+            ? `${displayName} helper is not stably signed in this development build.`
+            : `${displayName} access was not granted. ${access.detail}`);
       } catch (error) {
         setConnectorActionMessage(error instanceof Error ? error.message : "Could not request Apple access.");
+        await refreshConnectorSnapshot().catch(() => undefined);
       } finally {
         setConnectorBusyID(undefined);
+      }
+    };
+
+    const connectorServiceIcon = (serviceID: string) => {
+      switch (serviceID) {
+        case "gmail": return <Mail size={15} />;
+        case "googleCalendar":
+        case "appleCalendar": return <CalendarDays size={15} />;
+        case "googleTasks": return <ListChecks size={15} />;
+        case "googleDriveDocs": return <HardDrive size={15} />;
+        case "googlePeople": return <Users size={15} />;
+        case "appleReminders": return <AlarmClock size={15} />;
+        case "appleContacts": return <Contact size={15} />;
+        case "appleNotes": return <StickyNote size={15} />;
+        case "messages": return <MessageSquare size={15} />;
+        default: return <Blocks size={15} />;
       }
     };
 
@@ -26534,15 +26807,26 @@ function SettingsContent({
       if (!account) return null;
       const checked = account.enabledServiceIDs.includes(service.id);
       const busy = connectorBusyID === `${account.id}:${service.id}`;
-      const appleStatus = service.id === "appleReminders"
-        ? appleEventKitStatus?.reminders ?? localAccessByServiceID.get(service.id)
+      const nativePermissionID = service.id === "appleReminders"
+        ? "eventkit.reminders"
         : service.id === "appleCalendar"
-          ? appleEventKitStatus?.calendar ?? localAccessByServiceID.get(service.id)
+          ? "eventkit.calendar"
           : undefined;
+      const nativeAccess = nativePermissionSnapshot?.permissions.find((permission) => permission.id === nativePermissionID);
+      const appleStatus = nativeAccess ? {
+        serviceID: service.id,
+        status: nativeAccess.state === "granted" ? "granted" as const : "blocked" as const,
+        label: nativeAccess.state === "granted" ? "Ready" : nativeAccess.state === "notDetermined" ? "Needs access" : "Blocked",
+        detail: nativeAccess.detail,
+        permissionKind: "appleEventKit" as const
+      } : localAccessByServiceID.get(service.id);
       const accessStatus = service.provider === "local" ? localAccessByServiceID.get(service.id) : appleStatus;
       const showAccessProblem = checked && accessStatus && accessStatus.status !== "granted";
       return (
         <div className={cx("connector-service-row", showAccessProblem && "needs-access")} key={`${account.id}:${service.id}`}>
+          <span aria-hidden="true" className={cx("connector-service-icon", checked && "active")}>
+            {connectorServiceIcon(service.id)}
+          </span>
           <div>
             <span className="connector-service-title-line">
               <strong>{service.displayName}</strong>
@@ -26568,7 +26852,9 @@ function SettingsContent({
                     disabled={connectorBusyID === `apple-access:${service.id === "appleReminders" ? "reminders" : "calendar"}`}
                     onClick={() => { void requestAppleAccess(service.id === "appleReminders" ? "reminders" : "calendar"); }}
                   >
-                    {connectorBusyID === `apple-access:${service.id === "appleReminders" ? "reminders" : "calendar"}` ? "Requesting..." : "Grant Access"}
+                    {connectorBusyID === `apple-access:${service.id === "appleReminders" ? "reminders" : "calendar"}`
+                      ? nativeAccess?.state === "notDetermined" ? "Requesting..." : "Opening..."
+                      : nativeAccess?.state === "notDetermined" ? "Grant Access" : "Open Settings"}
                   </button>
                 )}
               </div>
@@ -27898,23 +28184,40 @@ function SettingsSelect({
 }: {
   label: string;
   value: string;
-  options: Array<string | { value: string; label: string }>;
+  options: Array<string | { value: string; label: string; group?: string }>;
   disabled?: boolean;
   onChange: (value: string) => void;
 }) {
-  const baseOptions = options.map((option) => (
+  const baseOptions: Array<{ value: string; label: string; group?: string }> = options.map((option) => (
     typeof option === "string" ? { value: option, label: option } : option
   ));
   const normalizedOptions = value && !baseOptions.some((option) => option.value === value)
     ? [{ value, label: `Custom: ${value}` }, ...baseOptions]
     : baseOptions;
+  const ungroupedOptions = normalizedOptions.filter((option) => !option.group);
+  const groupedOptions = normalizedOptions.reduce<Array<{ label: string; options: typeof normalizedOptions }>>((groups, option) => {
+    if (!option.group) return groups;
+    const existing = groups.find((group) => group.label === option.group);
+    if (existing) existing.options.push(option);
+    else groups.push({ label: option.group, options: [option] });
+    return groups;
+  }, []);
   return (
     <FieldLabel label={label}>
       <select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
-        {normalizedOptions.map((option) => (
+        {ungroupedOptions.map((option) => (
           <option key={option.value} value={option.value}>
             {option.label}
           </option>
+        ))}
+        {groupedOptions.map((group) => (
+          <optgroup key={group.label} label={group.label}>
+            {group.options.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </optgroup>
         ))}
       </select>
     </FieldLabel>
@@ -28440,33 +28743,29 @@ function ShortcutRecorderRow({
   );
 }
 
-type MacPermissionState = "granted" | "denied" | "not-determined" | "unknown";
-type MacPermissionsSnapshot = {
-  platformSupported: boolean;
-  accessibility: MacPermissionState;
-  screenRecording: MacPermissionState;
-  microphone: MacPermissionState;
-};
-type MacPermissionKind = "accessibility" | "screenRecording" | "microphone" | "speechRecognition" | "automation";
-
-function permissionStatusLabel(state: MacPermissionState) {
+function permissionStatusLabel(state: NativePermissionState) {
   if (state === "granted") return "Granted";
   if (state === "denied") return "Not granted";
-  if (state === "not-determined") return "Not set";
+  if (state === "notDetermined") return "Not set";
+  if (state === "devUnsigned") return "Unstable dev helper";
+  if (state === "identityMismatch") return "Wrong helper identity";
+  if (state === "writeOnly") return "Write only";
+  if (state === "restricted") return "Restricted";
+  if (state === "unavailable") return "Unavailable";
   return "Unknown";
 }
 
 function MacOSPermissionsCard() {
-  const [snapshot, setSnapshot] = useState<MacPermissionsSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<NativePermissionBrokerSnapshot | null>(null);
   const [bridgeError, setBridgeError] = useState<string | null>(null);
-  const [requestingKind, setRequestingKind] = useState<MacPermissionKind | null>(null);
+  const [requestingKind, setRequestingKind] = useState<NativePermissionID | null>(null);
   const isMac = (window.openAssistElectron?.platform ?? "") === "darwin";
 
   useEffect(() => {
     if (!isMac) return;
     let cancelled = false;
     const refresh = async () => {
-      const bridge = window.openAssistElectron?.getMacOSPermissions;
+      const bridge = window.openAssistElectron?.getNativePermissions;
       if (typeof bridge !== "function") {
         if (!cancelled) setBridgeError("This Open Assist build is out of date. Quit it fully and run npm run dev again so the main process picks up the new permission APIs.");
         return;
@@ -28484,37 +28783,53 @@ function MacOSPermissionsCard() {
       }
     };
     void refresh();
-    const intervalID = window.setInterval(refresh, 3_000);
+    const removeListener = window.openAssistElectron?.onNativePermissionsChanged?.((next) => {
+      if (!cancelled) setSnapshot(next);
+    });
+    const refreshOnFocus = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshOnFocus);
     return () => {
       cancelled = true;
-      window.clearInterval(intervalID);
+      removeListener?.();
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshOnFocus);
     };
   }, [isMac]);
 
   if (!isMac) return null;
 
-  const requestPermission = async (kind: MacPermissionKind) => {
+  const requestPermission = async (kind: NativePermissionID, state: NativePermissionState) => {
     setRequestingKind(kind);
     try {
-      await window.openAssistElectron?.requestMacOSPermission(kind);
-      const next = await window.openAssistElectron?.getMacOSPermissions();
+      if (state === "notDetermined" && kind.startsWith("eventkit.")) {
+        await window.openAssistElectron?.requestNativePermission(kind);
+      } else if (kind === "electron.microphone" && state === "notDetermined") {
+        await window.openAssistElectron?.requestNativePermission(kind);
+      } else {
+        await window.openAssistElectron?.openNativePermissionSettings(kind);
+      }
+      const next = await window.openAssistElectron?.getNativePermissions();
       if (next) setSnapshot(next);
     } finally {
       setRequestingKind(null);
     }
   };
 
-  const accessibility = snapshot?.accessibility ?? "unknown";
-  const screenRecording = snapshot?.screenRecording ?? "unknown";
-  const microphone = snapshot?.microphone ?? "unknown";
-  const computerUseBlocked = accessibility !== "granted" || screenRecording !== "granted";
+  const permissionByID = new Map((snapshot?.permissions ?? []).map((permission) => [permission.id, permission]));
+  const computerUsePermissions = [
+    permissionByID.get("computerUse.accessibility"),
+    permissionByID.get("computerUse.screenRecording")
+  ];
+  const computerUseBlocked = computerUsePermissions.some((permission) => permission && permission.state !== "granted" && permission.state !== "unknown");
 
   const renderRow = (
     title: string,
     subtitle: string,
-    state: MacPermissionState,
-    kind: MacPermissionKind
+    kind: NativePermissionID
   ) => {
+    const permission = permissionByID.get(kind);
+    const state = permission?.state ?? "unknown";
     const isGranted = state === "granted";
     const pillClass = isGranted ? "open-pill" : "open-pill open-pill-warning";
     return (
@@ -28522,7 +28837,8 @@ function MacOSPermissionsCard() {
         <span className="permission-status-icon"><Shield size={18} /></span>
         <span className="permission-status-text">
           <strong>{title}</strong>
-          <small>{subtitle}</small>
+          <small>{permission?.detail || subtitle}</small>
+          {permission?.owner.displayName && <small>Used by: {permission.owner.displayName}</small>}
         </span>
         <span className={pillClass}>
           {permissionStatusLabel(state)} {isGranted && <Check size={14} />}
@@ -28530,10 +28846,10 @@ function MacOSPermissionsCard() {
         <button
           type="button"
           className="permission-status-action"
-          onClick={() => void requestPermission(kind)}
+          onClick={() => void requestPermission(kind, state)}
           disabled={requestingKind === kind}
         >
-          {isGranted ? "Re-check" : requestingKind === kind ? "Opening..." : "Grant"}
+          {isGranted ? "Open Settings" : requestingKind === kind ? "Opening..." : state === "notDetermined" ? "Grant" : "Open Settings"}
         </button>
       </div>
     );
@@ -28566,40 +28882,14 @@ function MacOSPermissionsCard() {
           </span>
         </div>
       )}
-      {renderRow(
-        "Accessibility",
-        "Required for Computer Use to attach to other apps.",
-        accessibility,
-        "accessibility"
-      )}
-      {renderRow(
-        "Screen Recording",
-        "Required for Computer Use to read window state and take screenshots.",
-        screenRecording,
-        "screenRecording"
-      )}
-      {renderRow(
-        "Microphone",
-        "Required for dictation and realtime voice.",
-        microphone,
-        "microphone"
-      )}
-      <div className="inline-actions">
-        <button
-          type="button"
-          onClick={() => void requestPermission("automation")}
-          disabled={requestingKind === "automation"}
-        >
-          Open Automation pane
-        </button>
-        <button
-          type="button"
-          onClick={() => void requestPermission("speechRecognition")}
-          disabled={requestingKind === "speechRecognition"}
-        >
-          Open Speech Recognition pane
-        </button>
-      </div>
+      {renderRow("Realtime microphone", "Required for Live Voice.", "electron.microphone")}
+      {renderRow("Apple Reminders", "Used by the EventKit helper.", "eventkit.reminders")}
+      {renderRow("Apple Calendar", "Used by the EventKit helper.", "eventkit.calendar")}
+      {renderRow("Speech microphone", "Used by on-device Apple Speech.", "speech.microphone")}
+      {renderRow("Speech Recognition", "Used by on-device Apple Speech.", "speech.recognition")}
+      {renderRow("Computer Use Accessibility", "Used by the Computer Use helper.", "computerUse.accessibility")}
+      {renderRow("Computer Use Screen Recording", "Used by the Computer Use helper.", "computerUse.screenRecording")}
+      {renderRow("Full Disk Access", "Used by protected local sources.", "electron.fullDiskAccess")}
     </LiquidGlassSurface>
   );
 }
@@ -29671,33 +29961,35 @@ function FeatureRouter({
       );
     case "settings":
       return (
-        <SettingsView
-          initialSection={settingsInitialSection}
-          onOpenAssistant={onOpenAssistant}
-          onRefresh={onRefreshAppState}
-          onOpenTarget={async () => ({ ok: false, error: "Open target is unavailable from this view." })}
-          onSaveTelegramBotToken={async () => undefined}
-          onClearTelegramBotToken={async () => undefined}
-          onApproveTelegramPairing={async () => undefined}
-          onDeclineTelegramPairing={async () => undefined}
-          onForgetTelegramPairing={async () => undefined}
-          onTestTelegramConnection={async () => undefined}
-          onSavePromptRewriteAPIKey={onSavePromptRewriteAPIKey}
-          onClearPromptRewriteAPIKey={onClearPromptRewriteAPIKey}
-          onSaveCloudTranscriptionAPIKey={onSaveCloudTranscriptionAPIKey}
-          onClearCloudTranscriptionAPIKey={onClearCloudTranscriptionAPIKey}
-          onSaveRealtimeOpenAIAPIKey={async () => undefined}
-          onClearRealtimeOpenAIAPIKey={async () => undefined}
-	          onSaveRealtimeGeminiAPIKey={async () => undefined}
-	          onClearRealtimeGeminiAPIKey={async () => undefined}
-	          onUpdateSetting={onUpdateSetting}
-	          onUpdateSettings={onUpdateSettings}
-	          onUpdateShortcut={onUpdateShortcut}
-          onPreviewColorTheme={onPreviewColorTheme}
-          settings={appState.settings}
-          settingsLoaded={settingsLoaded}
-          todayWakeWordStatus={todayWakeWordStatus}
-        />
+        <LiveVoiceSettingsLockProvider locked={liveVoiceSettingsAreLocked(liveVoiceStatus)}>
+          <SettingsView
+            initialSection={settingsInitialSection}
+            onOpenAssistant={onOpenAssistant}
+            onRefresh={onRefreshAppState}
+            onOpenTarget={async () => ({ ok: false, error: "Open target is unavailable from this view." })}
+            onSaveTelegramBotToken={async () => undefined}
+            onClearTelegramBotToken={async () => undefined}
+            onApproveTelegramPairing={async () => undefined}
+            onDeclineTelegramPairing={async () => undefined}
+            onForgetTelegramPairing={async () => undefined}
+            onTestTelegramConnection={async () => undefined}
+            onSavePromptRewriteAPIKey={onSavePromptRewriteAPIKey}
+            onClearPromptRewriteAPIKey={onClearPromptRewriteAPIKey}
+            onSaveCloudTranscriptionAPIKey={onSaveCloudTranscriptionAPIKey}
+            onClearCloudTranscriptionAPIKey={onClearCloudTranscriptionAPIKey}
+            onSaveRealtimeOpenAIAPIKey={async () => undefined}
+            onClearRealtimeOpenAIAPIKey={async () => undefined}
+            onSaveRealtimeGeminiAPIKey={async () => undefined}
+            onClearRealtimeGeminiAPIKey={async () => undefined}
+            onUpdateSetting={onUpdateSetting}
+            onUpdateSettings={onUpdateSettings}
+            onUpdateShortcut={onUpdateShortcut}
+            onPreviewColorTheme={onPreviewColorTheme}
+            settings={appState.settings}
+            settingsLoaded={settingsLoaded}
+            todayWakeWordStatus={todayWakeWordStatus}
+          />
+        </LiveVoiceSettingsLockProvider>
       );
     case "threads":
     default:
@@ -29798,11 +30090,20 @@ function isTodayLiveVoiceThreadTitle(title?: string | null) {
   return title?.trim().toLowerCase() === TODAY_LIVE_VOICE_THREAD_TITLE.toLowerCase();
 }
 
+// Rotated day logs carry titles like "Live Voice · Jul 18"; the kind flag is the
+// durable marker, this title check is a fallback for stale caches.
+function isRotatedLiveVoiceThreadTitle(title?: string | null) {
+  return /^live voice · /i.test(title?.trim() ?? "");
+}
+
 function isTodayLiveVoiceThread(
-  thread?: { id?: string | null; title?: string | null } | null,
+  thread?: { id?: string | null; title?: string | null; kind?: string | null } | null,
   todayThreadID?: string | null
 ) {
-  return isTodayLiveVoiceThreadTitle(thread?.title) || Boolean(thread?.id && todayThreadID && sameID(thread.id, todayThreadID));
+  return thread?.kind === "liveVoice"
+    || isTodayLiveVoiceThreadTitle(thread?.title)
+    || isRotatedLiveVoiceThreadTitle(thread?.title)
+    || Boolean(thread?.id && todayThreadID && sameID(thread.id, todayThreadID));
 }
 
 function readStoredSidebarWidth(): number {
@@ -30051,7 +30352,7 @@ function AppInner() {
       realtimeDedicatedOpenAIAPIKeyConfigured: false,
       realtimeOpenAIAPIKeySource: "missing",
       realtimeMaskedOpenAIAPIKey: "Not configured",
-      realtimeOpenAIModel: "gpt-realtime-mini",
+      realtimeOpenAIModel: defaultOpenAIRealtimeModel,
       realtimeOpenAIVoice: "marin",
       realtimeVoiceProvider: "openaiRealtime",
       realtimeGeminiAPIKeyConfigured: false,
@@ -30062,7 +30363,12 @@ function AppInner() {
 	      liveVoiceEchoGuardEnabled: true,
 	      todayWakeWordEnabled: false,
       todayWakeWordPhrase: "Hey Open Assist",
-      realtimeDelegationMode: "autoHardTasksOnly",
+      realtimeWorkerPolicy: "auto",
+      realtimeFastWorkerModel: "auto",
+      realtimeDeepWorkerModel: "auto",
+      realtimeLocalMCPEnabled: true,
+      realtimeLocalMCPAllowedServers: "auto",
+      realtimeLocalMCPServers: [],
       localVoiceModel: "gemma4:e2b",
       speechOutputRewriteModel: "gemma4:e2b",
       assistantVoiceOutputEnabled: false,
@@ -30339,14 +30645,6 @@ function AppInner() {
   const liveVoiceSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveVoiceChunkTimerRef = useRef<number | null>(null);
   const liveVoiceInputChunksRef = useRef<Float32Array[]>([]);
-  // Cloud realtime input noise gate state: tracks whether the user is currently
-  // speaking, when they last did, and a tiny ring buffer of recent frames used as
-  // pre-roll so the onset of speech isn't clipped.
-  const liveVoiceGateRef = useRef<{ speaking: boolean; lastSpeechAt: number; preRoll: Float32Array[] }>({
-    speaking: false,
-    lastSpeechAt: 0,
-    preRoll: []
-  });
   // TEMP DIAGNOSTIC (realtime audio-flow debugging): tracks mic chunks sent to the
   // realtime session so we can confirm audio is actually leaving the renderer.
   const liveVoiceAudioDiagRef = useRef({ sends: 0, ok: 0, fail: 0, bytes: 0, peakRms: 0, lastLogAt: 0, firstLogged: false });
@@ -30358,6 +30656,7 @@ function AppInner() {
   const liveVoiceMicrophoneReadyRef = useRef(false);
   const liveVoiceStatusRef = useRef<LiveVoiceStatus>("idle");
   const liveVoiceProviderLabelRef = useRef("Live Voice");
+  const liveVoiceModelRef = useRef("");
   const notifiedRealtimeTaskIDsRef = useRef(new Set<string>());
   const liveVoiceExpectedStopRef = useRef(false);
   const liveVoiceStartTokenRef = useRef(0);
@@ -30784,6 +31083,11 @@ function AppInner() {
           sourceTurnID: typeof task.sourceTurnID === "string" ? task.sourceTurnID : taskID,
           prompt: typeof task.prompt === "string" ? task.prompt.trim() : existing?.prompt || "Delegated Live Voice task",
           workerProvider: typeof task.workerProvider === "string" && task.workerProvider.trim() ? task.workerProvider.trim() : existing?.workerProvider || "Agent",
+          workerModelRole: task.workerModelRole === "deep" ? "deep" : task.workerModelRole === "fast" ? "fast" : existing?.workerModelRole,
+          workerModelID: typeof task.workerModelID === "string" ? task.workerModelID.trim() : existing?.workerModelID,
+          workerReasoningEffort: task.workerReasoningEffort === "high" ? "high" : task.workerReasoningEffort === "medium" ? "medium" : existing?.workerReasoningEffort,
+          workerSelectionReason: typeof task.workerSelectionReason === "string" ? task.workerSelectionReason.trim() : existing?.workerSelectionReason,
+          workerModelExplicit: typeof task.workerModelExplicit === "boolean" ? task.workerModelExplicit : existing?.workerModelExplicit,
           state: state as RealtimeWorkTask["state"],
           progress: typeof task.progress === "string" ? task.progress.trim() : progressEntries.at(-1)?.text || existing?.progress || "",
           progressEntries: progressEntries.length ? progressEntries : existing?.progressEntries || [],
@@ -30828,6 +31132,11 @@ function AppInner() {
           sourceTurnID: item.taskID,
           prompt: item.prompt,
           workerProvider: item.workerProvider,
+          workerModelRole: item.workerModelRole,
+          workerModelID: item.workerModelID,
+          workerReasoningEffort: item.workerReasoningEffort,
+          workerSelectionReason: item.workerSelectionReason,
+          workerModelExplicit: item.workerModelExplicit,
           state: item.state,
           progress: historySteps.at(-1)?.text || existing?.progress || "",
           // Keep live in-memory steps if we already have them; otherwise restore
@@ -32225,7 +32534,12 @@ function AppInner() {
     liveVoiceMeterBus.outputPlaying = liveVoiceOutputSourcesRef.current.size > 0;
   };
 
-  const setLiveVoiceListeningStatus = (text = `${liveVoiceProviderLabelRef.current} listening`, preserveHeard = true) => {
+  const liveVoiceRuntimeLabel = () => [
+    liveVoiceProviderLabelRef.current,
+    liveVoiceModelRef.current
+  ].filter(Boolean).join(" · ");
+
+  const setLiveVoiceListeningStatus = (text = `${liveVoiceRuntimeLabel()} listening`, preserveHeard = true) => {
     if (!liveVoiceMicrophoneReadyRef.current) {
       if (liveVoiceStatusRef.current !== "idle") setLiveVoiceStatus("connecting");
       setLiveVoiceStatusText((current) => current || "Opening microphone...");
@@ -32273,19 +32587,7 @@ function AppInner() {
 
   const interruptLiveVoicePlayback = () => {
     const context = liveVoiceOutputContextRef.current;
-    for (const source of liveVoiceOutputSourcesRef.current) {
-      try {
-        source.stop();
-      } catch {
-        // Already stopped or not yet started.
-      }
-      try {
-        source.disconnect();
-      } catch {
-        // Ignore cleanup errors from already-disconnected audio nodes.
-      }
-    }
-    liveVoiceOutputSourcesRef.current.clear();
+    stopRealtimeAudioSources(liveVoiceOutputSourcesRef.current);
     syncLiveVoiceOutputPlaying();
     liveVoicePlaybackTimeRef.current = context ? context.currentTime : 0;
   };
@@ -32305,6 +32607,9 @@ function AppInner() {
     liveVoiceActiveRef.current = false;
     liveVoiceMutedRef.current = false;
     setLiveVoiceMuted(false);
+    // Reflect the user's stop immediately while backend cleanup finishes.
+    setLiveVoiceStatus(nextStatus);
+    setLiveVoiceStatusText(nextText);
     liveVoiceMicrophoneReadyRef.current = false;
     const wasLocalVoiceAgent = localVoiceModeActiveRef.current;
     localVoiceModeActiveRef.current = false;
@@ -32387,7 +32692,6 @@ function AppInner() {
       liveVoiceMutedRef.current = next;
       liveVoiceInputChunksRef.current = [];
       liveVoiceMeterBus.inputLevel = 0;
-      liveVoiceGateRef.current = { speaking: false, lastSpeechAt: 0, preRoll: [] };
       if (next) {
         localVoiceCaptureRef.current = {
           speaking: false,
@@ -32413,11 +32717,6 @@ function AppInner() {
     const api = openAssistRealtimeAPI();
     if (!context || !api || !liveVoiceInputChunksRef.current.length) return;
     if (liveVoiceMutedRef.current) {
-      liveVoiceInputChunksRef.current = [];
-      liveVoiceMeterBus.inputLevel = 0;
-      return;
-    }
-    if (liveVoiceEchoGuardEnabledRef.current && (liveVoiceMeterBus.outputPlaying || liveVoiceStatusRef.current === "speaking")) {
       liveVoiceInputChunksRef.current = [];
       liveVoiceMeterBus.inputLevel = 0;
       return;
@@ -32689,7 +32988,8 @@ function AppInner() {
     }
     if (!(appState.settings.realtimeVoiceEnabled ?? true)) {
       setLiveVoiceStatus("error");
-      setLiveVoiceStatusText("Turn on Realtime conversation in Settings.");
+      setLiveVoiceStatusText("Turn on Realtime conversation in Settings, then try again.");
+      void window.openAssistElectron?.openSettingsWindow?.("voice");
       return;
     }
     const engine = appState.settings.transcriptionEngine || "whisper.cpp";
@@ -32701,7 +33001,8 @@ function AppInner() {
     }
     if (engine === "Cloud Providers" && provider !== "ChatGPT / Codex Session" && !(appState.settings.cloudTranscriptionAPIKeyConfigured ?? false)) {
       setLiveVoiceStatus("error");
-      setLiveVoiceStatusText(`${provider} transcription needs an API key in Settings.`);
+      setLiveVoiceStatusText(`${provider} transcription needs an API key in Settings. Save it, then try again.`);
+      void window.openAssistElectron?.openSettingsWindow?.("voice");
       return;
     }
     if (engine === "whisper.cpp" && !(appState.settings.whisperModelInstalled ?? false)) {
@@ -32796,12 +33097,12 @@ function AppInner() {
     }
   };
 
-  const activeNoteLiveVoiceContextHint = () => {
+  const activeNoteLiveVoiceContext = (): { hint: string; resources: LiveVoiceContextResource[] } => {
     const target = selectedNoteTargetRef.current;
     const detail = noteDetailRef.current;
-    if (activeViewRef.current !== "notes" || !target || !detail) return "";
+    if (activeViewRef.current !== "notes" || !target || !detail) return { hint: "", resources: [] };
     const sourceItemID = selectedNoteTargetToKnowledgeItemID(target);
-    if (!sourceItemID) return "";
+    if (!sourceItemID) return { hint: "", resources: [] };
     const projectByID = new Map(appState.projects.map((project) => [project.id.toLowerCase(), project]));
     const threadProjectID = target.scope === "thread"
       ? target.projectID ?? appState.threads.find((thread) => sameID(thread.id, target.threadID))?.projectID
@@ -32811,7 +33112,7 @@ function AppInner() {
     const category = cleanDailyTagLabel(detail.area) || cleanDailyTagLabel(listProject?.area);
     const tags = (detail.tags ?? []).map(cleanDailyTagLabel).filter(Boolean);
     const excerpt = (noteDraftRef.current || detail.markdown || "").trim().replace(/\s+/g, " ").slice(0, 1600);
-    return [
+    const hint = [
       "This live voice session was started while a note is selected in OpenAssist Notes.",
       `Active source note itemID: ${sourceItemID}.`,
       `Active note title: ${detail.title || "Untitled note"}.`,
@@ -32824,7 +33125,25 @@ function AppInner() {
       "Create a Review Inbox preview first; do not say tasks were created until the user approves.",
       excerpt ? `Active note excerpt: ${excerpt}` : ""
     ].filter(Boolean).join("\n");
+    return {
+      hint,
+      resources: [{
+        kind: "openassist_note",
+        id: sourceItemID,
+        title: detail.title || "Untitled note",
+        source: "openassist_notes",
+        attributes: {
+          scope: target.scope,
+          projectID: listProjectID,
+          threadID: target.scope === "thread" ? target.threadID : undefined,
+          category,
+          tags
+        }
+      }]
+    };
   };
+
+  const activeNoteLiveVoiceContextHint = () => activeNoteLiveVoiceContext().hint;
 
   const startLiveVoice = async (options: LiveVoiceStartOptions = {}) => {
     if ((appState.settings.liveVoiceMode || "openaiRealtime") === "localVoiceAgent") {
@@ -32844,20 +33163,26 @@ function AppInner() {
     }
     if (!(appState.settings.realtimeVoiceEnabled ?? true)) {
       setLiveVoiceStatus("error");
-      setLiveVoiceStatusText("Turn on Realtime conversation in Settings.");
+      setLiveVoiceStatusText("Turn on Realtime conversation in Settings, then press Live again.");
+      void window.openAssistElectron?.openSettingsWindow?.("voice");
       return;
     }
     const realtimeProvider = appState.settings.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
     const realtimeProviderName = realtimeProvider === "geminiLive" ? "Gemini Live" : "OpenAI Realtime";
     liveVoiceProviderLabelRef.current = realtimeProviderName;
+    const realtimeVoiceModel = realtimeProvider === "geminiLive"
+      ? (appState.settings.realtimeGeminiModel || "gemini-3.1-flash-live-preview")
+      : (appState.settings.realtimeOpenAIModel || defaultOpenAIRealtimeModel);
+    liveVoiceModelRef.current = realtimeVoiceModel;
     const realtimeKeyConfigured = realtimeProvider === "geminiLive"
       ? Boolean(appState.settings.realtimeGeminiAPIKeyConfigured)
       : Boolean(appState.settings.realtimeOpenAIAPIKeyConfigured);
     if (!realtimeKeyConfigured) {
       setLiveVoiceStatus("error");
       setLiveVoiceStatusText(realtimeProvider === "geminiLive"
-        ? "Add a Google Gemini API key in Settings."
-        : "Add an OpenAI API key in Settings.");
+        ? "Add a Google Gemini API key in Settings, then press Live again."
+        : "Add an OpenAI API key in Settings, then press Live again.");
+      void window.openAssistElectron?.openSettingsWindow?.("voice");
       return;
     }
     if (nativeVoiceActiveRef.current) await stopVoiceInput();
@@ -32895,7 +33220,9 @@ function AppInner() {
       const composerMentions = composerMentionIDs(composerTextRef.current, appState.plugins, appState.skills);
       const liveVoicePluginIDs = options.pluginIDs ?? Array.from(new Set([...selectedPluginIDs, ...composerMentions.pluginIDs]));
       const liveVoiceSkillIDs = options.skillIDs ?? composerMentions.skillIDs;
-      const contextHint = options.contextHint || activeNoteLiveVoiceContextHint();
+      const selectedResourceContext = activeNoteLiveVoiceContext();
+      const contextHint = options.contextHint || selectedResourceContext.hint;
+      const contextResources = options.contextResources ?? selectedResourceContext.resources;
       const requestedContextProjectID = options.contextProjectID
         || selectedThreadForFallback?.projectID
         || selectedProjectID;
@@ -32921,6 +33248,7 @@ function AppInner() {
           pluginIDs: liveVoicePluginIDs,
           skillIDs: liveVoiceSkillIDs,
           contextHint,
+          contextResources,
           contextProjectID,
           contextProjectName,
           contextThreadID
@@ -32937,6 +33265,9 @@ function AppInner() {
       if (!result.ok) throw new Error(result.error || "Could not start Realtime conversation.");
       const liveThreadID = usableOpenAssistThreadID(result.threadId || targetThreadID);
       if (liveThreadID) {
+        // The bridge may have rotated to a fresh day-log thread; persist its ID so
+        // the next ensureTodayLiveVoiceThread resolves the same thread.
+        saveTodayLiveVoiceThreadID(liveThreadID);
         const existingThread = appState.threads.find((thread) => sameID(thread.id, liveThreadID));
         const fallbackThread: ThreadItem = {
           id: liveThreadID,
@@ -32984,14 +33315,18 @@ function AppInner() {
         ? appState.settings.selectedMicrophoneUID?.trim()
         : "";
       setLiveVoiceStatusText("Opening microphone...");
-      // Echo cancellation stops the mic from picking up the assistant's own voice
-      // out of the speakers (which otherwise triggers false interruptions, garbled
-      // transcripts, and even wrong-language replies). Noise suppression + auto gain
-      // keep background noise from being heard as speech.
-      const liveVoiceAudioProcessing = {
-        echoCancellation: true,
+      // Prefer Chromium's voice-isolation path when it is available. Automatic
+      // gain stays off because it can amplify distant speech and notifications
+      // until they look like the nearby user's voice.
+      const supportedAudioConstraints = navigator.mediaDevices.getSupportedConstraints?.() as
+        | (MediaTrackSupportedConstraints & { voiceIsolation?: boolean })
+        | undefined;
+      const liveVoiceAudioProcessing: MediaTrackConstraints & { voiceIsolation?: boolean } = {
+        echoCancellation: liveVoiceEchoGuardEnabledRef.current,
         noiseSuppression: true,
-        autoGainControl: true
+        autoGainControl: false,
+        channelCount: 1,
+        ...(supportedAudioConstraints?.voiceIsolation ? { voiceIsolation: true } : {})
       };
       let stream: MediaStream;
       try {
@@ -33020,54 +33355,18 @@ function AppInner() {
       const processor = context.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = (event) => {
         if (!liveVoiceActiveRef.current) return;
-        const gate = liveVoiceGateRef.current;
         if (liveVoiceMutedRef.current) {
           liveVoiceInputChunksRef.current = [];
           liveVoiceMeterBus.inputLevel = 0;
-          gate.speaking = false;
-          gate.preRoll = [];
-          return;
-        }
-        if (liveVoiceEchoGuardEnabledRef.current && (liveVoiceMeterBus.outputPlaying || liveVoiceStatusRef.current === "speaking")) {
-          liveVoiceInputChunksRef.current = [];
-          liveVoiceMeterBus.inputLevel = 0;
-          gate.speaking = false;
-          gate.preRoll = [];
           return;
         }
         const channel = event.inputBuffer.getChannelData(0);
         const frame = new Float32Array(channel);
         const rms = rmsForFloatChunk(channel);
-        const now = performance.now();
-        const threshold = gate.speaking ? liveVoiceGateContinueThreshold : liveVoiceGateStartThreshold;
-        if (rms >= threshold) {
-          if (!gate.speaking) {
-            // Speech onset: flush the buffered pre-roll so the first word isn't clipped.
-            for (const preRollFrame of gate.preRoll) {
-              liveVoiceInputChunksRef.current.push(preRollFrame);
-            }
-            gate.preRoll = [];
-            gate.speaking = true;
-          }
-          gate.lastSpeechAt = now;
-        }
-        if (gate.speaking) {
-          liveVoiceMeterBus.inputLevel = rms;
-          liveVoiceInputChunksRef.current.push(frame);
-          // Keep passing real audio through a short hangover so trailing words and
-          // brief pauses survive; then close the gate.
-          if (now - gate.lastSpeechAt > liveVoiceGateHangoverMs) {
-            gate.speaking = false;
-          }
-        } else {
-          // Below threshold: stash recent frames for pre-roll and stream clean
-          // silence so the provider's VAD sees a real pause (and ends the turn)
-          // instead of the background noise that's actually in the room.
-          gate.preRoll.push(frame);
-          if (gate.preRoll.length > liveVoiceGatePreRollFrames) gate.preRoll.shift();
-          liveVoiceMeterBus.inputLevel = 0;
-          liveVoiceInputChunksRef.current.push(new Float32Array(channel.length));
-        }
+        // The cloud provider owns speech-turn detection. Sending the real stream
+        // here avoids a second gate silently discarding normal or quiet speech.
+        liveVoiceMeterBus.inputLevel = rms;
+        liveVoiceInputChunksRef.current.push(frame);
       };
       if (!startStillCurrent()) {
         try { processor.disconnect(); } catch { /* not connected */ }
@@ -33084,7 +33383,6 @@ function AppInner() {
       liveVoiceSourceRef.current = source;
       liveVoiceProcessorRef.current = processor;
       liveVoiceInputChunksRef.current = [];
-      liveVoiceGateRef.current = { speaking: false, lastSpeechAt: 0, preRoll: [] };
       liveVoiceAudioDiagRef.current = { sends: 0, ok: 0, fail: 0, bytes: 0, peakRms: 0, lastLogAt: 0, firstLogged: false };
       liveVoiceMicrophoneReadyRef.current = true;
       liveVoiceActiveRef.current = true;
@@ -33199,7 +33497,10 @@ function AppInner() {
         : thread?.active ?? false
     };
     try {
-      const renamed = thread?.title === TODAY_LIVE_VOICE_THREAD_TITLE
+      // Only name threads the renderer just created. Never rename an existing
+      // thread: the bridge owns rotation and renames old logs to dated titles,
+      // which this must not fight.
+      const renamed = thread
         ? null
         : await electron.renameSession?.(threadID, TODAY_LIVE_VOICE_THREAD_TITLE);
       if (renamed) nextThread = { ...nextThread, ...renamed, active: nextThread.active };
@@ -33363,19 +33664,26 @@ function AppInner() {
 	          ? payload.voiceProviderLabel.trim()
 	          : liveVoiceProviderLabelRef.current;
 	        liveVoiceProviderLabelRef.current = providerName;
+	        const voiceModel = typeof snapshot.voiceModel === "string" && snapshot.voiceModel.trim()
+	          ? snapshot.voiceModel.trim()
+	          : typeof payload.voiceModel === "string" && payload.voiceModel.trim()
+	            ? payload.voiceModel.trim()
+	            : liveVoiceModelRef.current;
+	        liveVoiceModelRef.current = voiceModel;
+	        const runtimeLabel = liveVoiceRuntimeLabel();
 	        const reason = typeof payload.reason === "string" ? payload.reason : "";
 	        if (voicePhase === "closed" || proxyState === "idle") {
 	          setLiveVoiceStatus("idle");
 	          setLiveVoiceStatusText(undefined);
 	        } else if (voicePhase === "error") {
 	          setLiveVoiceStatus("error");
-	          setLiveVoiceStatusText(reason || `${providerName} needs attention.`);
+	          setLiveVoiceStatusText(reason || `${runtimeLabel} needs attention.`);
 	        } else if (voicePhase === "speaking" || proxyState === "narrating") {
 	          setLiveVoiceStatus("speaking");
-	          setLiveVoiceStatusText(`${providerName} speaking`);
+	          setLiveVoiceStatusText(`${runtimeLabel} speaking`);
 	        } else if (voicePhase === "quiet") {
 	          setLiveVoiceStatus("listening");
-	          setLiveVoiceStatusText("Quiet mode");
+	          setLiveVoiceStatusText("Replies paused. Say \"I'm back\" to resume.");
 	        } else if (snapshot.foregroundWork || proxyState === "toolPending") {
 	          setLiveVoiceStatus("listening");
 	          setLiveVoiceStatusText(reason.includes("function_call") ? "Checking OpenAssist..." : "OpenAssist is checking...");
@@ -33521,7 +33829,7 @@ function AppInner() {
       }
       if (isRealtimeOutputAudioDeltaEvent(type, lowerType)) {
         setLiveVoiceStatus("speaking");
-        setLiveVoiceStatusText((current) => current && /^heard:/i.test(current) ? current : `${liveVoiceProviderLabelRef.current} speaking`);
+        setLiveVoiceStatusText((current) => current && /^heard:/i.test(current) ? current : `${liveVoiceRuntimeLabel()} speaking`);
         void playRealtimeAudio(event.payload).catch((error) => {
           setLiveVoiceStatus("error");
           setLiveVoiceStatusText(error instanceof Error ? error.message : "Could not play Realtime conversation audio.");
@@ -34202,8 +34510,15 @@ function AppInner() {
     const unsubscribeOpenThread = window.openAssistElectron?.onOpenThread?.((threadID) => {
       if (usableOpenAssistThreadID(threadID)) void selectThreadRef.current(threadID);
     });
+    // oa-thread:// links in note markdown (Open Loops ledger) route here.
+    const onThreadLink = (event: Event) => {
+      const threadID = String((event as CustomEvent).detail ?? "");
+      if (usableOpenAssistThreadID(threadID)) void selectThreadRef.current(threadID);
+    };
+    window.addEventListener(OPEN_THREAD_LINK_EVENT, onThreadLink);
     return () => {
       window.removeEventListener("focus", onFocus);
+      window.removeEventListener(OPEN_THREAD_LINK_EVENT, onThreadLink);
       unsubscribeOpenThread?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -34771,7 +35086,13 @@ function AppInner() {
       return;
     }
     if (target.ownerKind === "project") {
-      await openSelectedNoteTarget({ scope: "project", projectID: target.ownerId, noteID: target.noteId });
+      const linkedNote = appState.notes.find((item) => sameID(item.id, target.noteId) && sameID(item.projectID, target.ownerId))
+        ?? appState.notes.find((item) => sameID(item.id, target.noteId));
+      await openSelectedNoteTarget({
+        scope: "project",
+        projectID: linkedNote?.projectID ?? target.ownerId,
+        noteID: target.noteId
+      });
       return;
     }
     const threadNote = appState.threadNotes.find((item) =>
@@ -35100,6 +35421,80 @@ function AppInner() {
         sameID(item.id, note.id) && sameID(item.projectID, note.projectID) ? { ...item, folderID } : item
       )
     }));
+  };
+
+  const moveNoteToProjectFromMenu = async (note: NoteItem, destinationProjectID: string) => {
+    if (sameID(note.projectID, destinationProjectID)) return;
+    const currentTarget = selectedNoteTargetRef.current;
+    const movingOpenNote = currentTarget?.scope === "project"
+      && sameID(currentTarget.projectID, note.projectID)
+      && sameID(currentTarget.noteID, note.id);
+    if (movingOpenNote) await flushNoteDraftBeforeNavigation();
+
+    let result: ProjectNoteMoveResult | undefined;
+    try {
+      result = await window.openAssistElectron?.moveNoteToProject(note.projectID, note.id, destinationProjectID);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not move the note to that List.");
+      return;
+    }
+    if (!result) return;
+
+    const remapMovedNoteTarget = (target: SelectedNoteTarget): SelectedNoteTarget =>
+      target.scope === "project" && sameID(target.projectID, result!.sourceProjectID) && sameID(target.noteID, note.id)
+        ? { ...target, projectID: result!.destinationProjectID }
+        : target;
+    setNoteNavigationBackStack((stack) => {
+      const nextStack = stack.map(remapMovedNoteTarget);
+      noteNavigationBackStackRef.current = nextStack;
+      return nextStack;
+    });
+    setNoteNavigationForwardStack((stack) => {
+      const nextStack = stack.map(remapMovedNoteTarget);
+      noteNavigationForwardStackRef.current = nextStack;
+      return nextStack;
+    });
+
+    const movedNote: NoteItem = { ...result.note, active: movingOpenNote };
+    setAppState((current) => ({
+      ...current,
+      noteFolders: current.noteFolders.map((folder) =>
+        sameID(folder.projectID, note.projectID) && note.folderID && sameID(folder.id, note.folderID)
+          ? { ...folder, noteCount: Math.max(0, folder.noteCount - 1) }
+          : folder
+      ),
+      notes: [
+        movedNote,
+        ...current.notes.filter((item) => !(
+          sameID(item.id, note.id)
+          && (sameID(item.projectID, note.projectID) || sameID(item.projectID, result!.destinationProjectID))
+        ))
+      ],
+      ...(movingOpenNote ? {
+        activeProjectID: result.destinationProjectID,
+        activeNoteID: note.id
+      } : {})
+    }));
+
+    if (!movingOpenNote) return;
+    const nextTarget: SelectedNoteTarget = {
+      scope: "project",
+      projectID: result.destinationProjectID,
+      noteID: note.id
+    };
+    selectedNoteTargetRef.current = nextTarget;
+    setSelectedProjectID(result.destinationProjectID);
+    setSelectedNoteID(note.id);
+    setSelectedNoteTarget(nextTarget);
+    setNotesScope("project");
+    setPendingMarkdownImport(null);
+    setNoteLinksSnapshot(null);
+    setNoteDetail(result.detail);
+    setNoteDraft(result.detail.markdown);
+    noteDraftRef.current = result.detail.markdown;
+    lastSavedNoteKeyRef.current = noteTargetKey(nextTarget);
+    lastSavedNoteDraftRef.current = result.detail.markdown.replace(/\r\n/g, "\n");
+    setNoteSaveStatus({ kind: "saved", at: Date.now() });
   };
 
   const openMarkdownFileForProject = async () => {
@@ -36830,8 +37225,9 @@ function AppInner() {
 		            onOpenFull={openFullAssistant}
 	          />
 	        )}
-	        <SettingsView
-	          initialSection={settingsInitialSection}
+          <LiveVoiceSettingsLockProvider locked={liveVoiceSettingsAreLocked(liveVoiceStatus)}>
+            <SettingsView
+              initialSection={settingsInitialSection}
           onOpenAssistant={openAssistant}
           onOpenTarget={openTarget}
           onRefresh={() => void refreshAppState()}
@@ -36858,9 +37254,10 @@ function AppInner() {
           onUpdateShortcut={updateShortcutValue}
           onPreviewColorTheme={previewColorThemeEverywhere}
           settings={appState.settings}
-          settingsLoaded={settingsHydrated}
-          todayWakeWordStatus={todayWakeWordStatus}
-        />
+              settingsLoaded={settingsHydrated}
+              todayWakeWordStatus={todayWakeWordStatus}
+            />
+          </LiveVoiceSettingsLockProvider>
       </div>
     );
   }
@@ -36908,7 +37305,7 @@ function AppInner() {
   const openRealtimeVoiceLog = () => {
     const taskThreadID = realtimeWorkTaskList.at(-1)?.threadID;
     const voiceThread = appState.threads.find((thread) => sameID(thread.id, taskThreadID))
-      ?? appState.threads.find((thread) => thread.title === "Today Live Voice");
+      ?? appState.threads.find((thread) => !thread.isArchived && isTodayLiveVoiceThreadTitle(thread.title));
     if (!voiceThread) return;
     setRealtimeWorkDrawerOpen(false);
     setActiveView("threads");
@@ -37043,6 +37440,7 @@ function AppInner() {
         onDeleteNoteFolder={(folder) => { void deleteNoteFolderFromMenu(folder); }}
         onMoveNoteFolder={(folder, parentFolderID) => { void moveNoteFolderFromMenu(folder, parentFolderID); }}
         onMoveNoteToFolder={(note, folderID) => { void moveNoteToFolderFromMenu(note, folderID); }}
+        onMoveNoteToProject={(note, projectID) => { void moveNoteToProjectFromMenu(note, projectID); }}
         onToggleArchivedThreads={toggleArchivedThreads}
         onCreateProject={createProject}
         onCreatePlannerList={createPlannerList}

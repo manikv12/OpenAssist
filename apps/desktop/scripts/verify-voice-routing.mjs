@@ -13,7 +13,7 @@ const { classifyVoiceRoute, todayTaskSourceSelection } = await import(path.toNam
 
 const cases = [
   ["Add buy milk to my Today list.", "write"],
-  ["What memory do I have about the Quality Nails plan?", "recall"],
+  ["What memory do I have about the client launch plan?", "recall"],
   ["Do I have any pending task today?", "read"],
   ["Do I have anything in my to-do list for today?", "read"],
   ["Check the user's to-do list for today.", "read"],
@@ -54,6 +54,16 @@ assert.deepEqual(todayTaskSourceSelection("Show only Apple Reminders for today."
   matches: true,
   includeOpenAssist: false,
   includeAppleReminders: true
+});
+assert.deepEqual(todayTaskSourceSelection("Show my Apple Reminders for today."), {
+  matches: true,
+  includeOpenAssist: false,
+  includeAppleReminders: true
+});
+assert.deepEqual(todayTaskSourceSelection("What is on my OpenAssist Today list?"), {
+  matches: true,
+  includeOpenAssist: true,
+  includeAppleReminders: false
 });
 
 console.log("Voice routing checks passed.");

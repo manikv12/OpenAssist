@@ -24,7 +24,7 @@ export function todayTaskSourceSelection(text: string): TodayTaskSourceSelection
   const normalized = normalizeVoiceRouteText(text);
   const noMatch = { matches: false, includeOpenAssist: false, includeAppleReminders: false };
   if (!normalized) return noMatch;
-  if (/\b(add|create|put|save|insert|append|delete|remove|move|schedule|rename|update|change|complete|finish|mark|check off|cross off)\b/.test(normalized)) {
+  if (/\b(add|create|put|save|insert|append|delete|remove|move|schedule|rename|update|change|complete|finish|mark|check off|cross off|re-?open|restart|un-?complete)\b/.test(normalized)) {
     return noMatch;
   }
 
@@ -34,15 +34,21 @@ export function todayTaskSourceSelection(text: string): TodayTaskSourceSelection
 
   const appleSource = /\b(apple reminders?|reminders app|icloud reminders?)\b/.test(normalized);
   const openAssistSource = /\b(openassist|open assist|today planner|openassist today|open assist today)\b/.test(normalized);
-  const onlyApple = appleSource && (/\bonly\b.{0,30}\b(apple reminders?|reminders app|icloud reminders?)\b/.test(normalized)
-    || /\b(apple reminders?|reminders app|icloud reminders?)\b.{0,30}\bonly\b/.test(normalized));
-  const onlyOpenAssist = openAssistSource && (/\bonly\b.{0,30}\b(openassist|open assist|today planner)\b/.test(normalized)
-    || /\b(openassist|open assist|today planner)\b.{0,30}\bonly\b/.test(normalized));
+  // An explicitly named source wins. Generic "my to-do list" questions read
+  // both stores, while "Apple Reminders" or "OpenAssist Today" never leaks in
+  // tasks from the other store unless the user names both.
+  if (appleSource !== openAssistSource) {
+    return {
+      matches: true,
+      includeOpenAssist: openAssistSource,
+      includeAppleReminders: appleSource
+    };
+  }
 
   return {
     matches: true,
-    includeOpenAssist: !onlyApple,
-    includeAppleReminders: !onlyOpenAssist
+    includeOpenAssist: true,
+    includeAppleReminders: true
   };
 }
 
@@ -73,7 +79,12 @@ export function classifyVoiceRoute(text: string): VoiceRouteDecision {
   }
 
   if (
-    /\b(memory|memories|remember|saved|previous|earlier|last time|old conversation|past conversation|all chats?|all threads?|codex said|claude said|spark said)\b/.test(normalized)
+    (
+      /\b(memory|memories|remember|saved|previous|earlier|last time|old conversation|past conversation|all chats?|all threads?|codex said|claude said|spark said)\b/.test(normalized)
+      // "What did we decide/discuss/agree ..." is conversation recall even
+      // without a memory keyword.
+      || /\bwhat did (we|i|you)\b.{0,50}\b(decide|discuss|agree|say|talk)\b/.test(normalized)
+    )
     && !/\b(save|add|create|delete|forget|remove)\b.{0,40}\b(memory|memories)\b/.test(normalized)
     && !/\b(online|web|internet|website|current|latest)\b/.test(normalized)
   ) {
@@ -102,7 +113,7 @@ export function classifyVoiceRoute(text: string): VoiceRouteDecision {
     return { kind: "delegate", reason: "request requires agent execution", confidence: "high" };
   }
 
-  const hasMutation = /\b(add|create|put|save|insert|append|delete|remove|move|schedule|rename|update|change|complete|finish|mark|check off|cross off)\b/.test(normalized);
+  const hasMutation = /\b(add|create|put|save|insert|append|delete|remove|move|schedule|rename|update|change|complete|finish|mark|check off|cross off|re-?open|restart|un-?complete)\b/.test(normalized);
   if (hasMutation) {
     return { kind: "write", reason: "mutation verb", confidence: "high" };
   }
@@ -111,7 +122,7 @@ export function classifyVoiceRoute(text: string): VoiceRouteDecision {
     return { kind: "read", reason: "today task read", confidence: "high" };
   }
 
-  const hasExplicitRead = /\b(what|which|show|read|check|list out|list all|how many|do i have|do we have|any pending|unfinished|open tasks?)\b/.test(normalized);
+  const hasExplicitRead = /\b(what|which|show|read|check|list out|list all|how many|do i have|do we have|is there|anything|any pending|unfinished|open tasks?)\b/.test(normalized);
   if (hasExplicitRead) {
     return { kind: "read", reason: "explicit read question", confidence: "medium" };
   }
