@@ -3,17 +3,14 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
-  pull-requests: read
 
 jobs:
   build-and-release:
-    name: Build, Sign, Notarize & Release
+    name: Build, Sign, Notarize, and Release Desktop
     runs-on: macos-latest
 
     steps:
@@ -22,26 +19,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
-
-      - name: Install create-dmg
-        run: npm install -g create-dmg
-
-      - name: Setup Node for Electron
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: electron-react/package-lock.json
-
-      - name: Cache Swift build artifacts
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: ${{ runner.os }}-swift-${{ hashFiles('Package.swift', 'Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-swift-
+          cache-dependency-path: apps/desktop/package-lock.json
 
       - name: Import Developer ID certificate
         env:
@@ -64,126 +47,41 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" "$(security list-keychains -d user | sed s/\"//g)"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-      - name: Extract version from tag
+      - name: Read release version
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build & package DMG
-        env:
-          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
-        run: ./build.sh --make-dmg
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
 
-      - name: Notarize DMG
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: Scripts/notarize.sh "dist/Open Assist.dmg"
-
-      - name: Build & package Electron DMG
+      - name: Build signed Electron DMG
+        working-directory: apps/desktop
         env:
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
           OPENASSIST_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          cd electron-react
-          npm ci
-          OPENASSIST_BUILD_VERSION="$(git rev-list --count HEAD)" npm run release:mac
+          OPENASSIST_BUILD_VERSION: ${{ github.run_number }}
+        run: npm run release:mac
 
       - name: Notarize Electron DMG
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: Scripts/notarize.sh "electron-react/dist/Open Assist Electron.dmg"
-
-      - name: Download Sparkle tools
         run: |
-          SPARKLE_VERSION="2.6.0"
-          curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" -o /tmp/sparkle.tar.xz
-          mkdir -p /tmp/sparkle
-          tar xf /tmp/sparkle.tar.xz -C /tmp/sparkle
-
-      - name: Sign DMG and generate appcast
-        env:
-          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          BUILD_NUMBER="$(git rev-list --count HEAD)"
-          DMG_FILE="dist/Open Assist.dmg"
-          # GitHub normalizes release asset URLs by replacing spaces with dots.
-          DOWNLOAD_URL="https://github.com/manikv12/OpenAssist/releases/download/${{ github.ref_name }}/Open.Assist.dmg"
-          SPARKLE_KEY_FILE="$(mktemp -t sparkle_ed25519)"
-          trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
-          printf "%s" "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
-          chmod 600 "$SPARKLE_KEY_FILE"
-
-          # Sign the DMG with Sparkle's EdDSA key
-          SIGNATURE=$(/tmp/sparkle/bin/sign_update "$DMG_FILE" --ed-key-file "$SPARKLE_KEY_FILE")
-
-          # Generate appcast.xml
-          # NOTE: sign_update outputs 'sparkle:edSignature="..." length="..."'
-          # so we do not add a separate length attribute.
-          cat > dist/appcast.xml <<'APPCAST_EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
-            <channel>
-              <title>Open Assist Updates</title>
-              <link>https://manikv12.github.io/OpenAssist/appcast.xml</link>
-          APPCAST_EOF
-
-          cat >> dist/appcast.xml <<EOF
-              <item>
-                <title>Version ${VERSION}</title>
-                <sparkle:version>${BUILD_NUMBER}</sparkle:version>
-                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
-                <pubDate>$(date -R)</pubDate>
-                <enclosure
-                  url="${DOWNLOAD_URL}"
-                  type="application/octet-stream"
-                  ${SIGNATURE}
-                />
-              </item>
-            </channel>
-          </rss>
-          EOF
-
-      - name: Generate release notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 Scripts/generate_release_notes.py \
-            --repo "${{ github.repository }}" \
-            --tag "${{ github.ref_name }}" \
-            --output dist/release-notes.md
+          xcrun notarytool submit "apps/desktop/dist/Open Assist.dmg" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "apps/desktop/dist/Open Assist.dmg"
+          xcrun stapler validate "apps/desktop/dist/Open Assist.dmg"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Open Assist ${{ github.ref_name }}
+          name: OpenAssist ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           draft: false
-          body_path: dist/release-notes.md
-          files: |
-            dist/Open Assist.dmg
-            electron-react/dist/Open Assist Electron.dmg
-
-      - name: Prepare Pages content
-        run: mkdir -p pages && cp dist/appcast.xml pages/appcast.xml
-
-      - name: Upload appcast as Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: pages
-
-  deploy-pages:
-    name: Deploy Appcast to GitHub Pages
-    needs: build-and-release
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy-pages.outputs.page_url }}
-
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deploy-pages
-        uses: actions/deploy-pages@v4
+          generate_release_notes: true
+          files: apps/desktop/dist/Open Assist.dmg
