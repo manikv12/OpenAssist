@@ -92,6 +92,21 @@ let voiceHUDInteractiveApplied: boolean | null = null;
 let voiceHUDLiveHideTimer: NodeJS.Timeout | null = null;
 let lastLiveVoiceHUDSnapshot: VoiceHUDPayload | null = null;
 let voiceCaptureHUDKeepAliveTimer: NodeJS.Timeout | null = null;
+// The live HUD pill is draggable. Remember where the user parked it (anchored
+// at its bottom-left so height changes grow upward) and stop re-centering it.
+let voiceHUDCustomPosition: { x: number; top: number } | null = null;
+// Bounds we last applied programmatically, so the "moved" listener can tell a
+// user drag apart from our own setBounds calls.
+let voiceHUDLastSetBounds: { x: number; y: number } | null = null;
+// Clickable HUD surfaces cannot use Electron's native drag region. Keep one
+// absolute drag anchor in the main process so pointer moves never queue a
+// getBounds -> setBounds round trip for every frame.
+let voiceHUDManualDragState: {
+  pointerStartX: number;
+  pointerStartY: number;
+  windowStartX: number;
+  windowStartY: number;
+} | null = null;
 
 type SpellcheckContextPayload = {
   misspelledWord: string;
@@ -409,6 +424,13 @@ type VoiceStartOptions = {
   dictationCorrectionLearnedSoundName?: string;
   dictationFeedbackVolume?: number;
 };
+type VoiceStartResult = {
+  ok: boolean;
+  error?: string;
+  modelID?: string;
+  useCoreML?: boolean;
+};
+let voiceStartInFlight: Promise<VoiceStartResult> | null = null;
 type DictationFeedbackCue = "startListening" | "stopListening" | "processing" | "pasted" | "correctionLearned";
 type MicrophoneOption = {
   uid: string;
@@ -1017,6 +1039,45 @@ function liveVoiceHUDSessionActive() {
 
 function liveVoiceHUDMuted() {
   return pendingVoiceHUDPayload?.muted === true;
+}
+
+// Dictation auto-mute: starting dictation (hotkey or app) during a Live Voice
+// session mutes the session's microphone instead of refusing to start, then
+// unmutes it when dictation ends — but only if this auto-mute muted it (a
+// user-chosen mute stays muted).
+let liveVoiceAutoMutedForDictation = false;
+
+function broadcastLiveVoiceHUDAction(action: string) {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    if (window === voiceHUDWindow) return;
+    safeSendWindow(window, "openassist:live-voice-hud-action", action);
+  });
+}
+
+async function muteLiveVoiceForDictation() {
+  if (!liveVoiceHUDSessionActive() || liveVoiceHUDMuted()) return true;
+  broadcastLiveVoiceHUDAction("muteMic");
+  // The renderer owns the mute state and reports it back through its next HUD
+  // payload; wait briefly for that round-trip before starting the capture.
+  const deadline = Date.now() + 1500;
+  while (Date.now() < deadline) {
+    if (liveVoiceHUDMuted()) {
+      liveVoiceAutoMutedForDictation = true;
+      debugLog("live voice auto-muted for dictation");
+      return true;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+  }
+  return false;
+}
+
+function restoreLiveVoiceMuteAfterDictation() {
+  if (!liveVoiceAutoMutedForDictation) return;
+  liveVoiceAutoMutedForDictation = false;
+  if (liveVoiceHUDSessionActive() && liveVoiceHUDMuted()) {
+    debugLog("live voice auto-unmuted after dictation");
+    broadcastLiveVoiceHUDAction("unmuteMic");
+  }
 }
 
 function updateMenuBarVoiceStatus(payload: VoiceHUDPayload) {
@@ -2530,20 +2591,23 @@ function voiceHUDHTML() {
     flex-shrink: 0;
   }
   .hud-live-orb {
-    width: 34px;
-    height: 34px;
-    flex: 0 0 34px;
+    width: 48px;
+    height: 48px;
+    flex: 0 0 48px;
     border-radius: 999px;
     position: relative;
     isolation: isolate;
     contain: strict;
+    overflow: hidden;
     background: rgb(17, 19, 25);
     box-shadow:
       0 0 0 1px rgba(255, 255, 255, 0.20),
       0 4px 12px rgba(0, 0, 0, 0.32);
   }
   /* Keep the animated light inside the orb. Large translucent CSS blurs form
-     visible color bands when macOS composites a transparent Electron window. */
+     visible color bands when macOS composites a transparent Electron window.
+     This gradient is the fallback look; when the WebGL fluid orb mounts it
+     adds .is-gl and takes over rendering. */
   .hud-live-orb::after {
     content: "";
     position: absolute;
@@ -2554,48 +2618,195 @@ function voiceHUDHTML() {
       conic-gradient(from 215deg, var(--orb-c1, #6f9dff), var(--orb-c2, #5ee0ae), var(--orb-c3, #e9c76e), var(--orb-c4, #ff8bd2), var(--orb-c1, #6f9dff));
     opacity: calc(0.72 + var(--hud-energy, 0) * 0.20);
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.30);
-    will-change: opacity;
+    will-change: opacity, transform;
+    /* Fallback look when the WebGL fluid orb cannot mount: a slow breath so
+       the orb never reads as a frozen ball. */
+    animation: hud-live-orb-breathe 3600ms ease-in-out infinite;
   }
-  /* Live layout: ONE cohesive glass card — captions, link chips, then a
-     fixed orb+status+controls row. Nothing floats detached over the dock,
-     and text updates never change the orb's position. */
+  @keyframes hud-live-orb-breathe {
+    0%, 100% { transform: scale(0.94) rotate(0deg); }
+    50% { transform: scale(1.0) rotate(8deg); }
+  }
+  /* With the WebGL fluid mounted the orb IS the fluid: no dark backing disc
+     and no white outline, or the backdrop showed as a ring around the ball
+     (the fluid only fills ~86% of its box). */
+  .hud-live-orb.is-gl {
+    background: transparent;
+    box-shadow: none;
+  }
+  .hud-live-orb.is-gl::after { content: none; }
+  .hud-live-orb canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    border-radius: 999px;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 140ms ease-out;
+  }
+  .hud-live-orb.is-gl canvas { opacity: 1; }
+  /* Shimmer over the phase label while the agent is thinking/working, the
+     classic "assistant is reasoning" treatment. */
+  .hud-live-phase.is-thinking {
+    background: linear-gradient(90deg, rgba(235, 240, 250, 0.42) 0%, rgba(255, 255, 255, 0.95) 50%, rgba(235, 240, 250, 0.42) 100%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: hud-think-shimmer 1.6s linear infinite;
+  }
+  @keyframes hud-think-shimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
+  /* Live layout: NO shell — the orb, caption chip, controls, and any extra
+     rows (work/links/approval/dictation) float directly on screen as their
+     own pieces. The whole area is a drag region so the user can park it
+     anywhere; interactive children opt out with no-drag. */
   html[data-status="live"] .hud {
     flex-direction: column;
-    justify-content: flex-end;
+    justify-content: flex-start;
     align-items: stretch;
     gap: 8px;
-    padding: 10px 12px;
-    background: rgba(16, 18, 24, 0.94);
+    padding: 4px 6px;
+    background: transparent;
     border: none;
-    border-radius: 18px;
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.13),
-      0 0 0 1px rgba(0, 0, 0, 0.6),
-      0 16px 44px rgba(0, 0, 0, 0.46);
+    border-radius: 0;
+    box-shadow: none;
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
     transition: none;
     contain: layout paint style;
+    -webkit-app-region: drag;
+    cursor: grab;
   }
+  /* Orb sits on its own row above everything else, centered and large. The
+     mute/stop pill is ATTACHED to the orb's lower edge (overlapping it), the
+     way ChatGPT's voice bubble carries its controls. */
+  .hud-live-orb-row {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    height: 112px;
+    flex: 0 0 112px;
+    width: 100%;
+    /* Headroom for the orb's halo — with only 4px the glow was sliced off
+       flat by the window's top edge. */
+    padding-top: 16px;
+  }
+  /* On the orb the controls are individual round buttons (like the ChatGPT
+     voice bubble), NOT a solid pill — a rectangular bar across the orb read
+     as the orb being cut off. */
+  .hud-live-orb-row .hud-live-controls {
+    position: absolute;
+    left: 50%;
+    bottom: 0;
+    transform: translateX(-50%);
+    z-index: 2;
+    gap: 12px;
+    padding: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  /* The orb and caption are CLICK surfaces (double-click opens the app), so
+     they must opt out of the drag region — macOS swallows mouse events on
+     draggable areas, which left double-click completely dead. The pill still
+     drags from everywhere else (row gaps, the area beside the orb). */
+  html[data-status="live"] .hud-live-orb,
+  html[data-status="live"] .hud-live-copy {
+    -webkit-app-region: no-drag;
+    cursor: grab;
+  }
+  html[data-status="live"] .hud-live-orb:active,
+  html[data-status="live"] .hud-live-copy:active {
+    cursor: grabbing;
+  }
+  /* Bare icons on the orb — no chip circles around them. A soft drop shadow
+     keeps them readable over the bright fluid and any wallpaper. */
+  .hud-live-orb-row .hud-live-control {
+    width: 26px;
+    height: 26px;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: rgba(255, 255, 255, 0.92);
+  }
+  .hud-live-orb-row .hud-live-control svg {
+    width: 13px;
+    height: 13px;
+    filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.65));
+  }
+  .hud-live-orb-row .hud-live-control:hover {
+    background: rgba(255, 255, 255, 0.14);
+    color: #ffffff;
+  }
+  .hud-live-orb-row .hud-live-control.is-stop {
+    color: rgba(255, 176, 184, 0.95);
+  }
+  .hud-live-orb-row .hud-live-control.is-muted {
+    color: #ffcf70;
+  }
+  html[data-status="live"] .hud-live-orb {
+    width: 72px;
+    height: 72px;
+    flex: 0 0 72px;
+  }
+  /* Only a faint bloom in the orb's own color — no outline ring, so the ball
+     reads as a light source floating on the desktop. */
+  html[data-status="live"] .hud-live-orb.is-gl {
+    box-shadow: 0 0 22px color-mix(in srgb, var(--orb-c1, #6f9dff) 20%, transparent);
+  }
+  /* The caption gets the full row to itself now that the controls live on
+     the orb — wider chip, room for two lines of spoken text. */
   .hud-live-main {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 10px;
-    height: 44px;
-    flex: 0 0 44px;
+    display: flex;
+    align-items: stretch;
+    justify-content: center;
+    height: 58px;
+    flex: 0 0 58px;
     min-width: 0;
     width: 100%;
+  }
+  /* Caption chip: a fitted glass pill behind the text so it stays readable
+     over any background, without a big rectangular card around everything. */
+  .hud-live-copy {
+    min-width: 0;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    padding: 8px 14px;
+    border-radius: 16px;
+    /* One shared surface recipe across every live chip (copy, controls, work,
+       dictation, approval): same base, same inset ring, same black outline. */
+    background: rgb(17, 19, 25);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+      0 0 0 1px rgba(0, 0, 0, 0.55),
+      0 6px 18px rgba(0, 0, 0, 0.32);
+  }
+  /* Both surfaces open the app on click (drag still wins if the pointer moves). */
+  .hud-live-copy:hover {
+    background: rgb(24, 27, 35);
+  }
+  /* Hover brightens the orb's own bloom instead of drawing an outline ring. */
+  html[data-status="live"] .hud-live-orb.is-gl:hover {
+    box-shadow: 0 0 30px color-mix(in srgb, var(--orb-c1, #6f9dff) 34%, transparent);
   }
   .hud-live-spacer {
     display: none;
   }
   .hud-live-main .hud-live-controls {
-    justify-self: end;
+    flex: 0 0 auto;
   }
   .hud-live-links {
     display: none;
     align-items: center;
+    justify-content: center;
     gap: 6px;
     height: 28px;
     flex: 0 0 28px;
@@ -2658,8 +2869,8 @@ function voiceHUDHTML() {
       0 6px 18px rgba(0, 0, 0, 0.34);
   }
   .hud-live-control {
-    width: 24px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     padding: 0;
     margin: 0;
     line-height: 0;
@@ -2688,8 +2899,8 @@ function voiceHUDHTML() {
     border-color: rgba(255, 139, 149, 0.24);
   }
   .hud-live-control svg {
-    width: 11px;
-    height: 11px;
+    width: 12.5px;
+    height: 12.5px;
     stroke-width: 2;
     stroke-linecap: round;
     stroke-linejoin: round;
@@ -2702,57 +2913,40 @@ function voiceHUDHTML() {
     gap: 1px;
     padding: 0 2px;
   }
-  .hud-live-transcript {
-    width: 100%;
-    height: 54px;
-    flex: 0 0 54px;
-    display: grid;
-    grid-template-rows: repeat(2, 22px);
-    align-content: center;
-    gap: 1px;
-    padding: 4px 10px;
-    border-radius: 11px;
-    background: rgba(255, 255, 255, 0.045);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
-  }
+  /* Compact caption: the assistant line rides above the meta line inside the
+     pill; the user line stays in the DOM (updates keep working) but hidden. */
   .hud-live-message {
     min-width: 0;
-    height: 22px;
+    height: 32px;
     display: grid;
-    grid-template-columns: 50px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     align-items: center;
-    gap: 7px;
     opacity: 1;
     transition: opacity 140ms ease;
+  }
+  .hud-live-message.is-user {
+    display: none;
   }
   .hud-live-message.is-empty {
     visibility: hidden;
     opacity: 0;
   }
   .hud-live-message-role {
-    color: rgba(235, 240, 250, 0.48);
-    font-size: 8.5px;
-    font-weight: 760;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    white-space: nowrap;
-  }
-  .hud-live-message.is-assistant .hud-live-message-role {
-    color: var(--orb-c1, #8eb0ff);
+    display: none;
   }
   .hud-live-message-text {
     min-width: 0;
-    color: rgba(250, 251, 255, 0.94);
-    font-size: 11.5px;
-    font-weight: 620;
-    letter-spacing: 0;
-    line-height: 1.2;
+    color: rgba(250, 251, 255, 0.96);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    line-height: 1.25;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .hud-live-message.is-user .hud-live-message-text {
-    color: rgba(235, 240, 250, 0.72);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    overflow-wrap: break-word;
   }
   /* Small professional status chip for agent/tool work — separate from the
      spoken caption so the two never race. */
@@ -2764,7 +2958,7 @@ function voiceHUDHTML() {
     max-width: 100%;
     padding: 4px 11px;
     border-radius: 999px;
-    background: rgb(19, 21, 27);
+    background: rgb(17, 19, 25);
     box-shadow:
       inset 0 0 0 1px rgba(255, 255, 255, 0.12),
       0 0 0 1px rgba(0, 0, 0, 0.52),
@@ -2776,6 +2970,8 @@ function voiceHUDHTML() {
     line-height: 1.25;
     border: 0;
     cursor: pointer;
+    pointer-events: auto;
+    -webkit-app-region: no-drag;
   }
   .hud-live-work:hover { background: rgba(28, 32, 41, 0.94); color: rgba(255, 255, 255, 0.92); }
   .hud-live-work.is-visible {
@@ -2788,10 +2984,28 @@ function voiceHUDHTML() {
     border-radius: 999px;
     background: var(--orb-c1, #6f9dff);
   }
+  /* The chip must read as ALIVE while a tool runs — a static "Checking…"
+     was indistinguishable from a hang. Pulsing dot + ticking seconds. */
+  .hud-live-work.is-visible .hud-live-work-dot {
+    animation: hud-live-work-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes hud-live-work-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.72); }
+  }
   .hud-live-work-text {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hud-live-work-elapsed {
+    flex: 0 0 auto;
+    margin-left: 2px;
+    color: rgba(235, 240, 250, 0.48);
+    font-size: 9.5px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   .hud-live-dictation {
@@ -2801,7 +3015,7 @@ function voiceHUDHTML() {
     gap: 7px;
     padding: 5px 12px;
     border-radius: 999px;
-    background: rgb(19, 21, 27);
+    background: rgb(17, 19, 25);
     box-shadow:
       inset 0 0 0 1px rgba(255, 255, 255, 0.12),
       0 0 0 1px rgba(0, 0, 0, 0.52),
@@ -2846,12 +3060,12 @@ function voiceHUDHTML() {
     width: 100%;
     align-items: center;
     gap: 8px;
-    padding: 8px 10px;
-    border-radius: 14px;
-    background: rgb(19, 21, 27);
+    padding: 8px 11px;
+    border-radius: 16px;
+    background: rgb(17, 19, 25);
     box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.14),
-      0 0 0 1px rgba(0, 0, 0, 0.58),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+      0 0 0 1px rgba(0, 0, 0, 0.55),
       0 7px 18px rgba(0, 0, 0, 0.32);
     pointer-events: auto;
     -webkit-app-region: no-drag;
@@ -3054,6 +3268,19 @@ function voiceHUDHTML() {
   let lastLiveHUDAction = { action: "", at: 0 };
   let activeScreenSubmit = null;
   let activeScreenCancel = null;
+  // Elapsed-time ticker for the live work chip: workStartedAt is set when
+  // workText appears and cleared when it goes away; one page-level interval
+  // keeps the "Ns" label ticking so tool work visibly progresses.
+  let liveWorkStartedAt = 0;
+  function refreshLiveWorkElapsed() {
+    const node = document.querySelector(".hud-live-work-elapsed");
+    if (!node) return;
+    const label = liveWorkStartedAt
+      ? Math.max(1, Math.round((Date.now() - liveWorkStartedAt) / 1000)) + "s"
+      : "";
+    if (node.textContent !== label) node.textContent = label;
+  }
+  setInterval(refreshLiveWorkElapsed, 1000);
   window.__openAssistScreenPromptValue = () => "";
   window.__openAssistScreenSubmit = () => false;
   window.__openAssistScreenCancel = () => false;
@@ -3087,6 +3314,25 @@ function voiceHUDHTML() {
 	    const floor = 0.02;
 	    if (level <= floor) return 0;
 	    return Math.pow(Math.min(1, (level - floor) / (1 - floor)), 0.60);
+	  }
+	  function orbVoiceEnergy(level) {
+	    // Live Voice levels arrive ALREADY shaped by the renderer's
+	    // glowEnergyFromLevel (floor + sqrt expansion), so real speech lands in
+	    // roughly the 0.15-0.55 band. Re-expanding here (the old gate + pow on
+	    // top) double-processed the signal and crushed speech to a sliver of
+	    // drive — the classic stacked-envelope trap. Instead, gate just above
+	    // ambient and remap the actual speech band to the orb's full range.
+	    const gate = 0.13;
+	    if (level <= gate) return 0;
+	    return Math.pow(Math.min(1, (level - gate) / 0.45), 0.85);
+	  }
+	  function orbDictationEnergy(level) {
+	    // Dictation levels are raw-ish RMS (no glow shaping upstream), so run
+	    // them through the same sqrt expansion the renderer applies to live
+	    // levels before the shared band remap — one envelope, one scale.
+	    const floor = 0.008;
+	    if (level <= floor) return 0;
+	    return orbVoiceEnergy(Math.pow((level - floor) / (1 - floor), 0.5));
 	  }
 	  const MIN_BAR_HEIGHT = 3;
 	  const MAX_BAR_HEIGHT = 20;
@@ -3173,6 +3419,391 @@ function voiceHUDHTML() {
 	    currentLevel = level;
 	    ensureWaveformLoop();
 	  }
+  // ── Fluid orb (WebGL) ─────────────────────────────────────────────────────
+  // A soft-edged disc whose interior is domain-warped fbm/perlin noise, with
+  // voice levels integrated over time (u_cumulativeAudio) so speech visibly
+  // stirs the fluid. States (listen/think/speak) crossfade with exponential
+  // smoothing so mode changes melt instead of snapping. Tinted from the user's
+  // glow preset via u_colorLow / u_colorMid. Falls back to the CSS gradient
+  // orb when WebGL is unavailable or reduced motion is requested.
+  // NOTE: this code lives inside a TS template literal — no backticks,
+  // backslashes, or dollar-brace sequences anywhere in here.
+  const ORB_VERT = "attribute vec2 a_position; varying vec2 v_uv; void main() { v_uv = a_position * 0.5 + 0.5; gl_Position = vec4(a_position, 0.0, 1.0); }";
+  const ORB_FRAG = ""
+    + "precision highp float; varying vec2 v_uv;"
+    + " uniform vec2 u_resolution; uniform float u_time; uniform float u_micLevel; uniform float u_outputLevel;"
+    + " uniform float u_stateListen; uniform float u_stateThink; uniform float u_stateSpeak;"
+    + " uniform vec4 u_audio; uniform vec4 u_cumulativeAudio; uniform vec3 u_colorA; uniform vec3 u_colorB; uniform vec3 u_colorC; uniform vec3 u_colorD;"
+    + " float rand(vec2 n) { return fract(sin(dot(n, vec2(12.9898, 4.1414))) * 43758.5453); }"
+    + " float noise(vec2 p) { vec2 ip = floor(p); vec2 u = fract(p); u = u * u * (3.0 - 2.0 * u);"
+    + "   float res = mix(mix(rand(ip), rand(ip + vec2(1.0, 0.0)), u.x), mix(rand(ip + vec2(0.0, 1.0)), rand(ip + vec2(1.0, 1.0)), u.x), u.y);"
+    + "   return res * res; }"
+    + " float fbm(vec2 x) { float v = 0.0; float a = 0.5; vec2 shift = vec2(100.0);"
+    + "   mat2 rot = mat2(cos(0.5), sin(0.5), -sin(0.5), cos(0.5));"
+    + "   for (int i = 0; i < 5; i++) { v += a * noise(x); x = rot * x * 2.0 + shift; a *= 0.5; }"
+    + "   return v; }"
+    + " vec4 permute(vec4 x) { return mod((x * 34.0 + 1.0) * x, 289.0); }"
+    + " vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }"
+    + " vec3 fade(vec3 t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }"
+    + " float cnoise(vec3 point) {"
+    + "   vec3 cell0 = floor(point); vec3 cell1 = cell0 + vec3(1.0);"
+    + "   cell0 = mod(cell0, 289.0); cell1 = mod(cell1, 289.0);"
+    + "   vec3 offset0 = fract(point); vec3 offset1 = offset0 - vec3(1.0);"
+    + "   vec4 x = vec4(cell0.x, cell1.x, cell0.x, cell1.x);"
+    + "   vec4 y = vec4(cell0.yy, cell1.yy);"
+    + "   vec4 z0 = vec4(cell0.z); vec4 z1 = vec4(cell1.z);"
+    + "   vec4 xy = permute(permute(x) + y); vec4 xy0 = permute(xy + z0); vec4 xy1 = permute(xy + z1);"
+    + "   vec4 gx0 = xy0 / 7.0; vec4 gy0 = fract(floor(gx0) / 7.0) - 0.5; gx0 = fract(gx0);"
+    + "   vec4 gz0 = vec4(0.5) - abs(gx0) - abs(gy0); vec4 sz0 = step(gz0, vec4(0.0));"
+    + "   gx0 -= sz0 * (step(vec4(0.0), gx0) - 0.5); gy0 -= sz0 * (step(vec4(0.0), gy0) - 0.5);"
+    + "   vec4 gx1 = xy1 / 7.0; vec4 gy1 = fract(floor(gx1) / 7.0) - 0.5; gx1 = fract(gx1);"
+    + "   vec4 gz1 = vec4(0.5) - abs(gx1) - abs(gy1); vec4 sz1 = step(gz1, vec4(0.0));"
+    + "   gx1 -= sz1 * (step(vec4(0.0), gx1) - 0.5); gy1 -= sz1 * (step(vec4(0.0), gy1) - 0.5);"
+    + "   vec3 g000 = vec3(gx0.x, gy0.x, gz0.x); vec3 g100 = vec3(gx0.y, gy0.y, gz0.y);"
+    + "   vec3 g010 = vec3(gx0.z, gy0.z, gz0.z); vec3 g110 = vec3(gx0.w, gy0.w, gz0.w);"
+    + "   vec3 g001 = vec3(gx1.x, gy1.x, gz1.x); vec3 g101 = vec3(gx1.y, gy1.y, gz1.y);"
+    + "   vec3 g011 = vec3(gx1.z, gy1.z, gz1.z); vec3 g111 = vec3(gx1.w, gy1.w, gz1.w);"
+    + "   vec4 norm0 = taylorInvSqrt(vec4(dot(g000, g000), dot(g010, g010), dot(g100, g100), dot(g110, g110)));"
+    + "   g000 *= norm0.x; g010 *= norm0.y; g100 *= norm0.z; g110 *= norm0.w;"
+    + "   vec4 norm1 = taylorInvSqrt(vec4(dot(g001, g001), dot(g011, g011), dot(g101, g101), dot(g111, g111)));"
+    + "   g001 *= norm1.x; g011 *= norm1.y; g101 *= norm1.z; g111 *= norm1.w;"
+    + "   float n000 = dot(g000, offset0);"
+    + "   float n100 = dot(g100, vec3(offset1.x, offset0.yz));"
+    + "   float n010 = dot(g010, vec3(offset0.x, offset1.y, offset0.z));"
+    + "   float n110 = dot(g110, vec3(offset1.xy, offset0.z));"
+    + "   float n001 = dot(g001, vec3(offset0.xy, offset1.z));"
+    + "   float n101 = dot(g101, vec3(offset1.x, offset0.y, offset1.z));"
+    + "   float n011 = dot(g011, vec3(offset0.x, offset1.yz));"
+    + "   float n111 = dot(g111, offset1);"
+    + "   vec3 fadePoint = fade(offset0);"
+    + "   vec4 noiseZ = mix(vec4(n000, n100, n010, n110), vec4(n001, n101, n011, n111), fadePoint.z);"
+    + "   vec2 noiseYZ = mix(noiseZ.xy, noiseZ.zw, fadePoint.y);"
+    + "   return 2.2 * mix(noiseYZ.x, noiseYZ.y, fadePoint.x); }"
+    + " void main() {"
+    + "   vec2 st = v_uv - 0.5; st.x *= u_resolution.x / u_resolution.y;"
+    + "   float sound = max(max(u_audio.x, u_audio.y), max(u_audio.z, u_audio.w));"
+    + "   float stateAmount = max(u_stateListen, max(u_stateThink, u_stateSpeak));"
+    + "   float thinking = u_stateThink;"
+    + "   float audioEnergy = smoothstep(0.05, 0.55, max(sound, u_micLevel));"
+    + "   float outputEnergy = smoothstep(0.03, 0.38, u_outputLevel);"
+    + "   float breath = sin(u_time * 3.141592653589793 * 0.34) * 0.5 + 0.5;"
+    + "   float entry = smoothstep(0.0, 0.9, stateAmount);"
+    + "   float maxDrawableRadius = 0.46;"
+    // Idle sits smaller so voice swell has real headroom before the clamp —
+    // the ChatGPT bloop reads as "inflating with speech" for exactly this
+    // reason (idle ~80%, speech pushes toward the rim).
+    + "   float baseRadius = mix(maxDrawableRadius * 0.94, maxDrawableRadius * 0.98, thinking);"
+    + "   float radius = baseRadius * mix(0.82, 1.0, entry);"
+    // Both directions swell the orb: the assistant's own speech and the user's
+    // mic. The wide smoothstep range keeps the JS-side spring overshoot
+    // (levels briefly above 1.0) visible as an extra bounce in the radius.
+    + "   float swellEnergy = smoothstep(0.04, 1.05, max(u_outputLevel, u_micLevel));"
+    // Gentler expansion: the orb breathes with speech instead of punching out
+    // on every peak (0.18 read as over-reacting to the assistant's voice).
+    + "   float outputExpansion = max(max(outputEnergy, audioEnergy) * 0.45, swellEnergy) * maxDrawableRadius * 0.10;"
+    + "   float restingBreath = (1.0 - thinking) * (1.0 - outputEnergy) * breath * maxDrawableRadius * 0.012;"
+    + "   radius = min(maxDrawableRadius, radius + outputExpansion + restingBreath);"
+    + "   float horizontalDrift = sin(u_time * 0.43) * 0.0028;"
+    + "   float verticalDrift = sin(u_time * 0.36 + 1.7) * 0.0035;"
+    + "   vec2 lifted = st - vec2(horizontalDrift, verticalDrift);"
+    + "   float dist = length(lifted) - radius;"
+    + "   float edgeWidth = max(1.25 / min(u_resolution.x, u_resolution.y), 0.0014);"
+    + "   if (dist > edgeWidth) { discard; }"
+    + "   float edge = 1.0 - smoothstep(-edgeWidth, edgeWidth, dist);"
+    + "   vec2 uv = lifted / (2.0 * radius) + 0.5;"
+    + "   float overallSoundScale = 1.0 + audioEnergy * 1.15;"
+    // Idle drift is deliberately slow; the fluid's real motion comes from the
+    // voice-driven cumulative terms so silence = calm, speech = churn.
+    + "   float time = u_time * 0.13;"
+    + "   float noiseX = cnoise(vec3(uv + vec2(0.0, 74.8572), (time + u_cumulativeAudio.x * 0.24 * overallSoundScale) * 0.3));"
+    + "   float noiseY = cnoise(vec3(uv + vec2(203.91282, 10.0), (time + u_cumulativeAudio.z * 0.24 * overallSoundScale) * 0.3));"
+    + "   uv += vec2(noiseX * 2.0, noiseY) * 0.19;"
+    + "   float voiceWarpX = cnoise(vec3(uv * 3.1 + vec2(0.0, 17.3), u_cumulativeAudio.x * 0.085 + u_cumulativeAudio.z * 0.035));"
+    + "   float voiceWarpY = cnoise(vec3(uv * 3.4 + vec2(31.7, 0.0), u_cumulativeAudio.y * 0.075 + u_cumulativeAudio.w * 0.045));"
+    + "   uv += vec2(voiceWarpX, voiceWarpY) * audioEnergy * 0.14;"
+    + "   uv.y += sin(uv.x * 5.4 + u_cumulativeAudio.w * 0.19) * audioEnergy * 0.05;"
+    // Per-band swirl: each frequency band rotates the field by its own amount,
+    // so loud speech visibly churns the fluid instead of only nudging it.
+    + "   float swirl = (u_audio.x - u_audio.z) * audioEnergy * 0.55;"
+    + "   vec2 swirlUv = uv - 0.5;"
+    + "   uv = mat2(cos(swirl), -sin(swirl), sin(swirl), cos(swirl)) * swirlUv + 0.5;"
+    + "   float watercolorNoise = cnoise(vec3(uv * 18.0 + vec2(344.91282, 0.0), time * 0.3)) + cnoise(vec3(uv * 39.6 + vec2(723.937, 0.0), time * 0.4)) * 0.5;"
+    + "   uv += watercolorNoise * 0.006;"
+    + "   float textureNoiseA = noise(uv * 22.0 + vec2(time * 0.08, u_cumulativeAudio.x * 0.025));"
+    + "   float textureNoiseB = noise(vec2(1.0 - uv.x, uv.y) * 41.0 + vec2(u_cumulativeAudio.z * 0.018, -time * 0.11));"
+    + "   float textureDisplacement = mix(textureNoiseA, textureNoiseB, sin(time + u_cumulativeAudio.w * 0.12) * 0.5 + 0.5) - 0.5;"
+    + "   uv += textureDisplacement * (0.012 + audioEnergy * 0.004);"
+    + "   uv.y = 1.0 - uv.y;"
+    + "   vec2 rotatedUv = uv - 0.5;"
+    + "   float gradientAngle = -0.16;"
+    + "   uv = mat2(cos(gradientAngle), -sin(gradientAngle), sin(gradientAngle), cos(gradientAngle)) * rotatedUv + 0.5;"
+    + "   uv.y -= 0.03;"
+    + "   vec2 stNoise = uv * 1.25;"
+    + "   vec2 q = vec2(0.0);"
+    + "   q.x = fbm(stNoise * 0.5 + 0.075 * (time + u_cumulativeAudio.w * 0.70 * overallSoundScale));"
+    + "   q.y = fbm(stNoise * 0.5 + 0.075 * (time + u_cumulativeAudio.x * 0.55 * overallSoundScale));"
+    + "   vec2 r = vec2("
+    + "     fbm(stNoise + q + vec2(0.3, 9.2) + 0.15 * (time + u_cumulativeAudio.y * 0.90 * overallSoundScale)),"
+    + "     fbm(stNoise + q + vec2(8.3, 0.8) + 0.126 * (time + u_cumulativeAudio.z * 0.65 * overallSoundScale)));"
+    + "   float f = fbm(stNoise + r - q);"
+    + "   float fullFbm = pow(((f + 0.6 * f * f + 0.7 * f) + 0.5) * 0.5, 0.55);"
+    // PALETTE AS LIGHT, NOT PIGMENT.
+    // Mixing four preset hues into the fluid was tried twice (broad wash, then
+    // ribbons) and both muddied clashing palettes into grey-lavender. Real
+    // spheres take color from the lights around them, so: the body is a clean
+    // blend of colors 1+2, then color 3 lands as a key highlight on the lit
+    // shoulder and color 4 as a rim light on the opposite edge. Every preset
+    // color is visible as its own light, and light ADDS (never averages), so
+    // clashing hues stay clean instead of turning to mud.
+    + "   float depth = clamp(fullFbm, 0.0, 1.0);"
+    + "   float blendField = smoothstep(0.25, 0.75, fbm(uv * 1.6 + r * 0.5 + time * 0.05));"
+    + "   vec3 accent = mix(u_colorA, u_colorB, blendField * 0.8);"
+    + "   float fineColorNoise = fbm(uv * 12.0 + vec2(time * 0.13, -time * 0.09) + r * 0.4);"
+    + "   vec3 base = accent * 0.22;"
+    + "   vec3 color = mix(base, accent, pow(depth, 0.95) * 0.96);"
+    + "   vec2 lightDir = vec2(-0.5877, 0.8090);"
+    + "   float lightDot = clamp(dot(lifted / max(radius, 0.0001), lightDir) * 0.5 + 0.5, 0.0, 1.0);"
+    + "   color += accent * lightDot * lightDot * 0.22;"
+    // Both extra colors light the orb from its EDGES, where the body is
+    // darkest — a centred bloom sat on the bright fluid and read as a dull
+    // patch (green over red = olive). Edge light lands on near-black, so each
+    // hue stays clean, and the two arcs sit on opposite sides so they never
+    // overlap each other.
+    + "   float edgeBand = smoothstep(0.55, 1.0, clamp(length(lifted) / max(radius, 0.0001), 0.0, 1.0));"
+    + "   vec2 unitPos = normalize(lifted + vec2(0.0001));"
+    // Key light (color 3): upper-left arc, drifting slowly.
+    + "   vec2 keyDir = normalize(vec2(-0.62, 0.58 + sin(u_time * 0.19) * 0.10));"
+    + "   float keySide = clamp(dot(unitPos, keyDir), 0.0, 1.0);"
+    + "   color += u_colorC * edgeBand * pow(keySide, 2.6) * 0.62;"
+    // Rim light (color 4): lower-right backlight, the classic product-render
+    // separation between the orb and the panel behind it.
+    + "   vec2 rimDir = normalize(vec2(0.66, -0.50 + cos(u_time * 0.15) * 0.10));"
+    + "   float rimSide = clamp(dot(unitPos, rimDir), 0.0, 1.0);"
+    + "   color += u_colorD * edgeBand * pow(rimSide, 2.6) * 0.62;"
+    + "   color = mix(color, vec3(1.0), smoothstep(0.80, 0.97, fineColorNoise) * (0.045 + audioEnergy * 0.12));"
+    + "   float rr = clamp(length(lifted) / max(radius, 0.0001), 0.0, 1.0);"
+    + "   color += accent * smoothstep(0.74, 1.0, rr) * 0.22;"
+    + "   color *= 1.07 + audioEnergy * 0.14 + outputEnergy * 0.20 + u_stateThink * 0.05;"
+    + "   float orbAlpha = edge * smoothstep(0.0, 0.18, stateAmount + 0.3);"
+    + "   gl_FragColor = vec4(color, orbAlpha); }";
+  function hexToRgb01(hex) {
+    const value = String(hex || "").trim();
+    const raw = value.charAt(0) === "#" ? value.slice(1) : value;
+    const full = raw.length === 3
+      ? raw.charAt(0) + raw.charAt(0) + raw.charAt(1) + raw.charAt(1) + raw.charAt(2) + raw.charAt(2)
+      : raw;
+    if (full.length !== 6) return null;
+    const num = parseInt(full, 16);
+    if (!Number.isFinite(num)) return null;
+    return [((num >> 16) & 255) / 255, ((num >> 8) & 255) / 255, (num & 255) / 255];
+  }
+  function orbPaletteColors() {
+    // The four glow-preset colors sweep around the disc in the shader.
+    const styles = getComputedStyle(document.documentElement);
+    const fallback = [[0.44, 0.62, 1.0], [0.37, 0.88, 0.68], [0.91, 0.78, 0.43], [1.0, 0.55, 0.82]];
+    const names = ["--orb-c1", "--orb-c2", "--orb-c3", "--orb-c4"];
+    return names.map((name, index) => hexToRgb01(styles.getPropertyValue(name)) || fallback[index]);
+  }
+  function compileOrbShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      gl.deleteShader(shader);
+      return null;
+    }
+    return shader;
+  }
+  function liveOrbStateTargets(phase, muted) {
+    if (muted) return { listen: 0.3, think: 0, speak: 0 };
+    if (phase === "connecting") return { listen: 0, think: 1, speak: 0 };
+    if (phase === "delegating") return { listen: 0.65, think: 1, speak: 0 };
+    if (phase === "speaking") return { listen: 0.2, think: 0, speak: 1 };
+    return { listen: 1, think: 0, speak: 0 };
+  }
+  function mountLiveOrb(host) {
+    // console.error on purpose: the main process mirrors HUD console errors
+    // into electron-debug.log, so a silent fall-back to the flat CSS orb
+    // becomes diagnosable.
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      console.error("[voice-hud] fluid orb disabled: prefers-reduced-motion");
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    const gl = canvas.getContext("webgl", { alpha: true, antialias: false, depth: false, premultipliedAlpha: false });
+    if (!gl) {
+      console.error("[voice-hud] fluid orb fallback: WebGL context unavailable");
+      return;
+    }
+    const program = gl.createProgram();
+    const vert = compileOrbShader(gl, gl.VERTEX_SHADER, ORB_VERT);
+    const frag = compileOrbShader(gl, gl.FRAGMENT_SHADER, ORB_FRAG);
+    if (!program || !vert || !frag) {
+      console.error("[voice-hud] fluid orb fallback: shader compile failed");
+      return;
+    }
+    gl.attachShader(program, vert);
+    gl.attachShader(program, frag);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error("[voice-hud] fluid orb fallback: program link failed " + String(gl.getProgramInfoLog(program) || ""));
+      return;
+    }
+    const positionLoc = gl.getAttribLocation(program, "a_position");
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    gl.useProgram(program);
+    gl.enableVertexAttribArray(positionLoc);
+    gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+    // One full-canvas pass already contains the desired alpha. Blending it
+    // against the transparent backing buffer squared the edge alpha and could
+    // produce a muddy flash while macOS composited the first frame.
+    gl.disable(gl.BLEND);
+    const uniforms = {
+      audio: gl.getUniformLocation(program, "u_audio"),
+      cumulativeAudio: gl.getUniformLocation(program, "u_cumulativeAudio"),
+      micLevel: gl.getUniformLocation(program, "u_micLevel"),
+      outputLevel: gl.getUniformLocation(program, "u_outputLevel"),
+      resolution: gl.getUniformLocation(program, "u_resolution"),
+      stateListen: gl.getUniformLocation(program, "u_stateListen"),
+      stateThink: gl.getUniformLocation(program, "u_stateThink"),
+      stateSpeak: gl.getUniformLocation(program, "u_stateSpeak"),
+      time: gl.getUniformLocation(program, "u_time"),
+      colorA: gl.getUniformLocation(program, "u_colorA"),
+      colorB: gl.getUniformLocation(program, "u_colorB"),
+      colorC: gl.getUniformLocation(program, "u_colorC"),
+      colorD: gl.getUniformLocation(program, "u_colorD")
+    };
+    host.appendChild(canvas);
+    const audioData = [0, 0, 0, 0];
+    const cumulativeAudio = [0, 0, 0, 0];
+    let micLevel = 0;
+    let micVel = 0;
+    let outputLevel = 0;
+    let outVel = 0;
+    let stateListen = 0;
+    let stateThink = 0;
+    let stateSpeak = 0;
+    let lastTime = 0;
+    let firstFrameReady = false;
+    const dispose = () => {
+      host.classList.remove("is-gl");
+      if (canvas.parentNode === host) host.removeChild(canvas);
+      const lose = gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+    };
+    const renderFrame = (nowMs) => {
+      if (!host.isConnected || document.documentElement.dataset.status !== "live") {
+        dispose();
+        return;
+      }
+      const now = nowMs / 1000;
+      const dt = lastTime === 0 ? 0.016 : Math.max(0, Math.min(0.05, now - lastTime));
+      lastTime = now;
+      const orbState = window.__liveOrbState || { phase: "listening", muted: false };
+      const targets = liveOrbStateTargets(orbState.phase, orbState.muted);
+      // States crossfade with tau 0.28s so listening -> speaking melts.
+      const stateK = 1 - Math.exp(-dt / 0.28);
+      stateListen += (targets.listen - stateListen) * stateK;
+      stateThink += (targets.think - stateThink) * stateK;
+      stateSpeak += (targets.speak - stateSpeak) * stateK;
+      // Synthesize four frequency bands from the single smoothed level; each
+      // band gets its own slow sine phase so the fluid churns asymmetrically.
+      const speaking = orbState.phase === "speaking";
+      const thinking = orbState.phase === "connecting" || orbState.phase === "delegating";
+      // Muted kills the live mic level, but dictation capture is still real
+      // audio the user is speaking — feed it in so the orb keeps reacting to
+      // the voice instead of sitting frozen while muted. Uses the gated orb
+      // curve, not the bars' curve, so ambient noise cannot flicker the orb.
+      const rawLevel = orbState.muted
+        ? orbDictationEnergy(dictationCurrentLevel)
+        : Math.max(orbVoiceEnergy(currentLevel), orbDictationEnergy(dictationCurrentLevel));
+      // Speaking motion is deliberately CALM: a slow phrase-level swell, not a
+      // syllable-rate jitter. The orb should read as "the assistant is
+      // talking", not bounce on every consonant.
+      const wobble = 0.72 + Math.sin(now * 1.15 + 0.6) * 0.10 + Math.sin(now * 0.73 + 2.1) * 0.07;
+      let drive;
+      if (thinking) {
+        drive = 0.1 + (Math.sin(now * 1.4) * 0.5 + 0.5) * 0.08;
+      } else if (speaking) {
+        // Some playback paths (Codex WebRTC) have no analyser tap, so the
+        // measured level sits at zero while the assistant talks and the fluid
+        // froze mid-speech. When no real level arrives, synthesize a slow
+        // speech cadence (phrase-length breathing, not per-syllable pulses).
+        const measured = rawLevel * wobble;
+        const phrase = (Math.sin(now * 1.05) * 0.5 + 0.5) * (Math.sin(now * 0.61 + 0.9) * 0.5 + 0.5);
+        const synthetic = 0.34 + phrase * 0.24;
+        drive = rawLevel > 0.06 ? measured : synthetic;
+      } else {
+        drive = rawLevel * 0.85;
+      }
+      drive = Math.min(1, drive);
+      const bandTargets = [
+        drive * (0.82 + Math.sin(now * 1.1) * 0.14),
+        drive * (0.76 + Math.sin(now * 1.5 + 1.2) * 0.16),
+        drive * (0.68 + Math.sin(now * 1.9 + 2.1) * 0.18),
+        drive
+      ];
+      for (let i = 0; i < 4; i++) {
+        // While the assistant speaks, smooth hard: the orb should follow the
+        // shape of a sentence, not twitch on every syllable. The user's own
+        // mic keeps a livelier response so talking still feels immediate.
+        const attackTau = speaking ? 0.34 : 0.12;
+        const releaseTau = speaking ? 0.70 : 0.34;
+        const tau = bandTargets[i] > audioData[i] ? attackTau : releaseTau;
+        audioData[i] += (bandTargets[i] - audioData[i]) * (1 - Math.exp(-dt / tau));
+        // Advance the fluid with the voice; gentle while speaking so the
+        // churn reads as flowing, not boiling.
+        cumulativeAudio[i] += audioData[i] * dt * (speaking ? 3.6 : 3.5) * (1 + audioData[i] * 1.5);
+      }
+      // Springs drive the radius. Speaking uses a soft, well-damped spring so
+      // the orb swells and settles like breathing; the mic keeps the snappier
+      // response so the user's own voice still feels instant.
+      const micTarget = speaking ? 0 : rawLevel;
+      micVel += ((micTarget - micLevel) * 130 - micVel * 13) * dt;
+      micLevel = Math.max(0, Math.min(1.35, micLevel + micVel * dt));
+      const outTarget = speaking ? Math.max(rawLevel, drive) : 0;
+      outVel += ((outTarget - outputLevel) * 26 - outVel * 9.5) * dt;
+      outputLevel = Math.max(0, Math.min(1.2, outputLevel + outVel * dt));
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      const height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      const pal = orbPaletteColors();
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.viewport(0, 0, width, height);
+      gl.useProgram(program);
+      gl.uniform1f(uniforms.time, now);
+      gl.uniform1f(uniforms.micLevel, micLevel);
+      gl.uniform1f(uniforms.outputLevel, outputLevel);
+      gl.uniform1f(uniforms.stateListen, stateListen);
+      gl.uniform1f(uniforms.stateThink, stateThink);
+      gl.uniform1f(uniforms.stateSpeak, stateSpeak);
+      gl.uniform2f(uniforms.resolution, width, height);
+      gl.uniform4fv(uniforms.audio, audioData);
+      gl.uniform4fv(uniforms.cumulativeAudio, cumulativeAudio);
+      gl.uniform3fv(uniforms.colorA, pal[0]);
+      gl.uniform3fv(uniforms.colorB, pal[1]);
+      gl.uniform3fv(uniforms.colorC, pal[2]);
+      gl.uniform3fv(uniforms.colorD, pal[3]);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      if (!firstFrameReady) {
+        firstFrameReady = true;
+        // Keep the clean CSS orb visible until WebGL has produced a correctly
+        // sized frame. This prevents an uninitialized canvas from flashing as
+        // a large colored blob when the floating HUD first appears.
+        requestAnimationFrame(() => {
+          if (host.isConnected && canvas.parentNode === host) host.classList.add("is-gl");
+        });
+      }
+      requestAnimationFrame(renderFrame);
+    };
+    requestAnimationFrame(renderFrame);
+  }
   window.updateOpenAssistVoiceHUDLevel = function(level, dictationLevel) {
     currentLevel = clampLevel(level);
     dictationCurrentLevel = clampLevel(dictationLevel);
@@ -3205,11 +3836,141 @@ function voiceHUDHTML() {
     if (!window.openAssistElectron || !window.openAssistElectron.liveVoiceHUDAction) return;
     window.openAssistElectron.liveVoiceHUDAction(action).catch(() => {});
   }
+  /* One press = ONE action. The old wiring fired on mousedown AND click with
+     only a 220ms dedupe, so a press held longer than that toggled twice —
+     mute flipped straight back to unmute. pointerdown is the primary trigger;
+     click only fires as a fallback when no pointerdown was seen. */
   function wireLiveHUDButton(button, action) {
-    const handler = (event) => sendLiveHUDAction(action, event);
-    button.onclick = handler;
-    button.onmousedown = handler;
-    button.onpointerdown = handler;
+    let pointerHandledAt = 0;
+    button.onpointerdown = (event) => {
+      pointerHandledAt = Date.now();
+      sendLiveHUDAction(action, event);
+    };
+    button.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (Date.now() - pointerHandledAt < 1500) return;
+      sendLiveHUDAction(action, event);
+    };
+    button.onmousedown = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+  }
+  /* DOUBLE-clicking the orb or the caption brings the app forward. Both are
+     app-region: no-drag (a drag region swallows mouse events entirely, which
+     made double-click dead), so the native dblclick works; the hand-rolled
+     tap counter stays as a belt-and-braces fallback. sendLiveHUDAction
+     dedupes within 220ms so the two paths cannot double-fire. */
+  /* These surfaces are no-drag (so clicks work), which means they must ALSO
+     provide dragging themselves: moving the pointer more than a few pixels
+     while pressed streams deltas to the main process, which moves the window.
+     A clean press-release still counts as a tap; two taps (or a native
+     dblclick) open the app. */
+  function wireLiveHUDSurfaceClick(node, action) {
+    node.addEventListener("dblclick", (event) => sendLiveHUDAction(action, event));
+    let start = null;
+    let lastTap = 0;
+    let dragState = null;
+    let latestDragPoint = null;
+    let dragFrame = 0;
+    const flushDrag = () => {
+      dragFrame = 0;
+      const point = latestDragPoint;
+      latestDragPoint = null;
+      if (point && window.openAssistElectron && window.openAssistElectron.liveVoiceHUDDrag) {
+        window.openAssistElectron.liveVoiceHUDDrag("move", point.x, point.y);
+      }
+    };
+    node.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) { start = null; dragState = null; return; }
+      start = { x: event.screenX, y: event.screenY, at: Date.now() };
+      dragState = { x: event.screenX, y: event.screenY, dragging: false };
+      latestDragPoint = null;
+      if (window.openAssistElectron && window.openAssistElectron.liveVoiceHUDDrag) {
+        window.openAssistElectron.liveVoiceHUDDrag("start", event.screenX, event.screenY);
+      }
+      try { node.setPointerCapture(event.pointerId); } catch (error) { /* capture unsupported */ }
+    });
+    node.addEventListener("pointermove", (event) => {
+      if (!dragState) return;
+      const totalMoved = start ? Math.abs(event.screenX - start.x) + Math.abs(event.screenY - start.y) : 99;
+      if (!dragState.dragging && totalMoved <= 5) return;
+      dragState.dragging = true;
+      dragState.x = event.screenX;
+      dragState.y = event.screenY;
+      latestDragPoint = { x: event.screenX, y: event.screenY };
+      if (!dragFrame) dragFrame = requestAnimationFrame(flushDrag);
+    });
+    node.addEventListener("pointerup", (event) => {
+      const wasDragging = dragState && dragState.dragging;
+      if (dragFrame) {
+        cancelAnimationFrame(dragFrame);
+        dragFrame = 0;
+      }
+      if (wasDragging) {
+        latestDragPoint = { x: event.screenX, y: event.screenY };
+        flushDrag();
+      }
+      if (window.openAssistElectron && window.openAssistElectron.liveVoiceHUDDrag) {
+        window.openAssistElectron.liveVoiceHUDDrag("end", event.screenX, event.screenY);
+      }
+      dragState = null;
+      if (!start) return;
+      const moved = Math.abs(event.screenX - start.x) + Math.abs(event.screenY - start.y);
+      const held = Date.now() - start.at;
+      start = null;
+      if (wasDragging || moved > 5 || held > 700) { lastTap = 0; return; }
+      const now = Date.now();
+      if (lastTap && now - lastTap < 420) {
+        lastTap = 0;
+        sendLiveHUDAction(action, event);
+        return;
+      }
+      lastTap = now;
+    });
+    node.addEventListener("pointercancel", (event) => {
+      if (dragFrame) cancelAnimationFrame(dragFrame);
+      dragFrame = 0;
+      latestDragPoint = null;
+      if (window.openAssistElectron && window.openAssistElectron.liveVoiceHUDDrag) {
+        window.openAssistElectron.liveVoiceHUDDrag("end", event.screenX, event.screenY);
+      }
+      start = null;
+      dragState = null;
+      lastTap = 0;
+    });
+  }
+  const liveCaptionRenderStates = new WeakMap();
+  function setSmoothLiveCaption(node, target) {
+    if (!node) return;
+    let state = liveCaptionRenderStates.get(node);
+    if (!state) {
+      state = { displayed: node.textContent || "", target: "", frame: 0 };
+      liveCaptionRenderStates.set(node, state);
+    }
+    if (state.target === target) return;
+    state.target = target;
+    // A different speaker/status is a real line change and should land once.
+    // Streaming additions keep the existing DOM text and catch up smoothly.
+    if (!state.displayed || !target.startsWith(state.displayed)) {
+      state.displayed = target;
+      if (node.textContent !== target) node.textContent = target;
+      return;
+    }
+    if (state.frame) return;
+    const renderNextChunk = () => {
+      state.frame = 0;
+      const remaining = state.target.slice(state.displayed.length);
+      if (!remaining) return;
+      // Ease toward the provider's latest transcript without repainting the
+      // whole line for every partial event. Short deltas still land promptly.
+      const chunkLength = Math.min(remaining.length, Math.max(3, Math.ceil(remaining.length * 0.34)));
+      state.displayed += remaining.slice(0, chunkLength);
+      node.textContent = state.displayed;
+      if (state.displayed !== state.target) state.frame = requestAnimationFrame(renderNextChunk);
+    };
+    state.frame = requestAnimationFrame(renderNextChunk);
   }
   function updateLiveHUDContent(payload, phase, container) {
     // Tint the orb with the user's "Realtime & Snip Glow Color" preset
@@ -3233,19 +3994,41 @@ function voiceHUDHTML() {
     const providerNode = scope.querySelector(".hud-live-provider");
     const phaseNode = scope.querySelector(".hud-live-phase");
     const muteButton = scope.querySelector(".hud-live-control.is-mute");
+    // Only touch the DOM when the text actually changed — live payloads
+    // arrive every ~120ms and rewriting identical textContent repaints the
+    // captions, which reads as flicker while the assistant is speaking.
+    const setText = (node, text) => {
+      if (node && node.textContent !== text) node.textContent = text;
+    };
     const phaseLabel = muted ? "Muted" : livePhaseLabel(phase);
-    if (providerNode) providerNode.textContent = provider;
-    if (phaseNode) phaseNode.textContent = phaseLabel;
+    setText(providerNode, provider);
+    if (phaseNode) {
+      setText(phaseNode, phaseLabel);
+      phaseNode.classList.toggle("is-thinking", !muted && (phase === "connecting" || phase === "delegating"));
+    }
+    // Feed the fluid orb: it reads phase + mute each animation frame.
+    window.__liveOrbState = { phase: phase || "listening", muted };
     const workText = oneLine(payload && payload.workText);
-    const assistantMessage = assistantText || (!userText ? liveCaptionFallback(phase, statusText, muted) : "");
-    if (assistantMessageTextNode && assistantMessage) assistantMessageTextNode.textContent = assistantMessage;
+    /* ONE stable caption line: prefer the assistant's spoken words, then the
+       user's live transcript, then a phase hint. The old logic blanked the
+       line whenever the "other" party owned the text, so every turn change
+       faded the caption out and back in — which read as the HUD glitching.
+       Now the text is only swapped in place (setText skips identical text)
+       and the line itself never disappears mid-session. */
+    const assistantMessage = muted
+      ? liveCaptionFallback(phase, statusText, muted)
+      : (assistantText || userText || liveCaptionFallback(phase, statusText, muted));
+    if (assistantMessage) setSmoothLiveCaption(assistantMessageTextNode, assistantMessage);
     if (assistantMessageNode) assistantMessageNode.classList.toggle("is-empty", !assistantMessage);
-    if (userMessageTextNode && userText) userMessageTextNode.textContent = userText;
+    if (userText) setText(userMessageTextNode, userText);
     if (userMessageNode) userMessageNode.classList.toggle("is-empty", !userText);
     const workNode = scope.querySelector(".hud-live-work");
     const workTextNode = workNode && workNode.querySelector(".hud-live-work-text");
-    if (workTextNode) workTextNode.textContent = workText;
+    setText(workTextNode, workText);
     if (workNode) workNode.classList.toggle("is-visible", Boolean(workText));
+    if (workText && !liveWorkStartedAt) liveWorkStartedAt = Date.now();
+    if (!workText) liveWorkStartedAt = 0;
+    refreshLiveWorkElapsed();
     if (muteButton) {
       muteButton.classList.toggle("is-muted", muted);
       muteButton.title = muted ? "Unmute microphone" : "Mute microphone";
@@ -3617,9 +4400,8 @@ function voiceHUDHTML() {
     } else if (status === "live") {
       const orb = document.createElement("span");
       orb.className = "hud-live-orb";
+      mountLiveOrb(orb);
 
-      const transcript = document.createElement("div");
-      transcript.className = "hud-live-transcript";
       const createLiveMessage = (role, roleLabel) => {
         const message = document.createElement("div");
         message.className = "hud-live-message is-" + role;
@@ -3631,7 +4413,6 @@ function voiceHUDHTML() {
         message.append(label, text);
         return message;
       };
-      transcript.append(createLiveMessage("assistant", "Assistant"), createLiveMessage("user", "You"));
 
       const controls = document.createElement("div");
       controls.className = "hud-live-controls";
@@ -3648,8 +4429,8 @@ function voiceHUDHTML() {
       wireLiveHUDButton(stop, "stop");
       controls.append(mute, stop);
 
-      // The transcript and control rows have fixed heights, so changing words
-      // cannot shift the orb or its controls.
+      // Caption (latest assistant line) rides above the meta line inside the
+      // pill; both have fixed heights so changing words cannot shift the orb.
       const meta = document.createElement("div");
       meta.className = "hud-live-meta";
       const providerNode = document.createElement("span");
@@ -3660,12 +4441,26 @@ function voiceHUDHTML() {
       phaseNode.className = "hud-live-phase";
       meta.append(providerNode, metaDot, phaseNode);
 
+      const copy = document.createElement("div");
+      copy.className = "hud-live-copy";
+      copy.title = "Double-click to open Open Assist";
+      copy.append(createLiveMessage("assistant", "Assistant"), createLiveMessage("user", "You"), meta);
+      wireLiveHUDSurfaceClick(copy, "openWork");
+      orb.title = "Double-click to open Open Assist";
+      wireLiveHUDSurfaceClick(orb, "openWork");
+
       const linksRow = document.createElement("div");
       linksRow.className = "hud-live-links";
 
+      const orbRow = document.createElement("div");
+      orbRow.className = "hud-live-orb-row";
+      // Controls ride ON the orb (overlapping its lower edge), leaving the
+      // full caption row to the text.
+      orbRow.append(orb, controls);
+
       const mainRow = document.createElement("div");
       mainRow.className = "hud-live-main";
-      mainRow.append(orb, meta, controls);
+      mainRow.append(copy);
 
       const approvalRow = document.createElement("div");
       approvalRow.className = "hud-live-approval";
@@ -3701,10 +4496,12 @@ function voiceHUDHTML() {
       workDot.className = "hud-live-work-dot";
       const workLabel = document.createElement("span");
       workLabel.className = "hud-live-work-text";
-      work.append(workDot, workLabel);
+      const workElapsed = document.createElement("span");
+      workElapsed.className = "hud-live-work-elapsed";
+      work.append(workDot, workLabel, workElapsed);
       wireLiveHUDButton(work, "openWork");
 
-      hud.append(dictationStrip, transcript, linksRow, work, approvalRow, mainRow);
+      hud.append(orbRow, mainRow, dictationStrip, linksRow, work, approvalRow);
       updateLiveHUDContent(payload, livePhase, hud);
       barNodes = [];
       barStates = [];
@@ -3814,6 +4611,10 @@ function voiceHUDHTML() {
 
 // Match the Swift WaveformHUD layout so both apps render at the same screen position.
 const HUD_DOCK_RESERVE = 80;
+// Height of the live pill's always-present block (orb row with attached
+// controls + two-line caption row); extra rows (work/links/approval/
+// dictation) add to it downward.
+const LIVE_HUD_BASE_HEIGHT = 188;
 const HUD_TOAST_VERTICAL_GAP = 12;
 const HUD_WAVEFORM_HEIGHT = 34;
 
@@ -3834,14 +4635,17 @@ function voiceHUDSize(payload: VoiceHUDPayload) {
     return { width, height: HUD_WAVEFORM_HEIGHT };
   }
   if (isLiveVoiceHUDStatus(payload.status)) {
-    // Single-card layout: captions + optional link chips + orb/status/controls.
+    // Stacked layout: the orb rides on its own row on top, with the caption +
+    // controls row under it; extra rows (dictation, work, links, approval)
+    // stack below that only when present.
     const hasLinks = Array.isArray(payload.links)
       && payload.links.some((link) => link && typeof link.url === "string" && /^https?:\/\//i.test(link.url));
-    let height = 142;
-    if (hasLinks) height += 36;
+    let height = LIVE_HUD_BASE_HEIGHT;
+    if (String(payload.workText ?? "").trim()) height += 30;
+    if (hasLinks) height += 34;
     if (payload.approval?.requestID) height += 46;
-    if (payload.dictationCapture) height += 34;
-    return { width: 460, height };
+    if (payload.dictationCapture) height += 30;
+    return { width: 384, height };
   }
   if (payload.status === "error" || payload.status === "unsupported" || payload.status === "message") {
     const text = String(payload.text ?? "Voice input failed").trim();
@@ -3862,10 +4666,32 @@ function positionVoiceHUDWindow(window: BrowserWindow, payload: VoiceHUDPayload)
   const margin = 16;
   const maxX = bounds.x + bounds.width - size.width - margin;
   const minX = bounds.x + margin;
-  const centeredX = bounds.x + (bounds.width - size.width) / 2;
-  const x = Math.max(minX, Math.min(maxX, centeredX));
-  const y = Math.max(bounds.y + margin, bounds.y + bounds.height - HUD_DOCK_RESERVE - size.height);
+  let x: number;
+  let y: number;
+  // A user-dragged live pill stays where the user parked it; only the size
+  // tracks content. Anchor at the top edge (where the orb sits) so extra rows
+  // grow downward without ever shifting the orb.
+  if (voiceHUDCustomPosition && isLiveVoiceHUDStatus(payload.status)) {
+    x = Math.max(minX, Math.min(maxX, voiceHUDCustomPosition.x));
+    y = Math.max(bounds.y + margin, Math.min(
+      bounds.y + bounds.height - size.height - margin,
+      voiceHUDCustomPosition.top
+    ));
+  } else {
+    const centeredX = bounds.x + (bounds.width - size.width) / 2;
+    x = Math.max(minX, Math.min(maxX, centeredX));
+    if (isLiveVoiceHUDStatus(payload.status)) {
+      // Pin the TOP edge (the orb) to where the base pill sits and let extra
+      // rows grow downward. Anchoring the bottom here moved the orb up/down
+      // every time a row appeared, which read as the HUD flickering.
+      const baseTop = bounds.y + bounds.height - HUD_DOCK_RESERVE - LIVE_HUD_BASE_HEIGHT;
+      y = Math.max(bounds.y + margin, Math.min(baseTop, bounds.y + bounds.height - margin - size.height));
+    } else {
+      y = Math.max(bounds.y + margin, bounds.y + bounds.height - HUD_DOCK_RESERVE - size.height);
+    }
+  }
   const useAnim = process.platform === "darwin" && (payload.status === "analysis-result" || payload.status === "analyzing");
+  voiceHUDLastSetBounds = { x: Math.round(x), y: Math.round(y) };
   window.setBounds({
     x: Math.round(x),
     y: Math.round(y),
@@ -3900,7 +4726,9 @@ function ensureVoiceHUDWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      backgroundThrottling: true
+      // This window is preloaded while hidden. Throttling made its first HUD
+      // render wait for Chromium's roughly one-second background timer slot.
+      backgroundThrottling: false
     }
   });
   window.setIgnoreMouseEvents(false);
@@ -3908,6 +4736,19 @@ function ensureVoiceHUDWindow() {
   if (process.platform === "darwin") {
     window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   }
+  // User drags of the live pill (via -webkit-app-region: drag) land here.
+  // Ignore our own setBounds echoes; remember everything else as the user's
+  // chosen spot, anchored at the top edge (where the orb sits).
+  window.on("moved", () => {
+    if (window.isDestroyed()) return;
+    const b = window.getBounds();
+    const programmatic = voiceHUDLastSetBounds
+      && Math.abs(b.x - voiceHUDLastSetBounds.x) <= 2
+      && Math.abs(b.y - voiceHUDLastSetBounds.y) <= 2;
+    if (programmatic) return;
+    if (!isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)) return;
+    voiceHUDCustomPosition = { x: b.x, top: b.y };
+  });
   window.on("closed", () => {
     if (voiceHUDWindow === window) voiceHUDWindow = null;
     voiceHUDReady = false;
@@ -3950,7 +4791,11 @@ function ensureVoiceHUDWindow() {
         debugLog(`voice HUD preload bridge check failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     const payload = pendingVoiceHUDPayload;
-    if (payload) void updateVoiceHUD(payload);
+    if (payload) {
+      void updateVoiceHUD(payload);
+    } else {
+      void prepaintVoiceHUDListeningState(window);
+    }
   });
   // Mirror HUD-page errors into the debug log — "Script failed to execute"
   // from executeJavaScript hides the real exception, which only surfaces here.
@@ -3972,8 +4817,45 @@ function rememberVoiceHUDAppearance(payload: VoiceHUDPayload) {
   };
 }
 
+async function prepaintVoiceHUDListeningState(window: BrowserWindow) {
+  if (window.isDestroyed()) return;
+  const payload: VoiceHUDPayload = {
+    status: "listening",
+    text: "",
+    theme: lastVoiceHUDAppearance.theme ?? "Vibrant Spectrum",
+    colorTheme: lastVoiceHUDAppearance.colorTheme ?? "Ocean",
+    chromeStyle: lastVoiceHUDAppearance.chromeStyle ?? "Liquid Glass",
+    level: 0,
+    tone: "success",
+    source: "",
+    replacement: ""
+  };
+  try {
+    await window.webContents.executeJavaScript(
+      `window.updateOpenAssistVoiceHUD(${JSON.stringify(payload)})`
+    );
+    // A hidden transparent BrowserWindow does not always get a compositor
+    // surface until its first presentation on macOS. Prime that surface at
+    // zero opacity so the shortcut can reveal the already-painted waveform
+    // instead of waiting for the first real window paint.
+    if (!pendingVoiceHUDPayload && !voiceCapture) {
+      positionVoiceHUDWindow(window, payload);
+      window.setOpacity(0);
+      window.showInactive();
+      await new Promise<void>((resolve) => setTimeout(resolve, 80));
+      if (!pendingVoiceHUDPayload && !voiceCapture) window.hide();
+      window.setOpacity(1);
+    }
+    debugLog("voice HUD listening state prepainted and compositor primed");
+  } catch (error) {
+    if (!window.isDestroyed()) window.setOpacity(1);
+    debugLog(`voice HUD listening prepaint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function prewarmVoiceHUDWindow() {
-  if (process.platform !== "darwin") return;
+  // Every platform pays the same first-load cost for this page, so warm it
+  // everywhere rather than only on macOS.
   const window = ensureVoiceHUDWindow();
   positionVoiceHUDWindow(window, { status: "listening" });
 }
@@ -4060,6 +4942,7 @@ function refreshLiveVoiceDictationOverlay() {
 
 function restoreLiveVoiceHUDAfterCaptureEnd() {
   stopVoiceCaptureHUDKeepAlive();
+  restoreLiveVoiceMuteAfterDictation();
   const livePayload = isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)
     ? pendingVoiceHUDPayload
     : lastLiveVoiceHUDSnapshot;
@@ -4074,12 +4957,17 @@ function restoreLiveVoiceHUDAfterCaptureEnd() {
 
 function shouldSuppressFloatingVoiceHUD(payload: VoiceHUDPayload) {
   if (payload.suppressForAppFocus) return true;
+  // Only suppress the floating live pill while the main window is actually
+  // focused (its in-app voice UI is on screen). "Visible somewhere behind
+  // other apps" used to count, which flapped the pill in and out while the
+  // user worked elsewhere during a delegated task.
   if (
     isLiveVoiceHUDStatus(payload.status)
     && mainWindow
     && !mainWindow.isDestroyed()
     && mainWindow.isVisible()
     && !mainWindow.isMinimized()
+    && mainWindow.isFocused()
   ) return true;
   return false;
 }
@@ -4187,7 +5075,7 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
         voiceHUDWindow?.hide();
         voiceHUDPresentationKey = "";
         updateMenuBarVoiceStatus({ visible: false, status: "idle" });
-      }, 450);
+      }, 900);
       voiceHUDLiveHideTimer.unref?.();
     }
     return { ok: true, visible: true };
@@ -4221,16 +5109,22 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     ...payload
   };
   applyLiveVoiceDictationOverlay(nextPayload, payload);
-  // Dictation must not replace an active, unmuted Live Voice HUD in the shared
-  // floating window — that was hiding the dictation pill behind the live orb.
+  // Dictation must never replace an active Live Voice HUD in the shared
+  // floating window. The live pill owns the window for the whole session —
+  // muted or not — and reports dictation through its own "Dictating" strip
+  // (see applyLiveVoiceDictationOverlay). Without this the standalone
+  // dictation pill flashed over the live orb whenever capture started.
   if (
     (nextPayload.status === "listening" || nextPayload.status === "processing")
     && liveVoiceHUDSessionActive()
-    && !liveVoiceHUDMuted()
     && pendingVoiceHUDPayload
     && isLiveVoiceHUDStatus(pendingVoiceHUDPayload.status)
   ) {
-    return updateVoiceHUD({ ...pendingVoiceHUDPayload, visible: true });
+    return updateVoiceHUD({
+      ...pendingVoiceHUDPayload,
+      visible: true,
+      dictationCapture: activeVoiceCaptureHUDPayload() ? true : pendingVoiceHUDPayload.dictationCapture
+    });
   }
   const shouldShow = nextPayload.visible !== false
     && (
@@ -4279,6 +5173,12 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
   pendingVoiceHUDPayload = storedVoiceHUDPayload(nextPayload);
   rememberLiveVoiceHUDSnapshot(nextPayload);
   updateMenuBarVoiceStatus(nextPayload);
+  // Moving the transparent window and executing HUD-page scripts at the same
+  // time causes macOS compositor stalls. Keep only the newest payload during
+  // a manual drag; the drag-end event applies it immediately afterward.
+  if (voiceHUDManualDragState) {
+    return { ok: true, visible: true, pending: true };
+  }
   if (!isLevelOnlyUpdate) {
     // Only re-position / re-show when the status or panel size actually
     // changed. Live Voice pushes a full payload every ~120ms; calling
@@ -4488,7 +5388,6 @@ function handleConfiguredShortcut(target: ShortcutTarget, phase: ShortcutPhase =
     return;
   }
   const isVoiceTranscriptionShortcut = target === "holdToTalk" || target === "continuousToggle";
-  const hadMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed());
   if (!mainWindow) {
     createMainWindow({ initiallyHidden: isVoiceTranscriptionShortcut || target === "assistantLiveVoice" });
   }
@@ -4504,17 +5403,42 @@ function handleConfiguredShortcut(target: ShortcutTarget, phase: ShortcutPhase =
       setTimeout(sendShortcut, 20);
     }
   };
-  if (
-    isVoiceTranscriptionShortcut
-    && phase !== "up"
-    && hadMainWindow
-    && !window.webContents.isLoading()
-    && !shouldSuppressFloatingVoiceHUD({ status: "listening" })
-    // Respect the floating HUD setting: without this the pill flashes for a
-    // second and is then hidden by the renderer when the HUD is disabled.
-    && readNativeBoolDefaultSync("OpenAssist.assistantFloatingHUDEnabled", true)
-  ) {
-    void updateVoiceHUD({ visible: true, status: "listening", ...lastVoiceHUDAppearance });
+  const shouldStartHoldCapture = target === "holdToTalk"
+    && phase === "down"
+    && readNativeBoolDefaultSync("OpenAssist.assistantVoiceTaskEntryEnabled", true);
+  if (shouldStartHoldCapture) {
+    const shortcutStartedAt = Date.now();
+    const warmConfiguration = armedVoiceHelper?.configuration;
+    const shouldShowStandaloneHUD = !shouldSuppressFloatingVoiceHUD({ status: "listening" })
+      && readNativeBoolDefaultSync("OpenAssist.assistantFloatingHUDEnabled", true)
+      && !liveVoiceHUDSessionActive();
+    // The HUD is already loaded and prepainted. Let Electron present that
+    // prepared frame before starting capture work; otherwise synchronous
+    // filesystem/CoreAudio setup can prevent macOS from drawing the panel
+    // even though the microphone is already recording. This is an event-loop
+    // handoff, not a fixed delay.
+    const hudPresentation = shouldShowStandaloneHUD
+      ? updateVoiceHUD({ visible: true, status: "listening", ...lastVoiceHUDAppearance })
+          .then(() => debugLog(`hold shortcut HUD visible elapsedMs=${Date.now() - shortcutStartedAt}`))
+          .catch((error) => {
+            debugLog(`hold shortcut HUD failed: ${error instanceof Error ? error.message : String(error)}`);
+          })
+      : Promise.resolve();
+    const voiceStart = hudPresentation.then(
+      () => new Promise<VoiceStartResult>((resolve, reject) => {
+        setImmediate(() => {
+          startConfiguredVoiceInput(warmConfiguration).then(resolve, reject);
+        });
+      })
+    );
+
+    // The main process owns the latency-sensitive start. The renderer still
+    // owns transcript insertion and UI state, but its later IPC call joins the
+    // same promise instead of launching a second capture.
+    void voiceStart.then(
+      (result) => debugLog(`hold shortcut microphone ready elapsedMs=${Date.now() - shortcutStartedAt} ok=${result.ok}`),
+      (error) => debugLog(`hold shortcut microphone failed elapsedMs=${Date.now() - shortcutStartedAt}: ${error instanceof Error ? error.message : String(error)}`)
+    );
   }
   sendWhenReady();
 }
@@ -7412,6 +8336,7 @@ async function openLocalPath(filePath: string) {
 
 type LocalFilePreviewKind =
   | "image"
+  | "video"
   | "pdf"
   | "markdown"
   | "html"
@@ -7443,6 +8368,9 @@ function previewMimeTypeForPath(filePath: string) {
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".webp") return "image/webp";
   if (ext === ".gif") return "image/gif";
+  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".mov") return "video/quicktime";
+  if (ext === ".webm") return "video/webm";
   if (ext === ".svg") return "image/svg+xml";
   if (ext === ".pdf") return "application/pdf";
   if (ext === ".html" || ext === ".htm") return "text/html";
@@ -7458,6 +8386,7 @@ function previewKindForPath(filePath: string): LocalFilePreviewKind {
   const ext = path.extname(filePath).toLowerCase();
   const name = path.basename(filePath).toLowerCase();
   if ([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"].includes(ext)) return "image";
+  if ([".mp4", ".mov", ".webm"].includes(ext)) return "video";
   if (ext === ".pdf") return "pdf";
   if (markdownPreviewExtensions.has(ext)) return "markdown";
   if (htmlPreviewExtensions.has(ext)) return "html";
@@ -9001,7 +9930,7 @@ async function ensureAppleEventKitHelper() {
   if (!sourcePath) throw new Error("Apple EventKit helper source was not found.");
   const infoPlistPath = appleEventKitHelperInfoPlistPath();
   if (!infoPlistPath) throw new Error("Apple EventKit helper Info.plist was not found.");
-  const helperBuildVersion = "2026-07-19-eventkit-helper-v6-search-recurrence";
+  const helperBuildVersion = "2026-07-20-eventkit-helper-v7-local-timezone";
   const helperBundleIdentifier = "com.developingadventures.OpenAssist.ElectronAppleEventKitHelper";
   const helperDirectory = path.join(app.getPath("userData"), "helpers");
   fs.mkdirSync(helperDirectory, { recursive: true });
@@ -9613,24 +10542,62 @@ function selectedMicrophoneArgument(options?: VoiceStartOptions) {
 }
 
 function shouldPreferExternalMicrophone(options?: VoiceStartOptions) {
-  return options?.autoDetectMicrophone !== false;
+  // "Auto" means the microphone macOS currently selected. Picking the first
+  // device classified as external also selected virtual drivers (for example,
+  // screen-sharing audio) and forced a slow CoreAudio route change on every
+  // shortcut press. Explicit microphone choices still use --microphone-uid.
+  return false;
 }
 
-async function listMicrophones(): Promise<MicrophoneOption[]> {
-  if (process.platform !== "darwin") return [];
+// Enumerating microphones spawns the Swift helper, which can stall well past a
+// few seconds when CoreAudio is busy (device wake, a Bluetooth mic settling, or
+// another app grabbing the input). That used to reject and surface as an
+// uncaught "apple-speech-helper timed out" in the renderer. The list barely
+// changes, so serve it from cache and treat a slow probe as "no update" rather
+// than an error.
+let cachedMicrophones: MicrophoneOption[] = [];
+let cachedMicrophonesAt = 0;
+let microphoneProbeInFlight: Promise<MicrophoneOption[]> | null = null;
+const microphoneCacheTTLMs = 30_000;
+const microphoneProbeTimeoutMs = 10_000;
+
+async function probeMicrophones(): Promise<MicrophoneOption[]> {
   const helperAppPath = await ensureAppleSpeechHelper();
   const helperPath = path.join(helperAppPath, "Contents", "MacOS", "apple-speech-helper");
-  const { stdout } = await runProcessWithOutput(helperPath, ["--list-microphones"], 3500);
-  try {
-    const parsed = JSON.parse(stdout.trim()) as MicrophoneOption[];
-    return Array.isArray(parsed)
-      ? parsed
-          .filter((item) => typeof item?.uid === "string" && typeof item?.name === "string")
-          .map((item) => ({ uid: item.uid, name: item.name, isDefault: item.isDefault === true }))
-      : [];
-  } catch {
-    return [];
+  const { stdout } = await runProcessWithOutput(helperPath, ["--list-microphones"], microphoneProbeTimeoutMs);
+  const parsed = JSON.parse(stdout.trim()) as MicrophoneOption[];
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((item) => typeof item?.uid === "string" && typeof item?.name === "string")
+    .map((item) => ({ uid: item.uid, name: item.name, isDefault: item.isDefault === true }));
+}
+
+async function listMicrophones(options?: { force?: boolean }): Promise<MicrophoneOption[]> {
+  if (process.platform !== "darwin") return [];
+  const fresh = Date.now() - cachedMicrophonesAt < microphoneCacheTTLMs;
+  if (!options?.force && fresh && cachedMicrophones.length > 0) return cachedMicrophones;
+  // Collapse concurrent callers onto one helper process instead of spawning
+  // several that then contend for the same audio device.
+  if (!microphoneProbeInFlight) {
+    microphoneProbeInFlight = probeMicrophones()
+      .then((microphones) => {
+        if (microphones.length > 0) {
+          cachedMicrophones = microphones;
+          cachedMicrophonesAt = Date.now();
+        }
+        return microphones;
+      })
+      .catch((error) => {
+        // Never reject: the caller gets the last known list (possibly empty)
+        // and the UI keeps working with the default input device.
+        debugLog(`microphone list probe failed: ${error instanceof Error ? error.message : String(error)}`);
+        return cachedMicrophones;
+      })
+      .finally(() => {
+        microphoneProbeInFlight = null;
+      });
   }
+  return microphoneProbeInFlight;
 }
 
 function launchVoiceHelperApp(
@@ -9671,13 +10638,13 @@ type ArmedVoiceHelper = {
   helperProcess: ChildProcess;
   helperPid?: number;
   signature: string;
+  configuration: VoiceStartOptions;
   armedAt: number;
   ready: boolean;
 };
 
 let armedVoiceHelper: ArmedVoiceHelper | null = null;
 let armVoiceHelperInFlight = false;
-const armedVoiceHelperMaxAgeMs = 45 * 60 * 1000;
 
 function voiceHelperArmSignature(options?: VoiceStartOptions) {
   return JSON.stringify({
@@ -9712,7 +10679,12 @@ async function armVoiceRecordingHelper(reason: string) {
     }
     const signature = voiceHelperArmSignature(configuration);
     if (armedVoiceHelper) {
-      if (armedVoiceHelper.signature === signature && armedVoiceHelper.helperProcess.exitCode === null) return;
+      if (armedVoiceHelper.signature === signature && armedVoiceHelper.helperProcess.exitCode === null) {
+        // Provider, HUD, and sound settings do not require a new helper
+        // process, but the shortcut hot path must use their latest values.
+        armedVoiceHelper.configuration = configuration;
+        return;
+      }
       disarmVoiceHelper("arm settings changed");
     }
     const helperAppPath = await ensureAppleSpeechHelper();
@@ -9724,12 +10696,17 @@ async function armVoiceRecordingHelper(reason: string) {
       helperProcess,
       helperPid: helperProcess.pid,
       signature,
+      configuration,
       armedAt: Date.now(),
       ready: false
     };
     armedVoiceHelper = armed;
     helperProcess.on("exit", () => {
-      if (armedVoiceHelper === armed) armedVoiceHelper = null;
+      if (armedVoiceHelper !== armed) return;
+      armedVoiceHelper = null;
+      if (!isQuitting) {
+        setTimeout(() => { void armVoiceRecordingHelper("replace exited helper"); }, 500).unref?.();
+      }
     });
     void waitForVoiceFile(sessionDirectory, ["armed.json", "error.json"], 15000).then((result) => {
       if (armedVoiceHelper !== armed) return;
@@ -9753,10 +10730,6 @@ function adoptArmedVoiceHelper(configuration?: VoiceStartOptions): ArmedVoiceHel
   if (!armed || !armed.ready) return null;
   if (armed.helperProcess.exitCode !== null) {
     armedVoiceHelper = null;
-    return null;
-  }
-  if (Date.now() - armed.armedAt > armedVoiceHelperMaxAgeMs) {
-    disarmVoiceHelper("armed helper expired");
     return null;
   }
   if (armed.signature !== voiceHelperArmSignature(configuration)) {
@@ -10262,7 +11235,6 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   if (process.platform !== "darwin") {
     return { ok: false, error: "Cloud voice capture is only available on macOS in this Electron port." };
   }
-  await cleanupStaleVoiceHelpers("before cloud voice start", voiceCapture?.helperPid);
   cleanupOldVoiceCaptureDirectories();
   clearMismatchedVoiceCapture("cloudProviders");
   if (voiceCapture) {
@@ -10281,6 +11253,14 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   const startBeganAt = Date.now();
   const armed = adoptArmedVoiceHelper(configuration);
   const warmStart = Boolean(armed);
+  // A warm helper is already a known, live capture process. Scanning every
+  // process before adopting it added about a second to each shortcut press.
+  // Keep that maintenance work off the latency-sensitive start path.
+  if (armed) {
+    void cleanupStaleVoiceHelpers("after warm cloud voice start", armed.helperPid);
+  } else {
+    await cleanupStaleVoiceHelpers("before cold cloud voice start");
+  }
   let sessionDirectory: string;
   let helperProcess: ChildProcess;
   let helperAppPath: string;
@@ -10618,21 +11598,47 @@ async function stopWhisperVoiceInput() {
   }
 }
 
-async function startConfiguredVoiceInput(options?: VoiceStartOptions) {
+async function performConfiguredVoiceInputStart(options?: VoiceStartOptions): Promise<VoiceStartResult> {
   if (liveVoiceHUDSessionActive() && !liveVoiceHUDMuted()) {
-    return {
-      ok: false,
-      error: "Stop Live Voice or mute its microphone before starting dictation."
-    };
+    // Dictation and Live Voice must never listen at the same time. Mute the
+    // live session's mic for the duration of the dictation instead of
+    // refusing to start; it unmutes again when the capture ends.
+    const muted = await muteLiveVoiceForDictation();
+    if (!muted) {
+      return {
+        ok: false,
+        error: "Stop Live Voice or mute its microphone before starting dictation."
+      };
+    }
   }
   void refreshFrontmostApplicationSnapshot();
   const configuration = options?.transcriptionEngine
     ? options
     : await (await openAssistBridge()).voiceInputConfiguration();
-  if (configuration.transcriptionEngine === "Apple Speech") return startAppleVoiceInput(configuration);
-  if (configuration.transcriptionEngine === "Cloud Providers") return startCloudVoiceInput(configuration);
-  if (configuration.transcriptionEngine === "whisper.cpp") return startWhisperVoiceInput(configuration);
-  return { ok: false, error: `Unsupported transcription engine: ${configuration.transcriptionEngine}` };
+  let result: VoiceStartResult;
+  if (configuration.transcriptionEngine === "Apple Speech") result = await startAppleVoiceInput(configuration);
+  else if (configuration.transcriptionEngine === "Cloud Providers") result = await startCloudVoiceInput(configuration);
+  else if (configuration.transcriptionEngine === "whisper.cpp") result = await startWhisperVoiceInput(configuration);
+  else result = { ok: false, error: `Unsupported transcription engine: ${configuration.transcriptionEngine}` };
+  // A capture that never started must hand the mic back to Live Voice now —
+  // the capture-end restore path will not run for it.
+  if (!result.ok) restoreLiveVoiceMuteAfterDictation();
+  return result;
+}
+
+function startConfiguredVoiceInput(options?: VoiceStartOptions): Promise<VoiceStartResult> {
+  if (voiceStartInFlight) return voiceStartInFlight;
+  const operation = performConfiguredVoiceInputStart(options);
+  voiceStartInFlight = operation;
+  operation.then(
+    () => {
+      if (voiceStartInFlight === operation) voiceStartInFlight = null;
+    },
+    () => {
+      if (voiceStartInFlight === operation) voiceStartInFlight = null;
+    }
+  );
+  return operation;
 }
 
 async function stopConfiguredVoiceInput() {
@@ -10707,6 +11713,29 @@ app.whenReady().then(() => {
     .catch((error) => {
       debugLog(`startup temporary thread purge failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  const runScheduledStorageCleanup = (source: string) => {
+    void openAssistBridge()
+      .then((bridge) => bridge.runScheduledJunkCleanup())
+      .then((result) => {
+        if (!result.skipped) {
+          debugLog(`${source} storage cleanup removed=${result.result.deletedItemCount} freedBytes=${result.result.freedBytes}`);
+        }
+      })
+      .catch((error) => {
+        debugLog(`${source} storage cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+  };
+  runScheduledStorageCleanup("startup");
+  const storageCleanupTimer = setInterval(() => runScheduledStorageCleanup("scheduled"), 6 * 60 * 60 * 1000);
+  storageCleanupTimer.unref();
+  void openAssistBridge()
+    .then((bridge) => bridge.recoverMemoryDreamPipelineOnStartup())
+    .then((result) => {
+      if (result.recovered) debugLog(`startup: recovered ${result.recovered} memory learning job(s)`);
+    })
+    .catch((error) => {
+      debugLog(`startup memory recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   if (process.platform === "darwin") {
     ensureRegularDockPresence("app ready");
     try {
@@ -10746,6 +11775,11 @@ app.whenReady().then(() => {
   void openAssistBridge()
     .then((bridge) => {
       bridge.setThreadsChangedListener(broadcastThreadsUpdated);
+      bridge.setSideChatDestroyedListener((event) => {
+        BrowserWindow.getAllWindows().forEach((window) => {
+          safeSendWindow(window, "openassist:side-chat-destroyed", event);
+        });
+      });
       bridge.setAppStateBackgroundUpdateListener(broadcastAppStateBackgroundUpdate);
       bridge.setConnectorSyncProgressListener((progress) => broadcastConnectorSyncProgress(progress));
       bridge.setPlannerReminderDueListener((reminder) => showPlannerReminderFallback(reminder));
@@ -10934,6 +11968,19 @@ app.whenReady().then(() => {
     if (window.isVisible()) positionMenuBarPopoverWindow(window);
   });
   ipcMain.handle("openassist:open-target", async (_event, target: string, workspaceRootPath?: string | null) => {
+    if (target === "codexLogin") {
+      const script = [
+        'tell application "Terminal"',
+        "activate",
+        'do script "codex login"',
+        "end tell"
+      ].join("\n");
+      const result = spawnSync("/usr/bin/osascript", ["-e", script], { encoding: "utf8" });
+      if (result.status !== 0) {
+        return { ok: false, error: "Could not open Codex sign in in Terminal." };
+      }
+      return { ok: true };
+    }
     if (target.startsWith("workspace:")) {
       return openWorkspaceLaunchTarget(target.slice("workspace:".length), workspaceRootPath);
     }
@@ -11315,8 +12362,14 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:delete-planner-category", async (_event, categoryID: string) =>
     (await openAssistBridge()).deletePlannerCategory(categoryID)
   );
-  ipcMain.handle("openassist:save-planner-day", async (_event, dayID: string | undefined, markdown: string) =>
-    (await openAssistBridge()).savePlannerDay(dayID, markdown)
+  ipcMain.handle("openassist:apply-planner-editor-mutation", async (_event, input: unknown) =>
+    (await openAssistBridge()).applyPlannerEditorMutation(input as any)
+  );
+  ipcMain.handle("openassist:apply-planner-operations", async (_event, input: unknown) =>
+    (await openAssistBridge()).applyPlannerOperations(input as any)
+  );
+  ipcMain.handle("openassist:resolve-planner-editor-conflicts", async (_event, input: unknown) =>
+    (await openAssistBridge()).resolvePlannerEditorConflicts(input as any)
   );
   ipcMain.handle("openassist:schedule-selection-to-planner", async (_event, request: unknown) =>
     (await openAssistBridge()).scheduleSelectionToPlanner(request as any)
@@ -11336,6 +12389,12 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:delete-daily-item", async (_event, dayID: string | undefined, itemID: string) =>
     (await openAssistBridge()).deleteDailyItem(dayID, itemID)
   );
+  ipcMain.handle("openassist:move-daily-item-to-day", async (
+    _event,
+    dayID: string | undefined,
+    itemID: string,
+    targetDayID: string
+  ) => (await openAssistBridge()).moveDailyItemToDay(dayID, itemID, targetDayID));
   ipcMain.handle("openassist:link-daily-item-note", async (_event, dayID: string | undefined, itemID: string, target: unknown) =>
     (await openAssistBridge()).linkDailyItemNote(dayID, itemID, target as any)
   );
@@ -11355,6 +12414,17 @@ app.whenReady().then(() => {
     (await openAssistBridge()).scheduleBacklogItem(itemID, targetDayID)
   );
   ipcMain.handle("openassist:load-thread-memory", async (_event, threadID: string) => (await openAssistBridge()).loadThreadMemory(threadID));
+  ipcMain.handle("openassist:set-thread-memory-policy", async (
+    _event,
+    threadID: string,
+    patch: { useMemory?: boolean; learnFromChat?: boolean }
+  ) => (await openAssistBridge()).setThreadMemoryPolicy(threadID, patch));
+  ipcMain.handle("openassist:flush-thread-memory", async (_event, threadID: string) =>
+    (await openAssistBridge()).flushThreadMemoryLearning(threadID)
+  );
+  ipcMain.handle("openassist:retry-thread-memory", async (_event, threadID: string) =>
+    (await openAssistBridge()).retryThreadMemoryLearning(threadID)
+  );
   ipcMain.handle("openassist:thread-agent-files-path", async (_event, threadID: string) =>
     (await openAssistBridge()).threadAgentFilesPath(threadID)
   );
@@ -11363,6 +12433,21 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:destroy-temporary-thread", async (_event, threadID: string) =>
     (await openAssistBridge()).destroyTemporaryThread(threadID)
+  );
+  ipcMain.handle("openassist:open-side-chat", async (_event, parentThreadID: string) =>
+    (await openAssistBridge()).openSideChat(parentThreadID)
+  );
+  ipcMain.handle("openassist:touch-side-chat", async (_event, threadID: string) =>
+    (await openAssistBridge()).touchSideChat(threadID)
+  );
+  ipcMain.handle("openassist:destroy-side-chat", async (_event, threadID: string) =>
+    (await openAssistBridge()).destroySideChat(threadID)
+  );
+  ipcMain.handle("openassist:side-chat-context-status", async (_event, threadID: string) =>
+    (await openAssistBridge()).sideChatContextStatus(threadID)
+  );
+  ipcMain.handle("openassist:sync-side-chat-context", async (_event, threadID: string) =>
+    (await openAssistBridge()).syncSideChatContext(threadID)
   );
   ipcMain.handle("openassist:create-project", async (_event, name: string, kind: "project" | "folder", parentID?: string) =>
     (await openAssistBridge()).createProject(name, kind, parentID)
@@ -11402,6 +12487,12 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:move-project-to-folder", async (_event, projectID: string, folderID?: string | null) =>
     (await openAssistBridge()).moveProjectToFolder(projectID, folderID)
   );
+  ipcMain.handle("openassist:reorder-project", async (_event, projectID: string, targetProjectID: string, position: "before" | "after") =>
+    (await openAssistBridge()).reorderProject(projectID, targetProjectID, position)
+  );
+  ipcMain.handle("openassist:steer-active-turn", async (_event, threadID: string, text: string) =>
+    (await openAssistBridge()).steerActiveProviderTurn(threadID, text)
+  );
   ipcMain.handle("openassist:hide-project", async (_event, projectID: string) =>
     (await openAssistBridge()).hideProject(projectID)
   );
@@ -11434,6 +12525,9 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:delete-session-permanently", async (_event, threadID: string) =>
     (await openAssistBridge()).deleteSessionPermanently(threadID)
+  );
+  ipcMain.handle("openassist:clear-live-voice-log", async (_event, threadID: string) =>
+    (await openAssistBridge()).clearLiveVoiceLog(threadID)
   );
   ipcMain.handle("openassist:load-note", async (_event, projectID: string, noteID: string) => (await openAssistBridge()).loadNote(projectID, noteID));
   ipcMain.handle("openassist:list-note-history", async (_event, projectID: string, noteID: string) =>
@@ -11484,6 +12578,9 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:planner-daily-digest-apply", async (_event, plan: unknown) =>
     (await openAssistBridge()).applyPlannerDailyDigestPlan(plan)
+  );
+  ipcMain.handle("openassist:memory-dream-now", async () =>
+    (await openAssistBridge()).runMemoryDreamConsolidation({ force: true })
   );
   ipcMain.handle("openassist:delete-note", async (_event, projectID: string, noteID: string) =>
     (await openAssistBridge()).deleteProjectNote(projectID, noteID)
@@ -11561,6 +12658,7 @@ app.whenReady().then(() => {
     for (const window of BrowserWindow.getAllWindows()) {
       safeSendWindow(window, "openassist:settings-updated", updated);
     }
+    void armVoiceRecordingHelper("settings updated");
     return updated;
   });
   ipcMain.handle("openassist:update-settings", async (_event, updates: Parameters<OpenAssistBridge["updateSettings"]>[0]) => {
@@ -11569,8 +12667,15 @@ app.whenReady().then(() => {
     for (const window of BrowserWindow.getAllWindows()) {
       safeSendWindow(window, "openassist:settings-updated", updated);
     }
+    void armVoiceRecordingHelper("settings updated");
     return updated;
   });
+  ipcMain.handle("openassist:preview-junk-cleanup", async (_event, retentionDays?: number) =>
+    (await openAssistBridge()).previewJunkCleanup(retentionDays)
+  );
+  ipcMain.handle("openassist:run-junk-cleanup", async (_event, retentionDays?: number, confirmationToken?: string) =>
+    (await openAssistBridge()).runJunkCleanup(retentionDays, confirmationToken)
+  );
   ipcMain.handle("openassist:preview-color-theme", async (_event, theme: string | null) => {
     const nextTheme = typeof theme === "string" && theme.trim() ? theme.trim() : null;
     for (const window of BrowserWindow.getAllWindows()) {
@@ -11943,6 +13048,7 @@ app.whenReady().then(() => {
     contextProjectID?: string;
     contextProjectName?: string;
     contextThreadID?: string;
+    webrtcOfferSdp?: string;
   }) =>
     (await openAssistBridge()).startCodexRealtimeVoice(
       {
@@ -11957,7 +13063,8 @@ app.whenReady().then(() => {
         contextResources: options?.contextResources,
         contextProjectID: options?.contextProjectID,
         contextProjectName: options?.contextProjectName,
-        contextThreadID: options?.contextThreadID
+        contextThreadID: options?.contextThreadID,
+        webrtcOfferSdp: options?.webrtcOfferSdp
       },
       (payload: unknown) => {
         broadcastRealtimeEvent(payload, event.sender);
@@ -11969,6 +13076,9 @@ app.whenReady().then(() => {
   );
   ipcMain.handle("openassist:realtime-append-text", async (_event, text: string) =>
     (await openAssistBridge()).appendCodexRealtimeText(text)
+  );
+  ipcMain.handle("openassist:realtime-playback", async (_event, input: unknown) =>
+    (await openAssistBridge()).reportCodexRealtimePlayback(input)
   );
   ipcMain.handle("openassist:realtime-append-images", async (_event, input: unknown) =>
     (await openAssistBridge()).appendCodexRealtimeImages(input)
@@ -11983,6 +13093,49 @@ app.whenReady().then(() => {
     (await openAssistBridge()).listCodexRealtimeVoices()
   );
   ipcMain.handle("openassist:update-voice-hud", async (_event, payload: VoiceHUDPayload) => updateVoiceHUD(payload ?? { visible: false }));
+  // Manual drag for the live HUD's click surfaces (orb + caption). The HUD
+  // sends absolute screen coordinates at most once per animation frame. This
+  // is intentionally fire-and-forget: waiting for an IPC reply made the
+  // pointer outrun the window and left a queue of stale relative moves.
+  ipcMain.on("openassist:voice-hud-drag", (event, phase: string, screenX: number, screenY: number) => {
+    const window = voiceHUDWindow;
+    if (!window || window.isDestroyed() || event.sender !== window.webContents) return;
+    const pointerX = Math.round(Number(screenX));
+    const pointerY = Math.round(Number(screenY));
+    if (!Number.isFinite(pointerX) || !Number.isFinite(pointerY)) {
+      if (phase === "end") {
+        voiceHUDManualDragState = null;
+        const latestPayload = pendingVoiceHUDPayload;
+        if (latestPayload) void updateVoiceHUD({ ...latestPayload, visible: true });
+      }
+      return;
+    }
+    if (phase === "start") {
+      const bounds = window.getBounds();
+      voiceHUDManualDragState = {
+        pointerStartX: pointerX,
+        pointerStartY: pointerY,
+        windowStartX: bounds.x,
+        windowStartY: bounds.y
+      };
+      return;
+    }
+    const drag = voiceHUDManualDragState;
+    if (!drag) return;
+    const x = drag.windowStartX + pointerX - drag.pointerStartX;
+    const y = drag.windowStartY + pointerY - drag.pointerStartY;
+    voiceHUDLastSetBounds = { x, y };
+    window.setPosition(x, y, false);
+    // Remember the spot like a native drag would, so the pill stays parked.
+    if (isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)) {
+      voiceHUDCustomPosition = { x, top: y };
+    }
+    if (phase === "end") {
+      voiceHUDManualDragState = null;
+      const latestPayload = pendingVoiceHUDPayload;
+      if (latestPayload) void updateVoiceHUD({ ...latestPayload, visible: true });
+    }
+  });
   ipcMain.handle("openassist:live-voice-hud-action", async (_event, action: string) => {
     // Link chips in the live HUD: user-clicked, browser-bound. Only ever open
     // plain http(s) URLs; anything else is dropped.
@@ -11998,9 +13151,17 @@ app.whenReady().then(() => {
     if (action !== "toggleMute" && action !== "stop" && action !== "approveRequest" && action !== "rejectRequest" && action !== "openWork") {
       return { ok: false };
     }
-    if (action === "openWork" && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.show();
-      mainWindow.focus();
+    if (action === "openWork") {
+      // Clicking the orb/caption brings the app forward even if the window was
+      // closed or the app is behind another one.
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        createMainWindow();
+      } else {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+      app.focus({ steal: true });
     }
     BrowserWindow.getAllWindows().forEach((window) => {
       if (window === voiceHUDWindow) return;
@@ -12050,10 +13211,19 @@ app.whenReady().then(() => {
 
   createMainWindow();
   setupMenuBarTray();
+  // Keep this deferred: the HUD page is large (inline WebGL orb) and building
+  // it inline with startup blocks the main window from appearing.
   setTimeout(prewarmVoiceHUDWindow, 250);
   setTimeout(prewarmVoiceHelperBuild, 700);
   // Park a warm dictation helper so the first shortcut press is fast too.
-  setTimeout(() => { void armVoiceRecordingHelper("startup"); }, 5_000);
+  setTimeout(() => { void armVoiceRecordingHelper("startup"); }, 1_200);
+  // Same idea for Live Voice: launch its Codex app-server ahead of the first
+  // start so the connect path only pays for the network handshake.
+  setTimeout(() => {
+    void openAssistBridge()
+      .then((bridge) => bridge.prewarmLiveVoiceTransport("startup"))
+      .catch(() => undefined);
+  }, 6_000);
   setTimeout(installApplicationMenu, 800);
   setTimeout(prewarmSettingsWindow, 2200);
   if (process.platform === "darwin") {
@@ -12111,6 +13281,9 @@ app.on("before-quit", (event) => {
 
 app.on("will-quit", () => {
   isQuitting = true;
+  // Side chats and other temporary threads must not outlive the app. The
+  // startup purge remains the crash-safe backstop if this promise loses the race.
+  void openAssistBridge().then((bridge) => bridge.purgeTemporaryThreadsOnStartup()).catch(() => {});
   const wakeCapture = wakeWordCapture;
   if (wakeCapture) {
     terminateWakeWordCapture(wakeCapture, "app quit");

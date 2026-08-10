@@ -1,6 +1,6 @@
 export type JsonObject = Record<string, unknown>;
 
-export type LiveVoiceProvider = "openaiRealtime" | "geminiLive";
+export type LiveVoiceProvider = "openaiRealtime" | "geminiLive" | "codexSubscription";
 export type RealtimeWorkerPolicy = "auto" | "never";
 
 export type VoiceSessionLifecycle = "connecting" | "open" | "closed" | "error";
@@ -20,13 +20,26 @@ export type VoiceTurnPhase =
   | "interrupted"
   | "failed";
 
+export type VoiceTurnActionOwner =
+  | "capability"
+  | "delegation"
+  | "status"
+  | "cancellation"
+  | "navigation";
+
 export type CapabilityOperation = "discover" | "read" | "search" | "create" | "update" | "move" | "complete" | "delete" | "execute";
 export type CapabilityRisk = "read" | "reversible_write" | "sensitive_write";
 export type CapabilityExecutionMode = "blocking" | "background";
 export type CapabilityOutcomeStatus =
   | "completed"
+  | "not_found"
   | "selection_required"
   | "clarification_required"
+  // The resolved capability is correct but required arguments are missing.
+  // The response carries the capability's inputSchema (via candidates) plus a
+  // re-call instruction, so the model can fill arguments from the user's own
+  // request instead of asking the user to repeat themselves.
+  | "arguments_required"
   | "approval_required"
   | "permission_required"
   | "running"
@@ -44,6 +57,18 @@ export type CapabilityContextBinding = {
   resourceKind: string;
   argument: string;
   resourceField: "id" | "title" | "source";
+};
+
+export type CapabilityArgumentOwner =
+  | "goal-derived"
+  | "context-resource"
+  | "provider-supplied"
+  | "user-required";
+
+export type CapabilityArgumentBinding = {
+  owner: CapabilityArgumentOwner;
+  resourceKind?: string;
+  resourceField?: "id" | "title" | "source";
 };
 
 export type CapabilityOutputResourceMapping = {
@@ -65,8 +90,14 @@ export type CapabilityDescriptor = {
   keywords?: string[];
   resourceKinds?: string[];
   contextBindings?: CapabilityContextBinding[];
+  argumentBindings?: Record<string, CapabilityArgumentBinding>;
   outputResources?: CapabilityOutputResourceMapping[];
   inputSchema: JsonObject;
+  // Required fields the executor can derive from an injected `userIntent`
+  // (parsed server-side from the user's spoken request). Missing required
+  // fields NOT listed here still return arguments_required — e.g. an `id`
+  // can never be derived from speech.
+  selfDerivedArguments?: string[];
   risk: CapabilityRisk;
   executionMode: CapabilityExecutionMode;
   timeoutMs: number;
@@ -124,6 +155,10 @@ export type VoiceTurn = {
   updatedAt: number;
   toolSteps: number;
   ownerCallID?: string;
+  actionOwner?: VoiceTurnActionOwner;
+  operationID?: string;
+  taskID?: string;
+  ungroundedActionClaim?: boolean;
   finalDeliveryID?: string;
   interrupted: boolean;
   error?: string;
@@ -195,6 +230,7 @@ export type WorkerModelMetadata = {
 
 export type AssistantDelegateTask = {
   prompt: string;
+  userText?: string;
   provider?: string;
   project?: string;
   executionProfile?: DelegatedWorkExecutionProfile;
@@ -203,15 +239,27 @@ export type AssistantDelegateTask = {
 
 export type AssistantDelegateArguments = {
   goal: string;
+  userText?: string;
   tasks?: AssistantDelegateTask[];
   provider?: string;
   project?: string;
   executionProfile?: DelegatedWorkExecutionProfile;
   freshThread?: boolean;
+  mode?: "new" | "follow_up" | "rerun";
+  taskID?: string;
 };
+
+export type LiveVoiceViewDestination =
+  | "today"
+  | "notes"
+  | "threads"
+  | "voice_log"
+  | "review_inbox"
+  | "settings";
 
 export type LiveVoicePublicToolName =
   | "assistant_capability"
   | "assistant_delegate_work"
   | "assistant_task_status"
-  | "assistant_cancel_task";
+  | "assistant_cancel_task"
+  | "assistant_open_view";

@@ -331,6 +331,20 @@ export function selectSparkRecallModel(candidates: ReadonlyArray<string>, availa
   });
 }
 
+// Activity-shaped recall questions ("what did I do today?") name no topic, so
+// keyword scoring can never match them. They are answered from the day's
+// session files directly; this detector returns the day offset (0 = today,
+// -1 = yesterday) or undefined for ordinary content questions.
+export function personalRecallActivityDayOffset(question: string, context = ""): number | undefined {
+  const text = `${question}\n${context}`.toLowerCase().replace(/\s+/g, " ");
+  const activityShape =
+    /\b(what (did|have) (i|we)|did (i|we) (do|work|get|finish)|work(ed)? on|what happened|what was done|what got done|anything (done|new)|how was my day|summary of (my |the )?(day|work)|accomplish|(search|check|find|look through|scan) .*(thread|threads|session|sessions|chat|chats|history)\b)/;
+  if (!activityShape.test(text)) return undefined;
+  if (/\byesterday\b/.test(text)) return -1;
+  if (/\b(today|this morning|this afternoon|tonight|this evening|so far)\b/.test(text)) return 0;
+  return undefined;
+}
+
 function textFromContent(value: unknown) {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return "";

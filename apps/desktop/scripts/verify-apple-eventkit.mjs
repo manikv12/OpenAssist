@@ -47,6 +47,9 @@ if (!requestAccessSource.includes("RunLoop.current.run")) throw new Error("Permi
 if (!requestAccessSource.includes("timedOut")) throw new Error("Permission request must report timeout state.");
 if (requestAccessSource.includes("DispatchSemaphore")) throw new Error("Permission request must not block EventKit with DispatchSemaphore.");
 if (!helperSource.includes('case "update-reminder"')) throw new Error("Apple EventKit helper must expose reminder updates.");
+if ((helperSource.match(/formatter\.timeZone = TimeZone\.current/g) ?? []).length < 2) {
+  throw new Error("ISO formatters must serialize LOCAL time. UTC output shifted evening reminders to the next day's date and models told the user the wrong day.");
+}
 if (!helperSource.includes("private func updateReminder")) throw new Error("Apple EventKit helper must update reminders without completing them.");
 if (!helperSource.includes("responsibility_spawnattrs_setdisclaim")) {
   throw new Error("Helper must disclaim TCC responsibility so permission prompts attribute to the helper, not the parent Electron process.");

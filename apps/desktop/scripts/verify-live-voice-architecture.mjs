@@ -330,6 +330,62 @@ assert.equal(voiceControlForText("Thanks").handled, false);
 }
 
 {
+  let executed = 0;
+  let executedArguments;
+  const reminderWrite = descriptor({
+    id: "knowledge_apple_add_reminder",
+    description: "Create an Apple Reminder.",
+    operations: ["create"],
+    source: "apple_reminders",
+    sourceAliases: ["Apple Reminders"],
+    keywords: ["create recurring reminder"],
+    risk: "sensitive_write",
+    idempotency: "required"
+  });
+  const coordinator = makeCoordinator({
+    descriptors: [reminderWrite],
+    executeCapability: async (_descriptor, request) => {
+      executed += 1;
+      executedArguments = request.arguments;
+      return { ok: true };
+    }
+  });
+  const requestTurnID = begin(coordinator, "Create a weekly Apple Reminder for taking out the trash.");
+  const approval = await coordinator.capability(requestTurnID, "call-reminder-approval", {
+    goal: "Create a weekly Apple Reminder for taking out the trash.",
+    operation: "create",
+    capabilityID: "knowledge_apple_add_reminder",
+    arguments: {
+      title: "Take out the trash",
+      dueDate: "2026-07-24T09:00:00-05:00",
+      recurrence: { frequency: "weekly" }
+    }
+  });
+  assert.equal(approval.status, "approval_required");
+
+  const confirmationTurnID = begin(coordinator, "Yes confirmed");
+  const completed = await coordinator.capability(confirmationTurnID, "call-reminder-confirmed", {
+    goal: "Yes confirmed",
+    operation: "create",
+    capabilityID: "knowledge_apple_add_reminder",
+    arguments: {}
+  });
+  assert.equal(completed.status, "completed", "A clear confirmation on the next voice turn must execute the saved action once.");
+  assert.equal(executed, 1);
+  assert.equal(executedArguments?.title, "Take out the trash");
+  assert.deepEqual(executedArguments?.recurrence, { frequency: "weekly" });
+
+  const duplicate = await coordinator.capability(confirmationTurnID, "call-reminder-confirmed-again", {
+    goal: "Yes confirmed",
+    operation: "create",
+    capabilityID: "knowledge_apple_add_reminder",
+    arguments: {}
+  });
+  assert.notEqual(duplicate.status, "completed", "A consumed approval must not execute a second time.");
+  assert.equal(executed, 1);
+}
+
+{
   let resolveRead;
   const pendingRead = new Promise((resolve) => { resolveRead = resolve; });
   const coordinator = makeCoordinator({
@@ -414,6 +470,46 @@ assert.equal(voiceControlForText("Thanks").handled, false);
   const workTurn = coordinator.beginTurn("openaiRealtime", "Fix the compiler errors in the repository.", "work-item");
   assert.equal((await coordinator.delegate(workTurn, "call-real-work", { goal: "Fix the compiler errors in the repository." })).status, "running");
   assert.equal(delegated, 1);
+}
+
+{
+  let delegatedRequest;
+  const coordinator = makeCoordinator({
+    delegateWork: async (request) => {
+      delegatedRequest = request;
+      return { status: "running", taskID: "task-existing" };
+    }
+  });
+  const turnID = begin(coordinator, "Send this correction to the agent that is already working.");
+  const result = await coordinator.delegate(turnID, "call-follow-up", {
+    goal: "Use the other signed-in account instead.",
+    mode: "follow_up",
+    taskID: "task-existing"
+  });
+  assert.equal(result.status, "running");
+  assert.equal(delegatedRequest?.mode, "follow_up");
+  assert.equal(delegatedRequest?.taskID, "task-existing");
+}
+
+{
+  let delegatedRequest;
+  const coordinator = makeCoordinator({
+    delegateWork: async (request) => {
+      delegatedRequest = request;
+      return { status: "running", taskID: "task-rerun" };
+    }
+  });
+  const turnID = begin(coordinator, "Run that finished work again with Sol.");
+  const result = await coordinator.delegate(turnID, "call-rerun", {
+    goal: "Run that finished work again with Sol.",
+    mode: "rerun",
+    taskID: "task-finished",
+    executionProfile: { modelPreference: "sol" }
+  });
+  assert.equal(result.status, "running");
+  assert.equal(delegatedRequest?.mode, "rerun");
+  assert.equal(delegatedRequest?.taskID, "task-finished");
+  assert.equal(delegatedRequest?.executionProfile?.modelPreference, "sol");
 }
 
 {
@@ -528,6 +624,11 @@ assert.equal(voiceControlForText("Thanks").handled, false);
     "still-running",
     "An active task must remain the relevant status even when another task finished more recently."
   );
+  assert.deepEqual(
+    tasks.recentFinished().map((task) => task.taskID),
+    ["already-finished"],
+    "The bounded result context must include terminal work without mixing in running tasks."
+  );
 }
 
 const proxySource = await readFile(path.join(desktopRoot, "electron", "realtimeProxy.ts"), "utf8");
@@ -546,6 +647,13 @@ assert.match(proxySource, /input_audio_transcription\.completed[\s\S]{0,400}begi
 assert.match(proxySource, /# Authoritative Background Work State/, "An active worker must be published into the provider's current instructions.");
 assert.match(proxySource, /Before answering whether delegated work is done[\s\S]{0,160}assistant_task_status/, "Status answers must consult the task coordinator.");
 assert.match(proxySource, /statusSource:\s*"task_coordinator"[\s\S]{0,100}followUpAction:\s*"assistant_task_status"/, "Delegation must identify the authoritative status source.");
+assert.match(proxySource, /request\.mode === "follow_up"[\s\S]{0,180}followUpCodexHandoff/, "Follow-ups must enter the existing-task continuation path.");
+assert.match(proxySource, /request\.mode === "rerun"[\s\S]{0,120}rerunCodexHandoff/, "Finished work reruns must enter the coordinator's rerun path.");
+assert.match(proxySource, /startCodexHandoff\(request\.callID, requested\.prompt/, "Reruns must reuse the original task goal instead of sending routing words to the worker.");
+assert.match(proxySource, /sendClientContent\(\{ turns: text, turnComplete: true \}\)/, "Gemini text and worker results must use ordered durable conversation content.");
+assert.match(proxySource, /Recent terminal Agent Work results/, "Completed worker results must remain in bounded provider context for follow-up questions.");
+assert.match(bridgeSource, /const liveVoiceWorkerFollowUps = new Map/, "The Codex handoff must own a follow-up queue for running tasks.");
+assert.match(bridgeSource, /providerPrompt = realtimeWorkerFollowUpPrompt\(followUp\.prompt\)/, "Queued follow-ups must continue in the same Codex worker thread.");
 assert.match(proxySource, /name:\s*"knowledge_apple_update_reminder"[\s\S]{0,1600}operations:\s*\["update"\]/, "Live Voice must expose a dedicated Apple reminder update capability.");
 assert.match(proxySource, /Never replace one operation with a different write operation/, "Providers must preserve the requested write operation.");
 assert.doesNotMatch(proxySource, /function classifyRealtimeRequest|function decideRealtimeDelegation|Ollama delegation router/i);

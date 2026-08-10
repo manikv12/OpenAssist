@@ -17,6 +17,18 @@ assert.match(bridge, /session\.isArchived = true;[\s\S]{0,200}?updateSession\(se
 assert.match(bridge, /finalizeLiveVoiceDayLog\(rotatedID\)/, "rotation must invoke the day-log finalize hook");
 assert.match(bridge, /pruneArchivedLiveVoiceThreads\(\)/, "rotation must prune old voice archives (registry 200-cap)");
 assert.match(bridge, /session\.kind = "liveVoice";\s*\n\s*session\.liveVoiceDayID = todayDayID;/, "fresh voice threads must be stamped with flag and day");
+assert.match(bridge, /function clearLiveVoiceLog/, "the bridge must expose a dedicated day-log clear action");
+assert.match(bridge, /if \(session\?\.kind === "liveVoice"\) continue;/, "an empty cleared Voice Log must survive cleanup");
+assert.match(
+  bridge.match(/function clearLiveVoiceLog[\s\S]*?\n\}/)?.[0] ?? "",
+  /conversationHistorySegmentFiles[\s\S]*?conversation-history\.json/,
+  "clearing a Voice Log must remove its older paged history too"
+);
+assert.doesNotMatch(
+  bridge.match(/function clearLiveVoiceLog[\s\S]*?\n\}/)?.[0] ?? "",
+  /deleteSessionPermanently|memoryDream|AssistantMemory/,
+  "clearing a Voice Log must not delete its thread, notes, or saved memories"
+);
 
 // Migration: legacy title-matched thread gets the flag stamped on first touch.
 assert.match(bridge, /session\.kind !== "liveVoice" \|\| !session\.liveVoiceDayID/, "legacy threads must be migrated in place");
@@ -28,6 +40,17 @@ assert.match(app, /saveTodayLiveVoiceThreadID\(liveThreadID\);/, "start result m
 // Predicates recognize the flag and dated archives so they group under Archived Voice.
 assert.match(app, /thread\?\.kind === "liveVoice"/, "renderer predicate must honor the kind flag");
 assert.match(app, /isRotatedLiveVoiceThreadTitle/, "renderer must recognize rotated dated titles");
+assert.match(app, /Clear this day’s Voice Log/, "the selected day must expose a clear action");
+assert.match(
+  app,
+  /threads=\{\[\.\.\.liveVoiceThreads, \.\.\.threads\]\}/,
+  "archived Voice Logs must be available to the shared right-click delete menu"
+);
+assert.match(
+  app,
+  /thread\.isArchived[\s\S]{0,500}?label: "Delete Permanently"/,
+  "archived thread context menus must expose permanent deletion"
+);
 assert.doesNotMatch(app, /thread\.title === "Today Live Voice"/, "no hardcoded title literals outside the predicate helpers");
 
 // ThreadItem carries the kind flag across the bridge boundary.

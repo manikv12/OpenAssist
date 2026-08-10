@@ -37,18 +37,28 @@ assert.match(
 );
 assert.match(
   bridge,
-  /isNewSession \? openAssistKnowledgeAgentInstructions\("Claude"\) : openAssistKnowledgeAgentInstructionsCompact\("Claude"\)/,
-  "Claude Code must get the full block only on new sessions and the compact one on resumed turns."
+  /isNewSession\s*\?\s*openAssistKnowledgeAgentInstructions\("Claude", options\?\.includeAutomaticProfile === true, \{ threadID: session\?\.id, projectID: session\?\.projectID \}\)\s*:\s*openAssistKnowledgeAgentInstructionsCompact\("Claude"\)/,
+  "Claude Code must get the profile-aware full block only on new sessions and the compact one on resumed turns."
 );
 assert.match(
   bridge,
-  /isNewSession \? openAssistKnowledgeAgentInstructions\("Copilot"\) : openAssistKnowledgeAgentInstructionsCompact\("Copilot"\)/,
-  "Copilot must get the full block only on new sessions and the compact one on resumed turns."
+  /isNewSession \? openAssistKnowledgeAgentInstructions\("Copilot", includeAutomaticProfile, \{ threadID: session\?\.id, projectID: session\?\.projectID \}\) : openAssistKnowledgeAgentInstructionsCompact\("Copilot"\)/,
+  "Copilot must get the profile-aware full block only on new sessions and the compact one on resumed turns."
 );
 assert.match(
   bridge,
   /openAssistKnowledgeAgentInstructionsCompact\("Antigravity"\)/,
   "Antigravity's per-turn header must use the compact instruction block."
+);
+assert.match(
+  bridge,
+  /openAssistKnowledgeAgentInstructions\("Ollama", includeAutomaticProfile, memoryContext\)/,
+  "Ollama must receive the automatic profile flag in its session instructions."
+);
+assert.match(
+  bridge,
+  /includeAutomaticProfile = session\?\.kind !== "sideChat"\s*&& Boolean\(cliKnowledgeAccess\)\s*&& automaticMemoryEnabled\(settings\)\s*&& turnMemoryPolicy\.useMemory/,
+  "Automatic profiles must be permission-gated and excluded from side chats."
 );
 
 // --- A3: stateless replay caps ---
@@ -126,9 +136,10 @@ for (const tool of ["oa_memory_save", "oa_memory_list", "oa_memory_read", "oa_me
 assert.match(bridge, /function appendSessionDigest\(/, "Automatic session digests must exist.");
 assert.match(
   bridge,
-  /if \(!isTransient && userSource !== "realtimeVoice"\) \{\s*\n\s*appendSessionDigest\(/,
-  "Digests must be written on completed turns, skipping temporary and realtime-voice threads."
+  /const artifact = appendSessionDigest\([\s\S]*?queueMemoryDream\(learningThreadID, artifact\)/,
+  "Normal and finalized Live Voice turns must queue the exact digest artifact that was written."
 );
+assert.match(bridge, /userSource: "realtimeVoice"/, "Live Voice learning must enter through finalized committed turns.");
 
 // --- B4: recall indexing ---
 assert.match(bridge, /"assistant_memory",/, "assistant_memory must be a knowledge timeline source type.");
@@ -168,5 +179,16 @@ assert.match(
   /oa_memory_save \/ oa_memory_list \/ oa_memory_read/,
   "The compact per-turn block must keep the memory tool hint."
 );
+
+// --- B6: lean automatic memory dreaming ---
+assert.match(bridge, /function runMemoryDreamConsolidation\(/, "Manual memory consolidation must be wired through the bridge.");
+assert.match(bridge, /memoryDreamingEnabled/, "Background memory must have its own persisted setting gate.");
+assert.match(bridge, /rankScopedMemoryCatalog\(\s*memoryCatalogEntries\(\)/s, "Automatic recall must use the scoped local memory catalog.");
+const automaticRecall = bridge.slice(
+  bridge.indexOf("function automaticMemoryContextForPrompt("),
+  bridge.indexOf("function automaticMemoryContextForPrompt(") + 1800
+);
+assert.doesNotMatch(automaticRecall, /searchKnowledgeTimeline|fetch\(/, "Automatic recall must not scan all Knowledge data or call the network.");
+assert.match(bridge, /memoryProfilePath\(\)/, "The bounded profile must use the existing Memory directory.");
 
 console.log("Memory and context-diet guards verified.");

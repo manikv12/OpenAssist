@@ -2,6 +2,7 @@
 
 type LocalFilePreviewKind =
   | "image"
+  | "video"
   | "pdf"
   | "markdown"
   | "html"
@@ -242,6 +243,19 @@ interface Window {
       detail: import("./types").ThreadDetail;
     }>;
     destroyTemporaryThread: (threadID: string) => Promise<{ ok: boolean; kept?: boolean }>;
+    openSideChat: (parentThreadID: string) => Promise<{
+      thread: import("./types").ThreadItem;
+      detail: import("./types").ThreadDetail;
+      parentThreadID: string;
+      reopened: boolean;
+    }>;
+    touchSideChat: (threadID: string) => Promise<void>;
+    destroySideChat: (threadID: string) => Promise<{ ok: boolean }>;
+    sideChatContextStatus: (threadID: string) => Promise<{ newMessages: number }>;
+    syncSideChatContext: (threadID: string) => Promise<{ ok: boolean; count: number }>;
+    onSideChatDestroyed: (
+      callback: (event: { threadID: string; parentThreadID?: string; reason: string }) => void
+    ) => () => void;
     createProject: (
       name: string,
       kind: "project" | "folder",
@@ -254,6 +268,8 @@ interface Window {
     openProjectFolder: (parentID?: string | null) => Promise<import("./types").ProjectItem | null>;
     removeProjectFolderLink: (projectID: string) => Promise<import("./types").ProjectItem | null>;
     moveProjectToFolder: (projectID: string, folderID?: string | null) => Promise<import("./types").ProjectItem | null>;
+    reorderProject: (projectID: string, targetProjectID: string, position: "before" | "after") => Promise<import("./types").ProjectItem | null>;
+    steerActiveTurn: (threadID: string, text: string) => Promise<{ ok: boolean; reason?: string; provider?: string }>;
     hideProject: (projectID: string) => Promise<{ ok: boolean }>;
     unhideProject: (projectID: string) => Promise<import("./types").ProjectItem | null>;
     deleteProject: (projectID: string) => Promise<{ ok: boolean }>;
@@ -264,6 +280,11 @@ interface Window {
     archiveSession: (threadID: string) => Promise<import("./types").ThreadItem | null>;
     unarchiveSession: (threadID: string) => Promise<import("./types").ThreadItem | null>;
     deleteSessionPermanently: (threadID: string) => Promise<{ ok: boolean }>;
+    clearLiveVoiceLog: (threadID: string) => Promise<{
+      ok: boolean;
+      thread: import("./types").ThreadItem;
+      detail: import("./types").ThreadDetail;
+    }>;
     loadThreadNote: (threadID: string) => Promise<import("./types").ThreadNoteWorkspace>;
 	    createThreadNote: (threadID: string, title?: string) => Promise<import("./types").ThreadNoteWorkspace>;
 	    saveThreadNote: (
@@ -302,13 +323,20 @@ interface Window {
       categories: import("./types").PlannerCategory[];
     }>;
     deletePlannerCategory: (categoryID: string) => Promise<import("./types").PlannerCategory[]>;
-    savePlannerDay: (dayID: string | undefined, markdown: string) => Promise<import("./types").PlannerDayDetail>;
+    applyPlannerEditorMutation: (input: import("./types").PlannerEditorMutation) => Promise<import("./types").PlannerApplyResult>;
+    applyPlannerOperations: (input: import("./types").PlannerMutationBatch) => Promise<import("./types").PlannerApplyResult>;
+    resolvePlannerEditorConflicts: (input: import("./types").PlannerConflictResolution) => Promise<import("./types").PlannerApplyResult>;
     scheduleSelectionToPlanner: (request: import("./types").PlannerScheduleRequest) => Promise<import("./types").PlannerDayDetail>;
     listDailyItems: (dayID?: string) => Promise<import("./types").DailyItem[]>;
     listBacklogItems: () => Promise<import("./types").DailyItem[]>;
     upsertDailyItem: (item: import("./types").DailyItemInput) => Promise<import("./types").DailyItemMutationResult>;
     toggleDailyItem: (dayID: string | undefined, itemID: string, checked: boolean) => Promise<import("./types").DailyItemMutationResult>;
     deleteDailyItem: (dayID: string | undefined, itemID: string) => Promise<import("./types").DailyItemMutationResult>;
+    moveDailyItemToDay: (
+      dayID: string | undefined,
+      itemID: string,
+      targetDayID: string
+    ) => Promise<import("./types").DailyItemMutationResult>;
     linkDailyItemNote: (
       dayID: string | undefined,
       itemID: string,
@@ -320,6 +348,15 @@ interface Window {
     moveDailyItemToBacklog: (dayID: string | undefined, itemID: string) => Promise<import("./types").BacklogItemMutationResult>;
     scheduleBacklogItem: (itemID: string, targetDayID: string) => Promise<import("./types").BacklogItemMutationResult>;
     loadThreadMemory: (threadID: string) => Promise<import("./types").ThreadMemorySnapshot>;
+    setThreadMemoryPolicy: (
+      threadID: string,
+      patch: { useMemory?: boolean; learnFromChat?: boolean }
+    ) => Promise<import("./types").ThreadMemorySnapshot>;
+    flushThreadMemory: (threadID: string) => Promise<{ ok: boolean }>;
+    retryThreadMemory: (threadID: string) => Promise<{
+      ok: boolean;
+      memory: import("./types").ThreadMemorySnapshot;
+    }>;
     threadAgentFilesPath: (threadID: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
     setThreadProvider: (threadID: string, backend: string, modelID?: string) => Promise<import("./types").ThreadItem | null>;
     loadNote: (projectID: string, noteID: string) => Promise<import("./types").NoteDetail>;
@@ -331,6 +368,7 @@ interface Window {
 		    cleanupNoteWithCodex: (request: import("./types").NoteAICleanupRequest) => Promise<import("./types").NoteAICleanupResult>;
     plannerDailyDigest?: (dayID?: string) => Promise<import("./types").PlannerDailyDigestResult>;
     applyPlannerDailyDigest?: (plan: import("./types").PlannerDailyDigestPlan) => Promise<{ ok: boolean; error?: string; moved: number; created: number }>;
+	    memoryDreamNow?: () => Promise<{ ok: boolean; message: string; memoriesSaved: number; profileWritten: boolean }>;
 		    openMarkdownFileForImport: () => Promise<import("./types").MarkdownImportFile | null>;
 		    createNote: (projectID: string) => Promise<{ note: import("./types").NoteItem; detail: import("./types").NoteDetail }>;
 		    renameNote: (projectID: string, noteID: string, title: string) => Promise<import("./types").NoteDetail>;
@@ -371,6 +409,8 @@ interface Window {
 		        value: import("./types").SettingsUpdateValue;
 		      }>
 		    ) => Promise<import("./types").SettingsSnapshot>;
+		    previewJunkCleanup: (retentionDays?: number) => Promise<import("./types").StorageCleanupPreview>;
+		    runJunkCleanup: (retentionDays?: number, confirmationToken?: string) => Promise<import("./types").StorageCleanupResult>;
 		    previewColorTheme: (theme: string | null) => Promise<{ ok: boolean }>;
 		    knowledgeStatus: () => Promise<import("./types").KnowledgeStatus>;
 	    listKnowledgeRequests: (
@@ -490,6 +530,10 @@ interface Window {
       cloudTranscriptionBaseURL: string;
       cloudTranscriptionProviderRequiresKey: boolean;
       cloudTranscriptionAPIKeyConfigured: boolean;
+      floatingHUDEnabled: boolean;
+      waveformTheme: string;
+      colorTheme: string;
+      appChromeStyle: string;
       dictationStartSoundName: string;
       dictationStopSoundName: string;
       dictationProcessingSoundName: string;
@@ -574,7 +618,8 @@ interface Window {
       links?: Array<{ label: string; url: string }>;
     }) => Promise<{ ok: boolean; visible: boolean; pending?: boolean }>;
     liveVoiceHUDAction: (action: "toggleMute" | "stop" | "approveRequest" | "rejectRequest" | "openWork") => Promise<{ ok: boolean }>;
-    onLiveVoiceHUDAction: (callback: (action: "toggleMute" | "stop" | "approveRequest" | "rejectRequest" | "openWork") => void) => (() => void);
+    liveVoiceHUDDrag: (phase: "start" | "move" | "end", screenX: number, screenY: number) => void;
+    onLiveVoiceHUDAction: (callback: (action: "toggleMute" | "muteMic" | "unmuteMic" | "stop" | "approveRequest" | "rejectRequest" | "openWork") => void) => (() => void);
     submitScreenAnalysis: (instruction: string, options?: { readback?: boolean }) => Promise<{ ok: boolean }>;
     cancelScreenAnalysis: () => Promise<{ ok: boolean }>;
     chooseScreenAnalysisReferenceImages: () => Promise<{
@@ -655,6 +700,10 @@ interface Window {
 	        source?: string;
 	        attributes?: Record<string, unknown>;
 	      }>;
+	      contextProjectID?: string;
+	      contextProjectName?: string;
+	      contextThreadID?: string;
+	      webrtcOfferSdp?: string;
 	    }) => Promise<{
 	      ok: boolean;
 	      threadId?: string;
@@ -668,6 +717,11 @@ interface Window {
       numChannels: number;
       samplesPerChannel: number | null;
       itemId: string | null;
+    }) => Promise<{ ok: boolean; error?: string }>;
+    playback?: (event: {
+      state: "started" | "finished";
+      deliveryID: string;
+      itemID?: string;
     }) => Promise<{ ok: boolean; error?: string }>;
     appendText: (text: string) => Promise<{ ok: boolean; error?: string }>;
     appendImages: (input: {

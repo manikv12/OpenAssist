@@ -99,6 +99,9 @@ assert.doesNotMatch(openAIRestore, /response\.create/, "history restore must not
 assert.doesNotMatch(proxy, /transcript[^\n]*\.slice\(/i, "debug logs must not include transcript text");
 
 assert.match(bridge, /buildLiveVoiceBootstrapContext/);
+assert.match(bridge, /codexVoiceStartupContext:\s*realtimeVoiceProvider === "codexSubscription"/);
+assert.match(bridge, /subscriptionStartupTaskSummaries\(openAssistThreadID\)/);
+assert.match(bridge, /codexVoiceScopedMemoryIndex\(recallContext\)/);
 assert.match(bridge, /userSource: "realtimeVoice"/);
 assert.match(bridge, /type: "thread\/realtime\/conversation\/committed"/);
 assert.match(bridge, /alreadyPersisted[\s\S]*?providerTurnID/);

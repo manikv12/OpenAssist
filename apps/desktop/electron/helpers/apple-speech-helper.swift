@@ -241,37 +241,59 @@ private final class AudioFileCapture: NSObject {
         }
     }
 
-    func start() {
+    func prepare() throws {
+        guard recorder == nil else { return }
         guard let sessionDirectory else {
-            emit(["type": "error", "message": "Voice recording needs a session folder."])
-            exit(2)
+            throw NSError(
+                domain: "OpenAssistVoiceCapture",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Voice recording needs a session folder."]
+            )
         }
 
+        microphoneSelection.apply()
+        let directoryURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let nextAudioURL = directoryURL.appendingPathComponent("voice-input.wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVSampleRateKey: 16_000.0,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+        let nextRecorder = try AVAudioRecorder(url: nextAudioURL, settings: settings)
+        nextRecorder.isMeteringEnabled = true
+        guard nextRecorder.prepareToRecord() else {
+            microphoneSelection.restore()
+            throw NSError(
+                domain: "OpenAssistVoiceCapture",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Could not prepare microphone recording."]
+            )
+        }
+        audioURL = nextAudioURL
+        recorder = nextRecorder
+    }
+
+    func start() {
         do {
-            microphoneSelection.apply()
-            let directoryURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
-            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-            let nextAudioURL = directoryURL.appendingPathComponent("voice-input.wav")
-            let settings: [String: Any] = [
-                AVFormatIDKey: Int(kAudioFormatLinearPCM),
-                AVSampleRateKey: 16_000.0,
-                AVNumberOfChannelsKey: 1,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsNonInterleaved: false,
-                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
-            ]
-            let nextRecorder = try AVAudioRecorder(url: nextAudioURL, settings: settings)
-            nextRecorder.isMeteringEnabled = true
-            nextRecorder.prepareToRecord()
-            guard nextRecorder.record() else {
+            try prepare()
+            guard let recorder else {
+                throw NSError(
+                    domain: "OpenAssistVoiceCapture",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Voice recorder was not prepared."]
+                )
+            }
+            guard recorder.record() else {
                 microphoneSelection.restore()
                 emit(["type": "error", "message": "Could not start microphone recording."])
                 exit(2)
             }
-            audioURL = nextAudioURL
-            recorder = nextRecorder
             meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
                 self?.emitLevel()
             }
@@ -281,6 +303,13 @@ private final class AudioFileCapture: NSObject {
             emit(["type": "error", "message": error.localizedDescription])
             exit(2)
         }
+    }
+
+    func cancel() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+        recorder?.stop()
+        microphoneSelection.restore()
     }
 
     func stop() {
@@ -536,12 +565,24 @@ if shouldRecordAudioFile {
                 // Armed: permissions verified, mic still OFF. Block on a kqueue
                 // directory watch (no polling) until the app writes
                 // start-recording.json — or a stop file / parent death ends us.
+                // Prepare the default-device recorder now so the shortcut only
+                // needs to call record(). An explicitly selected microphone may
+                // require a system route switch, so keep that on the start path.
+                if selectedMicrophoneUID == nil && !shouldPreferExternalMicrophone {
+                    do {
+                        try capture.prepare()
+                    } catch {
+                        emit(["type": "error", "message": error.localizedDescription])
+                        exit(2)
+                    }
+                }
                 emit(["type": "armed", "message": "Voice helper armed."])
                 let directoryURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
                 let startPath = directoryURL.appendingPathComponent("start-recording.json").path
                 let stopPath = directoryURL.appendingPathComponent("stop").path
                 let maybeBegin = {
                     if FileManager.default.fileExists(atPath: stopPath) {
+                        capture.cancel()
                         exit(0)
                     }
                     if FileManager.default.fileExists(atPath: startPath) {

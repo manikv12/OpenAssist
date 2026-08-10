@@ -58,4 +58,27 @@ build_helper \
   "-" \
   -framework AVFoundation -framework CoreAudio -framework Speech
 
+/usr/bin/swiftc \
+  -target arm64-apple-macos14.0 \
+  -framework CoreImage \
+  -framework Vision \
+  "${SOURCE_ROOT}/vision-background-helper.swift" \
+  -o "${OUTPUT_ROOT}/vision-background-helper"
+chmod 755 "${OUTPUT_ROOT}/vision-background-helper"
+/usr/bin/codesign --force --options runtime --sign "$SIGN_IDENTITY" \
+  "${OUTPUT_ROOT}/vision-background-helper"
+
+/usr/bin/swiftc \
+  -target arm64-apple-macos13.0 \
+  -framework AVFoundation \
+  -framework CoreGraphics \
+  -framework CoreVideo \
+  -framework ImageIO \
+  -framework UniformTypeIdentifiers \
+  "${SOURCE_ROOT}/short-video-helper.swift" \
+  -o "${OUTPUT_ROOT}/short-video-helper"
+chmod 755 "${OUTPUT_ROOT}/short-video-helper"
+/usr/bin/codesign --force --options runtime --sign "$SIGN_IDENTITY" \
+  "${OUTPUT_ROOT}/short-video-helper"
+
 echo "Native helpers built at ${OUTPUT_ROOT}"

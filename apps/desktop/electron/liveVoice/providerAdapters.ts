@@ -42,7 +42,7 @@ export const liveVoicePublicToolSpecs: LiveVoiceToolSpec[] = [
   },
   {
     name: "assistant_delegate_work",
-    description: "Delegate genuine Codex agent work such as current web research, code, terminal, browser, Computer Use, or a Codex skill. Do not use when assistant_capability can directly do the request. One or more explicit tasks may run in the background.",
+    description: "Start genuine Codex agent work, add a follow-up to running work, or rerun finished work. Use mode=follow_up for the same running worker and mode=rerun to repeat a finished task, including with an explicitly requested Spark or Sol model.",
     geminiBehavior: "NON_BLOCKING",
     parameters: {
       type: "object",
@@ -66,7 +66,9 @@ export const liveVoicePublicToolSpecs: LiveVoiceToolSpec[] = [
         provider: { type: "string", description: "Only set when the user explicitly names a worker/provider." },
         project: { type: "string", description: "Only set when the user explicitly names a destination project." },
         executionProfile: delegatedWorkExecutionProfileSchema,
-        freshThread: { type: "boolean", description: "Set true only when the user explicitly asks to start over in a new thread or to drop earlier task context. Follow-up work otherwise continues in the same worker thread automatically." }
+        freshThread: { type: "boolean", description: "Set true only when the user explicitly asks to start over in a new thread or to drop earlier task context." },
+        mode: { type: "string", enum: ["new", "follow_up", "rerun"], description: "Use follow_up to continue running work. Use rerun to repeat a finished task, optionally with a different explicitly requested worker model." },
+        taskID: { type: "string", description: "The Agent Work task to continue or rerun. Omit only when the intended task is unambiguous from authoritative task state." }
       },
       required: ["goal", "executionProfile"],
       additionalProperties: false
@@ -91,6 +93,22 @@ export const liveVoicePublicToolSpecs: LiveVoiceToolSpec[] = [
       type: "object",
       properties: { taskID: { type: "string" } },
       required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "assistant_open_view",
+    description: "Open one approved OpenAssist view. Use this for requests such as taking the user to Today, Notes, Threads, the Voice Log, Review Inbox, or Settings. Never claim navigation succeeded until this tool returns success.",
+    geminiBehavior: "BLOCKING",
+    parameters: {
+      type: "object",
+      properties: {
+        destination: {
+          type: "string",
+          enum: ["today", "notes", "threads", "voice_log", "review_inbox", "settings"]
+        }
+      },
+      required: ["destination"],
       additionalProperties: false
     }
   }

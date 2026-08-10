@@ -41,6 +41,8 @@ const functionNames = [
   "isMemoryWriteRequest",
   "asksAboutStoredMemories",
   "asksWhatAgentRemembers",
+  "asksAboutAgentThreadHistory",
+  "asksAboutRecentPastActivity",
   "conversationRecallRoute",
   "recallRouteForToolCall"
 ];
@@ -81,7 +83,15 @@ const personalPhrases = [
   "read my codex memory",
   "What were we working on in Codex yesterday?",
   "So, what was the note that you added last time?",
-  "Last time, what note did you create?"
+  "Last time, what note did you create?",
+  // regressions: recall questions phrased as commands ("check"/"search" used
+  // to hard-veto these as agent execution — seen live 2026-08-01 when
+  // "Check the codex threads if we worked on it" was refused)
+  "Check the codex threads if we worked on it",
+  "check the codex threads",
+  "Search Codex threads from today for work related to Airbnb",
+  "Can you check if we have done something about the Airbnb application today",
+  "look through my claude sessions from yesterday"
 ];
 for (const phrase of personalPhrases) {
   assert.equal(conversationRecallRoute(phrase), "personal", `Expected personal: "${phrase}"`);
@@ -127,10 +137,9 @@ assert.equal(recallRouteForToolCall("memories from codex", ""), "personal");
 assert.equal(recallRouteForToolCall("save this to memory", ""), "none");
 assert.equal(recallRouteForToolCall("check the website for the latest news", ""), "none");
 
-// 5. Both provider veto sites must use the two-text guard, not the raw route.
-const geminiGuard = /const query = stringValue\(effectiveArgs\.query, effectiveArgs\.question, effectiveArgs\.prompt, effectiveArgs\.text\);\s*\n\s*const recallRoute = recallRouteForToolCall\(query, this\.geminiInputTranscript \|\| this\.lastUserUtterance\);/;
-const openAIGuard = /const query = stringValue\(effectiveArgs\.query, effectiveArgs\.question, effectiveArgs\.prompt, effectiveArgs\.text\);\s*\n\s*const recallRoute = recallRouteForToolCall\(query, this\.lastUserUtterance\);/;
-assert.ok(geminiGuard.test(proxyText), "Gemini personal-recall guard must use recallRouteForToolCall with the transcript");
-assert.ok(openAIGuard.test(proxyText), "OpenAI personal-recall guard must use recallRouteForToolCall with the utterance");
+// 5. Both providers now share the same coordinator. Verify the centralized
+// guard checks the model query and real user utterance before personal recall.
+const coordinatorGuard = /descriptor\.id === "knowledge_personal_recall"[\s\S]*?const query = stringValue\(args\.query, args\.question, args\.prompt, args\.text, request\.goal\);[\s\S]*?recallRouteForToolCall\(query, this\.lastUserUtterance\)/;
+assert.ok(coordinatorGuard.test(proxyText), "Shared coordinator must guard personal recall with the model query and user utterance");
 
 console.log("verify:recall-route passed");

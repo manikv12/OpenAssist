@@ -1,0 +1,92 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+
+const bridge = await readFile(new URL("../electron/openassistBridge.ts", import.meta.url), "utf8");
+
+const sharedToolIndex = bridge.indexOf('name: "oa_request_image_generation"');
+assert.ok(sharedToolIndex >= 0, "Knowledge MCP must advertise provider-selectable image generation.");
+const sharedToolDefinition = bridge.slice(sharedToolIndex, sharedToolIndex + 5_000);
+assert.match(sharedToolDefinition, /enum:\s*\["codex",\s*"antigravity",\s*"compare"\]/);
+assert.match(sharedToolDefinition, /side-by-side comparison/i);
+assert.match(sharedToolDefinition, /provider=codex, antigravity, or compare/i);
+assert.match(sharedToolDefinition, /required:\s*\["prompt"\]/);
+
+const toolIndex = bridge.indexOf('name: "oa_request_codex_image_generation"');
+assert.ok(toolIndex >= 0, "Knowledge MCP must advertise the Codex image-generation tool.");
+const toolDefinition = bridge.slice(toolIndex, toolIndex + 5_000);
+assert.match(toolDefinition, /required:\s*\["prompt"\]/);
+assert.match(toolDefinition, /"new_image",\s*"edit_reference"/);
+assert.match(toolDefinition, /referenceArtifactIds/);
+assert.match(toolDefinition, /referenceImagePaths/);
+assert.match(toolDefinition, /referenceImages/);
+assert.match(toolDefinition, /base64 image bytes/);
+assert.match(toolDefinition, /maxItems:\s*6/);
+assert.match(toolDefinition, /useLatestImage/);
+assert.match(toolDefinition, /backgroundMode/);
+assert.match(toolDefinition, /transparent:\s*\{ type: "boolean"/);
+assert.match(toolDefinition, /"auto",\s*"opaque",\s*"transparent"/);
+assert.doesNotMatch(toolDefinition, /green_screen/);
+
+const simpleToolsIndex = bridge.indexOf("const simpleKnowledgeMCPToolNames");
+const simpleTools = bridge.slice(simpleToolsIndex, simpleToolsIndex + 1_200);
+assert.match(simpleTools, /oa_request_codex_image_generation/, "The image tool must be available in Simple external-agent mode.");
+assert.match(simpleTools, /oa_get_codex_image_generation/, "The image status tool must be available in Simple external-agent mode.");
+assert.match(simpleTools, /oa_request_image_generation/, "Provider-selectable image generation must be available in Simple mode.");
+assert.match(simpleTools, /oa_get_image_generation/, "Provider-selectable image status must be available in Simple mode.");
+
+assert.match(bridge, /case "oa_request_image_generation":\s*\n\s*case "knowledge_request_image_generation":\s*\n\s*return startCodexImageGenerationForExternalMCP\(args\)/);
+assert.match(bridge, /case "oa_request_codex_image_generation":\s*\n\s*case "knowledge_request_codex_image_generation":\s*\n\s*return startCodexImageGenerationForExternalMCP\(\{ \.\.\.args, provider: "codex" \}\)/);
+assert.match(bridge, /case "oa_get_image_generation":\s*\n\s*case "knowledge_get_image_generation":/);
+assert.match(bridge, /case "oa_get_codex_image_generation":\s*\n\s*case "knowledge_get_codex_image_generation":\s*\n\s*return getCodexImageGenerationForExternalMCP\(args\)/);
+assert.match(bridge, /artifactDirectory:\s*externalMCPGeneratedImagesDirectory\(\)/);
+assert.match(bridge, /persistThreadActivity:\s*false/);
+assert.match(bridge, /persistWorkerRecord:\s*false/);
+assert.match(bridge, /path\.join\(supportRoot\(\), "Knowledge", "Generated Images"\)/);
+assert.match(bridge, /path\.join\(supportRoot\(\), "Knowledge", "Image References"\)/);
+assert.match(bridge, /function saveExternalMCPInlineImageReferences/);
+assert.match(bridge, /Each inline reference image must be 12 MB or smaller/);
+assert.match(bridge, /Inline reference images must be PNG, JPEG, or WebP files/);
+assert.match(bridge, /referenceImages:\s*undefined/);
+assert.match(bridge, /function externalMCPImageArtifactID/);
+assert.match(bridge, /createHash\("sha256"\)/);
+assert.match(bridge, /function externalMCPImageJobFingerprint/);
+assert.match(bridge, /provider:\s*normalizeExternalMCPImageProvider\(request\.provider\)/);
+assert.match(bridge, /backgroundMode:\s*normalizeCodexImageBackgroundMode\(request\.backgroundMode\)/);
+assert.match(bridge, /object\.transparent === true/);
+assert.match(bridge, /hasAlpha:/);
+assert.match(bridge, /const externalMCPImageJobPromises = new Map/);
+assert.match(bridge, /estimatedWaitSeconds:/);
+assert.match(bridge, /parallelLimit:\s*codexImageGenerationMaxConcurrency/);
+assert.match(bridge, /retryAfterSeconds:/);
+assert.match(bridge, /waitSeconds/);
+assert.match(bridge, /Duplicate starts .* reuse the existing job/);
+assert.match(bridge, /function codexNotificationOwner/);
+assert.match(bridge, /function codexNotificationBelongsToWorker/);
+assert.match(bridge, /if \(!codexNotificationBelongsToWorker\(params, providerThreadID, providerTurnID\)\) return;/);
+assert.match(bridge, /OPENASSIST_IMAGE_JOB_CONCURRENCY/);
+assert.match(bridge, /const codexImageGenerationWaiters: Array<\(\) => void> = \[\]/);
+assert.match(bridge, /Queued for image generation \(position/);
+assert.match(bridge, /this\.setMaxListeners\(32\)/);
+assert.match(bridge, /async function runAntigravityImageGenerationForExternalMCP/);
+assert.match(bridge, /Use Antigravity's built-in generate_image tool exactly once/);
+assert.match(bridge, /antigravityArtifactsFromTranscript\(conversationID\)/);
+assert.match(bridge, /prepareCodexImageBackground/);
+assert.match(bridge, /provider === "compare"\s*\n\s*\? \["codex", "antigravity"\]/);
+assert.match(bridge, /Promise\.all\(providers\.map/);
+assert.match(bridge, /Codex and Antigravity images are ready for comparison/);
+assert.match(bridge, /"openassist\/imageProvider"/);
+assert.match(bridge, /hasProviderArtifacts/);
+assert.match(bridge, /record\.result\?\.summary \|\| "Generated image is ready\."/);
+
+const responseIndex = bridge.indexOf("function knowledgeMCPToolResponse");
+const responseBuilder = bridge.slice(responseIndex, responseIndex + 2_500);
+assert.match(responseBuilder, /type:\s*"image"/);
+assert.match(responseBuilder, /toString\("base64"\)/);
+assert.match(responseBuilder, /mimeType:/);
+
+const organizerGateIndex = bridge.indexOf('name.startsWith("oa_request")', bridge.indexOf("private async handleMCP"));
+const organizerGate = bridge.slice(organizerGateIndex, organizerGateIndex + 500);
+assert.match(organizerGate, /name !== "oa_request_codex_image_generation"/);
+assert.match(organizerGate, /name !== "oa_request_image_generation"/);
+
+console.log("OpenAssist image MCP provider contract checks passed.");

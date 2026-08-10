@@ -35,6 +35,7 @@ export type ThreadItem = {
   hasUnread?: boolean;
   active?: boolean;
   kind?: string;
+  liveVoiceDayID?: string;
 };
 
 export type ComposerImageAttachment = {
@@ -63,6 +64,7 @@ export type MessageArtifact = {
 
 export type LocalFilePreviewKind =
   | "image"
+  | "video"
   | "pdf"
   | "markdown"
   | "html"
@@ -121,6 +123,14 @@ export type ChatMessage = {
     description?: string;
     tone?: "approve" | "neutral" | "danger";
     result: unknown;
+  }>;
+  approvalQuestions?: Array<{
+    id: string;
+    header?: string;
+    prompt: string;
+    multiSelect: boolean;
+    allowFreeText: boolean;
+    options: Array<{ label: string; description?: string }>;
   }>;
   approvalResolved?: boolean;
   createdAt?: number;
@@ -373,11 +383,83 @@ export type PlannerDaySummary = {
 
 export type PlannerDayDetail = PlannerDaySummary & {
   markdown: string;
+  revision: string;
+  schemaVersion: number;
+  migrationWarning?: string;
 };
 
 export type PlannerBacklogDetail = PlannerDaySummary & {
   markdown: string;
+  revision: string;
+  schemaVersion: number;
+  migrationWarning?: string;
 };
+
+export type PlannerValidationIssue = {
+  code: string;
+  message: string;
+  line?: number;
+  path?: string;
+};
+
+export type PlannerConflict = {
+  id: string;
+  containerID: string;
+  itemID?: string;
+  path: string;
+  baseValue: unknown;
+  mineValue: unknown;
+  newerValue: unknown;
+  message: string;
+};
+
+export type PlannerDocument = {
+  schemaVersion: number;
+  containerID: string;
+  revision: string;
+  markdown: string;
+  scaffold: string;
+  items: DailyItem[];
+};
+
+export type PlannerOperation =
+  | { type: "create_item"; item: DailyItem; index?: number }
+  | { type: "update_item"; itemID: string; path: string; previousValue: unknown; value: unknown }
+  | { type: "delete_item"; itemID: string; previousItem: DailyItem }
+  | { type: "reorder_items"; previousOrder: string[]; order: string[] }
+  | { type: "create_step"; itemID: string; step: DailyItemStep; index?: number }
+  | { type: "update_step"; itemID: string; stepID: string; path: string; previousValue: unknown; value: unknown }
+  | { type: "delete_step"; itemID: string; stepID: string; previousStep: DailyItemStep }
+  | { type: "reorder_steps"; itemID: string; previousOrder: string[]; order: string[] }
+  | { type: "move_item"; itemID: string; fromContainerID: string; toContainerID: string; previousItem: DailyItem; item?: DailyItem; index?: number }
+  | { type: "move_step"; stepID: string; fromContainerID: string; fromItemID: string; toContainerID: string; toItemID: string; previousStep: DailyItemStep; index?: number };
+
+export type PlannerMutationBatch = {
+  mutationID: string;
+  containerID: string;
+  baseRevision: string;
+  baseRevisions?: Record<string, string>;
+  operations: PlannerOperation[];
+};
+
+export type PlannerEditorMutation = {
+  mutationID: string;
+  containerID: string;
+  baseRevision: string;
+  baseMarkdown: string;
+  markdown: string;
+};
+
+export type PlannerConflictResolution = PlannerEditorMutation & {
+  newerRevision: string;
+  choices: Record<string, "mine" | "newer">;
+};
+
+export type PlannerApplyResult =
+  | { status: "applied"; document: PlannerDocument; documents?: PlannerDocument[] }
+  | { status: "conflict"; document: PlannerDocument; conflicts: PlannerConflict[] }
+  | { status: "invalid"; document: PlannerDocument; issues: PlannerValidationIssue[] }
+  | { status: "failed"; document?: PlannerDocument; error: string };
 
 export type PlannerCategory = {
   id: string;
@@ -426,6 +508,7 @@ export type DailyItem = {
   reminderAt?: string | null;
   reminderTimezone?: string | null;
   reminderDeliveredAt?: string | null;
+  completedAt?: string | null;
   createdAt: string;
   updatedAt: string;
   order: number;
@@ -517,6 +600,7 @@ export type PluginItem = {
 
 export type ProviderModelOption = {
   id: string;
+  resolvedModel?: string;
   displayName: string;
   description?: string;
   isDefault?: boolean;
@@ -673,6 +757,11 @@ export type SettingsSnapshot = {
   realtimeOpenAIModel: string;
   realtimeOpenAIVoice: string;
   realtimeVoiceProvider: string;
+  codexSubscriptionVoiceAvailable: boolean;
+  codexSubscriptionVoiceStatus: "ready" | "signed_out" | "unsupported_version" | "not_available" | "rate_limited" | "endpoint_changed";
+  codexSubscriptionVoiceMessage: string;
+  codexSubscriptionPlanName: string;
+  codexSubscriptionCodexVersion: string;
   realtimeGeminiAPIKeyConfigured: boolean;
   realtimeMaskedGeminiAPIKey: string;
   realtimeGeminiModel: string;
@@ -700,6 +789,7 @@ export type SettingsSnapshot = {
   assistantVoiceOutputEnabled: boolean;
   computerUseEnabled: boolean;
   memoryEnabled: boolean;
+  memoryDreamingEnabled: boolean;
   knowledgeAccessEnabled: boolean;
   knowledgeExternalAccessEnabled: boolean;
   knowledgeExternalAccessMode: "simple" | "advanced" | "full";
@@ -712,6 +802,10 @@ export type SettingsSnapshot = {
   knowledgePendingRequestCount: number;
   assistantTrackCodeChangesInGitRepos: boolean;
   archiveAutoDeleteDays: number | null;
+  junkCleanupEnabled: boolean;
+  junkCleanupRetentionDays: number;
+  junkCleanupLastRunAt: string;
+  junkCleanupLastFreedBytes: number;
   automationAPIPort: string;
   browserProfile: string;
   holdToTalkShortcut: string;
@@ -847,12 +941,18 @@ export type ContextUsageSnapshot = {
   detail?: string | null;
 };
 
+export type ModelUsageWindowSnapshot = UsageWindowSnapshot & {
+  modelID?: string;
+  modelName: string;
+};
+
 export type ProviderUsageSnapshot = {
   providerBackend: string;
   providerLabel: string;
   planType?: string | null;
   primary?: UsageWindowSnapshot | null;
   secondary?: UsageWindowSnapshot | null;
+  modelSpecific?: ModelUsageWindowSnapshot[];
   context?: ContextUsageSnapshot | null;
 };
 
@@ -911,6 +1011,24 @@ export type ThreadMemorySnapshot = {
   exists: boolean;
   path?: string;
   markdown: string;
+  useMemory: boolean;
+  learnFromChat: boolean;
+  canUseMemory: boolean;
+  canLearnFromChat: boolean;
+  conversationHistory: {
+    available: boolean;
+    digestCount: number;
+    turnCount: number;
+    lastUpdatedAt?: number;
+  };
+  learnedSummary: {
+    state: "none" | "pending" | "learning" | "retrying" | "ready" | "error";
+    lastUpdatedAt?: number;
+    lastAttemptAt?: number;
+    nextRetryAt?: number;
+    safeErrorCode?: string;
+  };
+  durableMemoryCount: number;
 };
 
 export type KnowledgeExternalAccessMode = "simple" | "advanced" | "full";
@@ -930,6 +1048,14 @@ export type OpenAssistIntegrationTargetStatus = {
   skillMode: "cursor-rule" | "codex-agents" | "markdown-copy";
 };
 
+export type OpenAssistIntegrationModeCatalogEntry = {
+  id: KnowledgeExternalAccessMode;
+  description: string;
+  toolCount: number;
+  resourcesVisible: boolean;
+  tools: Array<{ name: string; summary: string }>;
+};
+
 export type OpenAssistIntegrationStatus = {
   targets: OpenAssistIntegrationTargetStatus[];
   proxyPath: string;
@@ -937,6 +1063,7 @@ export type OpenAssistIntegrationStatus = {
   exposedToolCount: number;
   resourcesVisible: boolean;
   modeDescription: string;
+  modes?: OpenAssistIntegrationModeCatalogEntry[];
 };
 
 export type OpenAssistIntegrationConnectResult = {
@@ -1278,6 +1405,7 @@ export type SettingsUpdateKey =
   | "assistantVoiceOutputEnabled"
   | "computerUseEnabled"
   | "memoryEnabled"
+  | "memoryDreamingEnabled"
   | "knowledgeAccessEnabled"
   | "knowledgeExternalAccessEnabled"
   | "knowledgeExternalAccessMode"
@@ -1287,6 +1415,8 @@ export type SettingsUpdateKey =
   | "knowledgeServerPort"
   | "assistantTrackCodeChangesInGitRepos"
   | "archiveAutoDeleteDays"
+  | "junkCleanupEnabled"
+  | "junkCleanupRetentionDays"
   | "telegramEnabled"
   | "remoteAccessEnabled"
   | "remoteAccessNetworkMode"
@@ -1354,10 +1484,40 @@ export type SettingsUpdateKey =
 
 export type SettingsUpdateValue = boolean | string | number;
 
+export type StorageCleanupCategory =
+  | "generatedImages"
+  | "imageJobs"
+  | "generatedVideos"
+  | "videoJobs"
+  | "logs"
+  | "backups";
+
+export type StorageCleanupPreview = {
+  retentionDays: number;
+  cutoffAt: string;
+  itemCount: number;
+  sizeBytes: number;
+  categories: Array<{
+    category: StorageCleanupCategory;
+    label: string;
+    itemCount: number;
+    sizeBytes: number;
+  }>;
+  protectedData: string[];
+  confirmationToken?: string;
+};
+
+export type StorageCleanupResult = StorageCleanupPreview & {
+  deletedItemCount: number;
+  freedBytes: number;
+  errors: string[];
+  completedAt: string;
+};
+
 export type KnowledgePreview =
   | { kind: "planner_append"; dayID: string; section: string; content: string }
-  | { kind: "planner_move"; fromDayID: string; dayID: string; section: string; content: string; removeTexts: string[] }
-  | { kind: "planner_backlog_move"; entries: { dayID: string; text: string }[] }
+  | { kind: "planner_move"; fromDayID: string; dayID: string; section: string; content: string; items: { itemID: string; title: string }[] }
+  | { kind: "planner_backlog_move"; entries: { dayID: string; itemID: string; text: string }[] }
   | { kind: "daily_item_upsert"; item: DailyItemInput }
   | {
       kind: "daily_items_batch";
@@ -1370,6 +1530,19 @@ export type KnowledgePreview =
     }
   | { kind: "daily_item_delete"; dayID: string; itemID: string }
   | { kind: "reference_note_create"; ownerKind: "project" | "thread"; ownerId: string; title: string; markdown: string }
+  | {
+      kind: "peer_file_fetch";
+      projectID: string;
+      relativePath: string;
+      targetPath: string;
+      stagedPath: string;
+      sha256: string;
+      size: number;
+      fromMachineID: string;
+      fromMachineName: string;
+      overwrites: boolean;
+      existingSha256?: string;
+    }
   | { kind: "replace_markdown"; itemID: string; markdown: string; previousMarkdown?: string; title?: string };
 
 export type KnowledgeWriteRequest = {
