@@ -13,6 +13,12 @@ export type RealtimeTaskProgressEntry = {
   createdAt: number;
 };
 
+export type RealtimeTaskFollowUp = {
+  id: string;
+  text: string;
+  createdAt: number;
+};
+
 export type RealtimeTaskRecord = {
   taskID: string;
   scopeKey: string;
@@ -22,6 +28,7 @@ export type RealtimeTaskRecord = {
   prompt: string;
   normalizedPrompt: string;
   workerProvider: string;
+  requestedProvider?: string;
   agentLabel: string;
   executionProfile?: DelegatedWorkExecutionProfile;
   freshThread?: boolean;
@@ -36,6 +43,7 @@ export type RealtimeTaskRecord = {
   state: RealtimeTaskState;
   progress: string;
   progressEntries: RealtimeTaskProgressEntry[];
+  followUps: RealtimeTaskFollowUp[];
   lastActivity: string;
   result: string;
   backendText: string;
@@ -57,6 +65,7 @@ export type RealtimeTaskStartInput = {
   userText?: string;
   prompt: string;
   workerProvider?: string;
+  requestedProvider?: string;
   executionProfile?: DelegatedWorkExecutionProfile;
   freshThread?: boolean;
   contextResources?: LiveVoiceContextResource[];
@@ -111,6 +120,7 @@ export class RealtimeTaskCoordinator {
       prompt,
       normalizedPrompt,
       workerProvider,
+      requestedProvider: input.requestedProvider?.trim() || undefined,
       agentLabel: workerProvider,
       executionProfile: input.executionProfile ? { ...input.executionProfile } : undefined,
       freshThread: input.freshThread === true,
@@ -120,6 +130,7 @@ export class RealtimeTaskCoordinator {
       state: "running",
       progress: "",
       progressEntries: [],
+      followUps: [],
       lastActivity: "",
       result: "",
       backendText: "",
@@ -182,6 +193,13 @@ export class RealtimeTaskCoordinator {
       ?? tasks[0];
   }
 
+  recentFinished(scopeKey?: string, limit = 3) {
+    return [...this.tasks.values()]
+      .filter((task) => !this.isActive(task) && (!scopeKey || task.scopeKey === scopeKey))
+      .sort((left, right) => (right.finishedAt ?? right.updatedAt) - (left.finishedAt ?? left.updatedAt))
+      .slice(0, Math.max(0, limit));
+  }
+
   updateProgress(taskID: string, progress: string) {
     const task = this.tasks.get(taskID);
     const detail = progress.replace(/\s+/g, " ").trim().slice(0, 700);
@@ -204,6 +222,22 @@ export class RealtimeTaskCoordinator {
     task.backendText = task.progressEntries.map((entry) => entry.text).join("\n");
     task.updatedAt = this.now();
     return task;
+  }
+
+  addFollowUp(taskID: string, text: string) {
+    const task = this.tasks.get(taskID);
+    const detail = text.replace(/\s+/g, " ").trim().slice(0, 700);
+    if (!task || !this.isActive(task) || !detail) return task;
+    const createdAt = this.now();
+    task.followUps.push({
+      id: `${task.taskID}-follow-up-${createdAt}-${task.followUps.length}`,
+      text: detail,
+      createdAt
+    });
+    if (task.followUps.length > 10) {
+      task.followUps.splice(0, task.followUps.length - 10);
+    }
+    return this.updateProgress(taskID, `Follow-up queued: ${detail}`);
   }
 
   updateWorkerModel(taskID: string, metadata: WorkerModelMetadata) {
@@ -308,6 +342,22 @@ export class RealtimeTaskCoordinator {
 
   snapshot() {
     return [...this.tasks.values()].map((task) => ({ ...task }));
+  }
+
+  clearScope(scopeKey: string) {
+    const normalizedScope = scopeKey.trim();
+    if (!normalizedScope) return { ok: false as const, reason: "invalid" as const, removed: 0 };
+    if (this.active(normalizedScope).length) {
+      return { ok: false as const, reason: "active" as const, removed: 0 };
+    }
+    const taskIDs = new Set(
+      [...this.tasks.values()]
+        .filter((task) => task.scopeKey === normalizedScope)
+        .map((task) => task.taskID)
+    );
+    for (const taskID of taskIDs) this.tasks.delete(taskID);
+    this.resultOutbox.removeTasks(taskIDs);
+    return { ok: true as const, removed: taskIDs.size };
   }
 
   private finish(taskID: string, state: Exclude<RealtimeTaskState, "queued" | "running">, result: string, error: string) {

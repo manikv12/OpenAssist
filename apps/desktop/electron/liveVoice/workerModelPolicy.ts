@@ -65,9 +65,17 @@ export function decideWorkerModelRole(input: {
     };
   }
 
-  const deepReason = profile.depth === "deep"
+  // The voice model routinely over-picks depth="deep"/"complex" for ordinary
+  // research, which routed everyday questions to the slow Sol worker. Those
+  // model-chosen escalations now count only when the user's own words ask for
+  // depth or care; safety escalations (high stakes, sensitive writes) always
+  // count.
+  const userSignalsDeepWork =
+    /\b(deep|deeply|thorough|thoroughly|comprehensive|comprehensively|detailed|in[- ]depth|exhaustive|extensive|carefully|research (it|this) (well|properly))\b/i
+      .test(input.userText);
+  const deepReason = profile.depth === "deep" && userSignalsDeepWork
     ? "deep reasoning was requested"
-    : profile.complexity === "complex"
+    : profile.complexity === "complex" && userSignalsDeepWork
       ? "the task is complex"
       : profile.stakes === "high"
         ? "the task is high-stakes"
@@ -88,7 +96,9 @@ export function decideWorkerModelRole(input: {
     reasoningEffort: "medium",
     selectionReason: profile.depth === "fast"
       ? "Selected the fast worker because fast execution was requested."
-      : "Selected the fast worker for normal delegated work.",
+      : profile.depth === "deep" || profile.complexity === "complex"
+        ? "Kept the fast Spark worker for speed — say \"deep\" or \"thorough\" when you want the Sol worker."
+        : "Selected the fast worker for normal delegated work.",
     explicitlySelected: false
   };
 }

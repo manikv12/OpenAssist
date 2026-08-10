@@ -275,6 +275,12 @@ export const settingsSections: SettingsSection[] = [
       "version",
       "build",
       "local data",
+      "storage",
+      "cleanup",
+      "junk",
+      "retention",
+      "generated images",
+      "old backups",
       "support",
       "app data"
     ]

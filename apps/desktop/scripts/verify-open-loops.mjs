@@ -4,22 +4,18 @@ import { readFile } from "node:fs/promises";
 const bridge = await readFile(new URL("../electron/openassistBridge.ts", import.meta.url), "utf8");
 const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 
-// Ledger home: "Open Loops" project note under the "Assistant" planner list,
-// created through the internal (approval-free) note APIs.
+// Legacy ledgers remain readable, but worker failures must never create or
+// mutate a note behind the user's back.
 assert.match(bridge, /openLoopsLedgerListTitle = "Assistant"/);
 assert.match(bridge, /openLoopsLedgerNoteTitle = "Open Loops"/);
-assert.match(bridge, /function ensureOpenLoopsLedger[\s\S]{0,400}?createPlannerList\(\{ name: openLoopsLedgerListTitle \}\)/);
-assert.match(bridge, /resolveCanonicalReferenceNote\(list\.id, openLoopsLedgerNoteTitle\)/);
-
-// Entries are checkable, dated, dedupe-safe, and deep-link to the day log.
-assert.match(bridge, /appendReferenceLinesToMarkdown\(note\.markdown, "Open", \[line\]\)/);
-assert.match(bridge, /- \[ \] \$\{description\}/);
-assert.match(bridge, /buildThreadURL\(entry\.voiceThreadID\)/);
+assert.doesNotMatch(bridge, /function ensureOpenLoopsLedger/);
+assert.doesNotMatch(bridge, /function appendOpenLoopEntry/);
+assert.doesNotMatch(bridge, /open loop recorded state=/);
 assert.match(bridge, /oa-thread:\/\/open\?id=/);
 
-// Every finished delegated turn passes through onCompletedTurn; unresolved ones
-// are recorded before the turn persists.
-assert.match(bridge, /turn\.source === "delegated" && \(turn\.taskState === "failed" \|\| turn\.taskState === "cancelled"\)[\s\S]{0,300}?appendOpenLoopEntry/);
+// Completed turns persist only in the Voice Log / Agent Work history.
+assert.doesNotMatch(bridge, /taskState === "failed"[\s\S]{0,300}?appendOpenLoopEntry/);
+assert.match(bridge, /onCompletedTurn: async \(turn\) => \{[\s\S]{0,600}?persistCompletedTurn\(/);
 
 // Daily digest surfaces unchecked ledger lines read-only (never as leftovers,
 // which the apply path treats as planner itemIDs).
@@ -33,4 +29,4 @@ assert.match(app, /requestOpenThreadLink\(threadLinkID\)/);
 assert.match(app, /OPEN_THREAD_LINK_EVENT, onThreadLink/);
 assert.match(app, /Unresolved agent tasks/);
 
-console.log("Open Loops ledger checks passed.");
+console.log("Open Loops compatibility checks passed.");

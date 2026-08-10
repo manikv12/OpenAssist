@@ -3,6 +3,12 @@ import {
   decideWorkerModelRole,
   resolveWorkerModel
 } from "../dist-electron/liveVoice/workerModelPolicy.js";
+import {
+  delegatedWorkArgumentsFromToolArgs,
+  delegatedWorkerToolSelection,
+  explicitlyRequestsComputerUse,
+  preferredComputerUsePluginID
+} from "../dist-electron/liveVoice/workerToolPolicy.js";
 import { RealtimeTaskCoordinator } from "../dist-electron/realtimeTaskCoordinator.js";
 
 const catalog = [
@@ -51,6 +57,78 @@ const explicitSol = decideWorkerModelRole({
 });
 assert.equal(explicitSol.role, "deep");
 assert.equal(explicitSol.explicitlySelected, true);
+
+assert.equal(explicitlyRequestsComputerUse("Ask Codex to use Computer Use in Reminders."), true);
+const disabledComputerUse = delegatedWorkerToolSelection({
+  prompt: "Create the reminder.",
+  userText: "Use Computer Use for this.",
+  computerUseEnabled: false
+});
+assert.equal(
+  disabledComputerUse.ok,
+  false,
+  "A disabled Computer Use request must fail before a worker can pretend it ran."
+);
+// Assert the message's meaning, not its exact wording: it must name the real
+// setting and explicitly rule out worker models, because the voice model was
+// paraphrasing a vague refusal into "no Live Voice work model selected".
+assert.match(disabledComputerUse.error ?? "", /Computer Use is turned off/i);
+assert.match(disabledComputerUse.error ?? "", /Allow Computer Use when requested/i);
+assert.match(disabledComputerUse.error ?? "", /Automation & Remote/i);
+assert.match(disabledComputerUse.error ?? "", /not a model or Live Voice worker-model problem/i);
+const computerUseSelection = delegatedWorkerToolSelection({
+  prompt: "Create the reminder.",
+  userText: "Use Computer Use for this.",
+  computerUseEnabled: true
+});
+assert.equal(computerUseSelection.ok, true);
+if (!computerUseSelection.ok) throw new Error("Computer Use selection failed.");
+assert.deepEqual(computerUseSelection.pluginIDs, [preferredComputerUsePluginID]);
+assert.equal(computerUseSelection.computerUseSelected, true);
+assert.deepEqual(
+  delegatedWorkerToolSelection({
+    prompt: "Check the current documentation.",
+    computerUseEnabled: true
+  }),
+  { ok: true, pluginIDs: [], computerUseSelected: false },
+  "Unrelated delegated work must not receive Computer Use."
+);
+
+const parsedDelegation = delegatedWorkArgumentsFromToolArgs({
+  goal: "Create the reminder using the requested worker.",
+  mode: "rerun",
+  taskID: "task-finished",
+  tasks: [{
+    prompt: "Create the repeating reminder.",
+    executionProfile: {
+      depth: "auto",
+      complexity: "simple",
+      impact: "reversible_write",
+      stakes: "normal",
+      modelPreference: "sol"
+    }
+  }],
+  executionProfile: {
+    depth: "auto",
+    complexity: "simple",
+    impact: "reversible_write",
+    stakes: "normal",
+    modelPreference: "sol"
+  }
+}, "Please use Sol and Computer Use for this reminder.");
+assert.equal(parsedDelegation.userText, "Please use Sol and Computer Use for this reminder.");
+assert.equal(parsedDelegation.mode, "rerun");
+assert.equal(parsedDelegation.taskID, "task-finished");
+assert.equal(parsedDelegation.executionProfile?.modelPreference, "sol");
+assert.equal(parsedDelegation.tasks?.[0]?.executionProfile?.modelPreference, "sol");
+assert.equal(
+  decideWorkerModelRole({
+    userText: parsedDelegation.userText ?? "",
+    profile: parsedDelegation.tasks?.[0]?.executionProfile
+  }).role,
+  "deep",
+  "The exact finalized model request and execution profile must survive tool parsing."
+);
 
 assert.equal(resolveWorkerModel({
   decision: fast,

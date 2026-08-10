@@ -16,11 +16,11 @@ const backlog = bridge.match(/function backlogMutationResult[\s\S]*?\n}\n/)?.[0]
 assert.ok(backlog, "backlogMutationResult must exist");
 assert.match(backlog, /item: readBackMutatedItem\(item, items, scheduledItems\)/, "backlog read-back must also search the scheduled day's items");
 
-// Fallbacks: positional plain: ids fall back to exact-title match; a total miss
-// is flagged (readBack:false) instead of silently trusting the in-memory item.
+// Read-back is ID-only. A total miss is flagged instead of silently trusting
+// the in-memory item or reviving the removed title-matching fallback.
 const readBackFn = bridge.match(/function readBackMutatedItem[\s\S]*?\n}\n/)?.[0] ?? "";
 assert.match(readBackFn, /candidate\.id === item\.id/);
-assert.match(readBackFn, /dailyItemVisibleTitle\(candidate\)/);
+assert.doesNotMatch(readBackFn, /dailyItemVisibleTitle\(candidate\)/);
 assert.match(readBackFn, /readBack: false/);
 
 // Regression: the explicit un-complete path exists and mutation results flow

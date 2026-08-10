@@ -33,15 +33,22 @@ private enum HelperError: Error, CustomStringConvertible {
     }
 }
 
+// Dates serialize with the LOCAL timezone offset (e.g. 2026-07-20T21:00:00-05:00),
+// never bare UTC. With the default UTC formatter, an evening reminder rendered as
+// the NEXT day's date ("9 PM today" became tomorrow's date), and models reading
+// the payload told the user the wrong day. Local-offset ISO8601 stays parseable
+// everywhere while the visible date/time components match the user's clock.
 private let isoFormatter: ISO8601DateFormatter = {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    formatter.timeZone = TimeZone.current
     return formatter
 }()
 
 private let isoFormatterNoFraction: ISO8601DateFormatter = {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime]
+    formatter.timeZone = TimeZone.current
     return formatter
 }()
 
@@ -402,7 +409,18 @@ private func listReminders(_ input: [String: Any]) throws -> [String: Any] {
     let predicate = includeCompleted
         ? eventStore.predicateForReminders(in: calendars)
         : eventStore.predicateForIncompleteReminders(withDueDateStarting: dueAfter, ending: dueBefore, calendars: calendars)
+    // predicateForReminders(in:) has no date parameters, so the requested due
+    // window must be applied here — otherwise "today, including completed"
+    // returns every reminder ever created (oldest first) and today's items
+    // never survive the limit.
     let reminders = fetchReminders(matching: predicate)
+        .filter { reminder in
+            guard dueAfter != nil || dueBefore != nil else { return true }
+            guard let due = reminder.dueDateComponents.flatMap({ Calendar.current.date(from: $0) }) else { return false }
+            if let after = dueAfter, due < after { return false }
+            if let before = dueBefore, due > before { return false }
+            return true
+        }
         .sorted { left, right in
             let leftDate = left.dueDateComponents.flatMap { Calendar.current.date(from: $0) } ?? Date.distantFuture
             let rightDate = right.dueDateComponents.flatMap { Calendar.current.date(from: $0) } ?? Date.distantFuture

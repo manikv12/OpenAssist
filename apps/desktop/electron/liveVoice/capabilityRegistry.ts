@@ -68,6 +68,25 @@ function resourceMatches(descriptor: CapabilityDescriptor, resources: LiveVoiceC
   return supportedKinds.size > 0 && resources.some((resource) => supportedKinds.has(normalize(resource.kind)));
 }
 
+function sourceIsExplicitlyAllowed(
+  descriptor: CapabilityDescriptor,
+  goal: string,
+  sourceHints: string[],
+  resources: LiveVoiceContextResource[]
+) {
+  const normalizedGoal = normalize(goal);
+  if (descriptor.source === "apple_reminders" && descriptor.risk !== "read") {
+    const explicitSource = /\bapple reminders?\b|\breminders? app\b/.test(normalizedGoal)
+      || sourceHints.some((hint) => /\bapple reminders?\b|\breminders? app\b/.test(normalize(hint)));
+    const stableReminderContext = resources.some((resource) =>
+      normalize(resource.kind) === "apple reminder"
+      || normalize(resource.source ?? "") === "apple reminders"
+    );
+    return explicitSource || stableReminderContext;
+  }
+  return true;
+}
+
 export class LiveVoiceCapabilityRegistry {
   private readonly descriptors = new Map<string, CapabilityDescriptor>();
 
@@ -101,6 +120,10 @@ export class LiveVoiceCapabilityRegistry {
     const goalTerms = terms(goal);
     return this.list()
       .filter((descriptor) => operationCompatible(descriptor, operation))
+      // A plain "task", "to-do", or "remind me" request belongs to the
+      // OpenAssist planner. Apple Reminders is a separate source and must be
+      // named explicitly before a mutating Apple capability can be selected.
+      .filter((descriptor) => sourceIsExplicitlyAllowed(descriptor, goal, sourceHints, contextResources))
       .map((descriptor) => {
         // Identity terms (id, source, aliases, keywords) are deliberate
         // routing signals and outweigh incidental description prose, so a
@@ -147,6 +170,21 @@ export class LiveVoiceCapabilityRegistry {
     if (capabilityID) {
       const descriptor = this.get(capabilityID);
       if (!descriptor) {
+        // Gemini Live sometimes invents a capabilityID instead of discovering
+        // first. A hard failure here makes it tell the user "I don't have
+        // permission" and give up, so recover with discovery on the stated
+        // goal: auto-run a single unambiguous match, otherwise hand back the
+        // real candidate list so the model can retry in the same turn.
+        if (eligibleCandidates.length === 1) {
+          return { kind: "selected", descriptor: eligibleCandidates[0].descriptor };
+        }
+        if (eligibleCandidates.length) {
+          return {
+            kind: "selection_required",
+            candidates: eligibleCandidates.map((candidate) => selection(candidate.descriptor)),
+            message: `Capability ${capabilityID} does not exist. Pick one of these real capabilityIDs and call assistant_capability again with it.`
+          };
+        }
         return { kind: "failed", message: `Capability ${capabilityID} is not available.`, errorCode: "capability_not_found" };
       }
       if (!operationCompatible(descriptor, input.operation)) {

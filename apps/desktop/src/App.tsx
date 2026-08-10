@@ -15,14 +15,16 @@ import {
   Node as TiptapNode,
   mergeAttributes,
   parseAttributes,
+  renderNestedMarkdownContent,
+  type JSONContent,
   type MarkdownParseHelpers,
   type MarkdownRendererHelpers,
   type MarkdownToken,
   type MarkdownTokenizer
 } from "@tiptap/core";
-import { Plugin, PluginKey } from "prosemirror-state";
+import { Plugin, PluginKey, TextSelection, type EditorState, type Transaction } from "prosemirror-state";
 import { Decoration, DecorationSet } from "prosemirror-view";
-import type { Node as ProseMirrorNode } from "prosemirror-model";
+import { Fragment as ProseMirrorFragment, type Node as ProseMirrorNode, type Schema } from "prosemirror-model";
 import StarterKit from "@tiptap/starter-kit";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { Image } from "@tiptap/extension-image";
@@ -51,6 +53,7 @@ import {
   BrainCircuit,
   CircleGauge,
   ChevronUp,
+  TextQuote,
   ClipboardPaste,
   Activity,
   AlarmClock,
@@ -67,6 +70,7 @@ import {
   FolderMinus,
   Gauge,
   GitBranch,
+  Globe2,
   GripVertical,
   Hash,
   Heading1,
@@ -79,6 +83,7 @@ import {
   Italic,
   Keyboard,
   Layers3,
+  LayoutGrid,
   List,
   Link2,
   ListChecks,
@@ -87,6 +92,7 @@ import {
   LockKeyhole,
   LockKeyholeOpen,
   MessageSquare,
+  MessageSquareQuote,
   Maximize2,
   Mic,
   MicOff,
@@ -164,6 +170,7 @@ import antigravityMark from "./assets/provider-marks/antigravity.png";
 import codexMark from "./assets/provider-marks/codex.svg";
 import copilotMark from "./assets/provider-marks/copilot.svg";
 import ollamaMark from "./assets/provider-marks/ollama.svg";
+import { CodexSubscriptionWebRTC } from "./codexSubscriptionWebRTC";
 import appLogo from "../assets/AppLogo.png";
 import { settingsSections } from "./data";
 import {
@@ -221,11 +228,16 @@ import type {
   OllamaRuntimeUpdateProgress,
   NoteReadAloudState,
   OpenAssistAppState,
+  OpenAssistIntegrationModeCatalogEntry,
   OpenAssistIntegrationStatus,
   OpenAssistIntegrationTargetID,
   OpenAssistIntegrationTargetStatus,
   KnowledgeExternalAccessMode,
   PlannerBacklogDetail,
+  PlannerConflict,
+  PlannerConflictResolution,
+  PlannerDocument,
+  PlannerEditorMutation,
   PlannerCategory,
   PlannerDayDetail,
   PlannerDaySummary,
@@ -242,6 +254,8 @@ import type {
   SettingsSnapshot,
   SettingsUpdateKey,
   SettingsUpdateValue,
+  StorageCleanupPreview,
+  StorageCleanupResult,
   SkillItem,
   ThreadDetail,
   TranscriptHistoryEntry,
@@ -359,6 +373,14 @@ function readableFileSize(bytes?: number) {
   if (!bytes || bytes <= 0) return "";
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(bytes > 10 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function cleanupSizeLabel(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 function readImageFileAttachment(file: File): Promise<ComposerImageAttachment> {
@@ -530,7 +552,27 @@ function mergeActiveRunMessages(messages: ChatMessage[], run?: ActiveThreadRun) 
   if (!activeMessages.length) return messages;
   const existingIDs = new Set(messages.map((message) => message.id));
   const missing = activeMessages.filter((message) => !existingIDs.has(message.id));
-  return missing.length ? [...messages, ...missing] : messages;
+  if (!missing.length) return messages;
+  // A mid-run refresh reloads the thread from disk, which already contains
+  // this turn's activity entries but NOT its user message (that persists only
+  // on turn completion). Blindly appending the local echo rendered the user's
+  // message BELOW the tool work it caused — insert user echoes before the
+  // first persisted entry that belongs to the running turn instead.
+  const missingUsers = missing.filter((message) => message.role === "user");
+  const missingRest = missing.filter((message) => message.role !== "user");
+  const runStartedAt = run?.startedAt ?? Number.POSITIVE_INFINITY;
+  const merged = [...messages];
+  for (const user of missingUsers) {
+    // Place each echo at its own moment in the run (the initial prompt before
+    // the first activity, a steer between the activities around it) — never
+    // inside pre-run history.
+    const userCreatedAt = user.createdAt ?? runStartedAt;
+    const insertAt = merged.findIndex((message) =>
+      (message.createdAt ?? 0) >= runStartedAt && (message.createdAt ?? 0) >= userCreatedAt);
+    if (insertAt >= 0) merged.splice(insertAt, 0, user);
+    else merged.push(user);
+  }
+  return [...merged, ...missingRest];
 }
 
 function usableThreadTitle(title?: string | null) {
@@ -570,15 +612,17 @@ type OpenAssistRealtimeAPI = {
     contextProjectID?: string;
     contextProjectName?: string;
     contextThreadID?: string;
+    webrtcOfferSdp?: string;
   }) => Promise<RealtimeStartResult>;
   appendAudio: (chunk: RealtimeAudioChunk) => Promise<{ ok: boolean; error?: string }>;
   appendText: (text: string) => Promise<{ ok: boolean; error?: string }>;
+  playback?: (event: { state: "started" | "finished"; deliveryID: string; itemID?: string }) => Promise<{ ok: boolean; error?: string }>;
   appendImages?: (input: { images: ComposerImageAttachment[]; text?: string; createResponse?: boolean }) => Promise<{ ok: boolean; sent?: number; error?: string }>;
   stop: () => Promise<{ ok: boolean; error?: string }>;
   stopDelegation?: (taskID?: string) => Promise<{ ok: boolean; error?: string }>;
   onEvent: (listener: (event: { type: string; payload?: any }) => void) => () => void;
 };
-type AssistantPanelKey = "thread-note" | "session-instructions" | "memory" | "file-preview" | null;
+type AssistantPanelKey = "thread-note" | "side-chat" | "session-instructions" | "memory" | "file-preview" | null;
 type RuntimeProviderOption = { key: RuntimeProviderKey; label: string; detail: string };
 type CodexPermissionOption = {
   value: CodexPermissionMode;
@@ -598,6 +642,23 @@ type NoteRenameTarget =
   | { kind: "project"; note: NoteItem }
   | { kind: "thread"; note: ThreadNoteListItem };
 type NoteSaveStatus = { kind: "idle" | "dirty" | "saving" | "saved" | "error"; message?: string; at?: number };
+type PlannerConflictReview = {
+  mutation: PlannerEditorMutation;
+  newerRevision: string;
+  conflicts: PlannerConflict[];
+  choices: Record<string, "mine" | "newer">;
+};
+
+function plannerConflictValueLabel(value: unknown) {
+  if (value == null) return "Removed";
+  if (typeof value === "string") return value || "Empty";
+  try {
+    const rendered = JSON.stringify(value);
+    return rendered.length > 180 ? `${rendered.slice(0, 177)}...` : rendered;
+  } catch {
+    return String(value);
+  }
+}
 type NoteCleanupContext = {
   noteID?: string;
   projectID?: string;
@@ -854,12 +915,16 @@ const liveVoiceCaptionBus = {
 };
 
 /** Append a streaming transcript delta, tolerating providers that send
- *  cumulative snapshots instead of incremental fragments. */
+ *  cumulative snapshots instead of incremental fragments. Deltas keep their
+ *  original whitespace (trimming them fused words: "How'sitgoing?What's");
+ *  a space is inserted only at a sentence seam, where a missing one is
+ *  unambiguous and a mid-word split can never occur. */
 function joinCaptionDelta(current: string, delta: string) {
   if (!current) return delta;
   if (!delta) return current;
-  if (delta.startsWith(current)) return delta;
-  return current + delta;
+  if (delta.trim().startsWith(current.trim()) && current.trim()) return delta;
+  const needsSeamSpace = /[.?!]$/.test(current) && /^[A-Za-z0-9]/.test(delta);
+  return current + (needsSeamSpace ? " " : "") + delta;
 }
 
 function base64ToPCM16(data: string) {
@@ -883,6 +948,16 @@ function isRealtimeNotRunningError(message: string) {
   return /\b(?:realtime|live)\s+voice\s+is\s+not\s+running\b/i.test(String(message || ""));
 }
 
+function isIntentionalLiveVoiceCloseReason(reason: string) {
+  const normalized = String(reason || "").trim().toLowerCase();
+  return normalized === "stopped"
+    || normalized === "replaced"
+    || normalized === "live voice stopped"
+    || normalized === "user stopped"
+    || normalized === "manual stop"
+    || normalized === "normal closure";
+}
+
 function realtimePayloadRole(payload: any) {
   if (!payload || typeof payload !== "object") return "";
   return String(payload.role ?? payload.item?.role ?? payload.response?.role ?? "").trim().toLowerCase();
@@ -898,14 +973,16 @@ function realtimeEventNames(event: { type?: string; payload?: any }) {
   ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
 }
 
-function realtimePayloadAudio(payload: any): { data: string; sampleRate: number; numChannels: number } | null {
+function realtimePayloadAudio(payload: any): { data: string; sampleRate: number; numChannels: number; deliveryID: string; itemID: string } | null {
   const audio = payload?.audio && typeof payload.audio === "object" ? payload.audio : undefined;
   const data = typeof payload === "string" ? payload : payload?.data ?? audio?.data ?? payload?.delta;
   if (typeof data !== "string" || !data) return null;
   return {
     data,
     sampleRate: Number(audio?.sampleRate ?? audio?.sample_rate ?? payload?.sampleRate ?? payload?.sample_rate ?? realtimeSampleRate) || realtimeSampleRate,
-    numChannels: Number(audio?.numChannels ?? audio?.channels ?? payload?.numChannels ?? payload?.channels ?? 1) || 1
+    numChannels: Number(audio?.numChannels ?? audio?.channels ?? payload?.numChannels ?? payload?.channels ?? 1) || 1,
+    deliveryID: String(payload?.deliveryID ?? payload?.delivery_id ?? audio?.deliveryID ?? audio?.delivery_id ?? "").trim(),
+    itemID: String(payload?.itemID ?? payload?.item_id ?? audio?.itemID ?? audio?.item_id ?? "").trim()
   };
 }
 
@@ -921,6 +998,15 @@ function isRealtimeOutputAudioDeltaEvent(type: string, lowerType: string) {
     || lowerType.includes("outputaudiodelta")
     || lowerType.includes("output_audio.delta")
     || lowerType.includes("response.audio.delta");
+}
+
+function isRealtimeOutputAudioDoneEvent(type: string, lowerType: string) {
+  return type === "thread/realtime/outputAudio/done"
+    || lowerType.includes("outputaudio/done")
+    || lowerType.includes("outputaudio.done")
+    || lowerType.includes("outputaudiodone")
+    || lowerType.includes("output_audio.done")
+    || lowerType.includes("response.audio.done");
 }
 
 function isRealtimeAudioPlaybackClearEvent(event: { type?: string; payload?: any }, lowerType: string) {
@@ -1574,7 +1660,7 @@ const keyNameByMacCode: Record<number, string> = {
 const runtimeProviderOptions: RuntimeProviderOption[] = [
   { key: "codex", label: "Codex", detail: "Uses your signed-in ChatGPT/Codex subscription" },
   { key: "copilot", label: "Copilot", detail: "GitHub Copilot CLI session" },
-  { key: "claudeCode", label: "Claude", detail: "Claude Code CLI session" },
+  { key: "claudeCode", label: "Claude", detail: "Claude Agent SDK session" },
   { key: "antigravityCLI", label: "Antigravity", detail: "Google Antigravity CLI subscription session" },
   { key: "ollamaLocal", label: "Ollama", detail: "Local Ollama chat model" }
 ];
@@ -1591,6 +1677,13 @@ const codexPermissionOptions: CodexPermissionOption[] = [
   { value: "autoReview", label: "Auto-review", shortLabel: "Auto-review", detail: "Codex reviewer handles approval prompts", Icon: CheckCircle2 },
   { value: "fullAccess", label: "Full access", shortLabel: "Full access", detail: "No local sandbox or approval prompts", Icon: ShieldPlus },
   { value: "custom", label: "Custom (config.toml)", shortLabel: "Custom", detail: "Use your Codex config.toml settings", Icon: Settings }
+];
+
+const claudePermissionOptions: CodexPermissionOption[] = [
+  { value: "default", label: "Ask before actions", shortLabel: "Default", detail: "Claude asks before risky tools and writes", Icon: Shield },
+  { value: "autoReview", label: "Auto-review", shortLabel: "Auto-review", detail: "Claude reviews each action automatically", Icon: CheckCircle2 },
+  { value: "fullAccess", label: "Full access", shortLabel: "Full access", detail: "Claude runs tools without approval prompts", Icon: ShieldPlus },
+  { value: "custom", label: "Claude settings", shortLabel: "Custom", detail: "Use your Claude user and project permission rules", Icon: Settings }
 ];
 
 const messageMotion = {
@@ -1713,6 +1806,8 @@ function normalizeUIFontSize(value: unknown) {
 function normalizeRendererSettings(settings: SettingsSnapshot): SettingsSnapshot {
   const realtimeVoiceProvider = settings.realtimeVoiceProvider === "geminiLive"
     ? "geminiLive"
+    : settings.realtimeVoiceProvider === "codexSubscription"
+      ? "codexSubscription"
     : settings.realtimeVoiceProvider === "openaiRealtime"
       ? "openaiRealtime"
       : settings.realtimeGeminiAPIKeyConfigured
@@ -2613,11 +2708,7 @@ const fallbackModelOptionsByProvider: Partial<Record<ProviderKey, ProviderModelO
     modelOption("gpt-5.2", "GPT-5.2"),
     modelOption("gpt-5.3-codex", "GPT-5.3-Codex")
   ],
-  claudeCode: [
-    modelOption("sonnet", "Claude Sonnet"),
-    modelOption("opus", "Claude Opus"),
-    modelOption("haiku", "Claude Haiku")
-  ],
+  claudeCode: [],
   antigravityCLI: antigravityModelOptions(),
   copilot: [
     modelOption("auto", "Auto", "Let Copilot pick the best model"),
@@ -2651,11 +2742,19 @@ function providerModelIDs(provider: ProviderKey, loadedModels?: ProviderModelOpt
 function modelMatchesProvider(provider: ProviderKey, model?: string | null, loadedModels?: ProviderModelOption[]) {
   const normalized = (model ?? "").trim().toLowerCase();
   if (!normalized) return false;
-  return providerModelIDs(provider, loadedModels).some((option) => option.toLowerCase() === normalized);
+  const options = loadedModels?.length ? loadedModels : fallbackModelOptionsForProvider(provider);
+  return options.some((option) =>
+    option.id.trim().toLowerCase() === normalized
+    || option.resolvedModel?.trim().toLowerCase() === normalized
+  );
 }
 
 function defaultModelForProvider(provider: ProviderKey, settings?: SettingsSnapshot, loadedModels?: ProviderModelOption[]) {
   const ids = providerModelIDs(provider, loadedModels);
+  if (provider === "claudeCode") {
+    const models = loadedModels?.length ? loadedModels : [];
+    return models.find((model) => model.isDefault)?.id || ids[0] || "default";
+  }
   if (provider === "ollamaLocal") {
     const preferredLocalModel = settings?.promptRewriteModel?.trim();
     if (modelMatchesProvider(provider, preferredLocalModel, loadedModels)) return preferredLocalModel || "gemma4:e2b";
@@ -2682,6 +2781,9 @@ function displayModelForProvider(
     if (modelMatchesProvider(provider, threadModel, loadedModels)) return threadModel;
     return defaultModelForProvider(provider, settings, loadedModels);
   }
+  if (provider === "claudeCode" && !loadedModels?.length) {
+    return thread?.modelID?.trim() || "default";
+  }
   return modelMatchesProvider(provider, thread?.modelID, loadedModels)
     ? thread?.modelID ?? defaultModelForProvider(provider, settings, loadedModels)
     : defaultModelForProvider(provider, settings, loadedModels);
@@ -2695,6 +2797,23 @@ function compactComposerModelName(modelName: string) {
     .replace(/^claude-/i, "")
     .replace(/-codex$/i, " Codex")
     .replace(/-/g, " ");
+}
+
+function reasoningEffortID(value: string) {
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (normalized === "extrahigh" || normalized === "xhigh") return "xhigh";
+  if (normalized === "maximum" || normalized === "max") return "max";
+  if (normalized === "minimal" || normalized === "none") return "low";
+  return normalized;
+}
+
+function reasoningEffortLabel(value: string) {
+  const normalized = reasoningEffortID(value);
+  if (normalized === "xhigh") return "Extra High";
+  if (normalized === "max") return "Max";
+  if (normalized === "medium") return "Medium";
+  if (normalized === "low") return "Low";
+  return "High";
 }
 
 function sameID(left?: string | null, right?: string | null) {
@@ -3366,6 +3485,371 @@ const OpenAssistSectionStyle = TiptapNode.create({
   },
   renderMarkdown(node: any) {
     return serializeSectionStyleComment(normalizeSectionStyleAttrs(node.attrs ?? {}));
+  }
+});
+
+type PlannerItemMetadata = Record<string, unknown> & {
+  id?: string;
+  checked?: boolean;
+  status?: string;
+  title?: string;
+  steps?: Array<Record<string, unknown> & { id?: string; text?: string; checked?: boolean }>;
+};
+
+function plannerItemMetadata(value: unknown): PlannerItemMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return structuredClone(value) as PlannerItemMetadata;
+}
+
+function plannerJSONText(node?: JSONContent | null): string {
+  if (!node) return "";
+  if (node.type === "text") return node.text ?? "";
+  return (node.content ?? []).map((child) => plannerJSONText(child)).join("");
+}
+
+function plannerTaskItems(node: JSONContent, result: JSONContent[] = []) {
+  if (node.type === "taskItem") result.push(node);
+  for (const child of node.content ?? []) plannerTaskItems(child, result);
+  return result;
+}
+
+function plannerTaskTitle(node?: JSONContent) {
+  const paragraph = node?.content?.find((child) => child.type === "paragraph");
+  return plannerJSONText(paragraph).trim();
+}
+
+const oaPlannerDocumentTokenizer: MarkdownTokenizer = {
+  name: "oaPlannerDocument",
+  level: "block",
+  start: (src) => src.indexOf("<!-- oa-planner-document"),
+  tokenize(src) {
+    const match = src.match(/^<!--\s*oa-planner-document\s+({[^\n]*})\s*-->\s*(?:\n|$)/);
+    if (!match) return undefined;
+    let metadata: Record<string, unknown> = {};
+    try {
+      metadata = JSON.parse(match[1]) as Record<string, unknown>;
+    } catch {
+      metadata = { invalid: true, raw: match[1] };
+    }
+    return { type: "oaPlannerDocument", raw: match[0], attributes: metadata } as MarkdownToken;
+  }
+};
+
+const OpenAssistPlannerDocument = TiptapNode.create({
+  name: "oaPlannerDocument",
+  group: "block",
+  atom: true,
+  selectable: false,
+  draggable: false,
+  addAttributes() {
+    return {
+      metadata: {
+        default: {},
+        parseHTML: (element) => {
+          try {
+            return JSON.parse(element.getAttribute("data-oa-planner-document") ?? "{}");
+          } catch {
+            return {};
+          }
+        }
+      }
+    };
+  },
+  parseHTML() {
+    return [{ tag: "div[data-oa-planner-document]" }];
+  },
+  renderHTML({ node }) {
+    return ["div", {
+      "data-oa-planner-document": JSON.stringify(node.attrs.metadata ?? {}),
+      class: "oa-planner-document-marker"
+    }];
+  },
+  markdownTokenName: "oaPlannerDocument",
+  markdownTokenizer: oaPlannerDocumentTokenizer,
+  parseMarkdown(token: MarkdownToken, helpers: MarkdownParseHelpers) {
+    const attributes = (token as MarkdownToken & { attributes?: Record<string, unknown> }).attributes ?? {};
+    return helpers.createNode("oaPlannerDocument", { metadata: attributes });
+  },
+  renderMarkdown(node: JSONContent) {
+    return `<!-- oa-planner-document ${JSON.stringify(node.attrs?.metadata ?? {})} -->`;
+  }
+});
+
+const oaPlannerItemTokenizer: MarkdownTokenizer = {
+  name: "oaPlannerItem",
+  level: "block",
+  start: (src) => src.indexOf("<!-- oa-daily-item"),
+  tokenize(src, _tokens, lexer) {
+    const opening = src.match(/^<!--\s*oa-daily-item\s+({[^\n]*})\s*-->\s*\n?/);
+    if (!opening) return undefined;
+    const remaining = src.slice(opening[0].length);
+    const closing = remaining.match(/\n?<!--\s*\/oa-daily-item\s*-->\s*(?:\n|$)/);
+    if (!closing || closing.index == null) return undefined;
+    const body = remaining.slice(0, closing.index).trim();
+    let metadata: PlannerItemMetadata = {};
+    try {
+      metadata = plannerItemMetadata(JSON.parse(opening[1]));
+    } catch {
+      metadata = { invalid: true, raw: opening[1] };
+    }
+    const raw = src.slice(0, opening[0].length + closing.index + closing[0].length);
+    return {
+      type: "oaPlannerItem",
+      raw,
+      attributes: metadata,
+      tokens: lexer.blockTokens(body)
+    } as MarkdownToken;
+  }
+};
+
+function addPlannerStepIDs(content: JSONContent[], metadata: PlannerItemMetadata) {
+  const root: JSONContent = { type: "doc", content };
+  const taskItems = plannerTaskItems(root);
+  const steps = Array.isArray(metadata.steps) ? metadata.steps : [];
+  taskItems.slice(1).forEach((taskItem, index) => {
+    taskItem.attrs = {
+      ...(taskItem.attrs ?? {}),
+      plannerStepID: String(steps[index]?.id ?? "").trim() || crypto.randomUUID()
+    };
+  });
+  return content;
+}
+
+const OpenAssistPlannerItem = TiptapNode.create({
+  name: "oaPlannerItem",
+  group: "block",
+  content: "block+",
+  defining: true,
+  isolating: true,
+  draggable: false,
+  addAttributes() {
+    return {
+      metadata: {
+        default: {},
+        parseHTML: (element) => {
+          try {
+            return JSON.parse(element.getAttribute("data-oa-planner-item") ?? "{}");
+          } catch {
+            return {};
+          }
+        }
+      }
+    };
+  },
+  parseHTML() {
+    return [{ tag: "section[data-oa-planner-item]" }];
+  },
+  renderHTML({ node, HTMLAttributes }) {
+    return ["section", mergeAttributes(HTMLAttributes, {
+      "data-oa-planner-item": JSON.stringify(node.attrs.metadata ?? {}),
+      class: "oa-planner-item"
+    }), 0];
+  },
+  markdownTokenName: "oaPlannerItem",
+  markdownTokenizer: oaPlannerItemTokenizer,
+  parseMarkdown(token: MarkdownToken, helpers: MarkdownParseHelpers) {
+    const attributes = plannerItemMetadata(
+      (token as MarkdownToken & { attributes?: PlannerItemMetadata }).attributes
+    );
+    const children = helpers.parseChildren(token.tokens ?? []);
+    return helpers.createNode(
+      "oaPlannerItem",
+      { metadata: attributes },
+      addPlannerStepIDs(children.length ? children : [helpers.createNode("paragraph")], attributes)
+    );
+  },
+  renderMarkdown(node: JSONContent, helpers: MarkdownRendererHelpers) {
+    const metadata = plannerItemMetadata(node.attrs?.metadata);
+    const tasks = plannerTaskItems(node);
+    const rootTask = tasks[0];
+    if (rootTask) {
+      const checked = Boolean(rootTask.attrs?.checked);
+      metadata.checked = checked;
+      metadata.status = checked ? "done" : metadata.status === "doing" ? "doing" : "todo";
+      metadata.title = plannerTaskTitle(rootTask) || metadata.title;
+      metadata.steps = tasks.slice(1).map((task, index) => ({
+        ...(Array.isArray(metadata.steps) ? metadata.steps[index] : {}),
+        id: String(task.attrs?.plannerStepID ?? "").trim()
+          || String(Array.isArray(metadata.steps) ? metadata.steps[index]?.id ?? "" : "").trim()
+          || crypto.randomUUID(),
+        text: plannerTaskTitle(task),
+        checked: Boolean(task.attrs?.checked)
+      }));
+    }
+    const visible = helpers.renderChildren(node.content ?? [], "\n\n").trim();
+    return `<!-- oa-daily-item ${JSON.stringify(metadata)} -->\n${visible}\n<!-- /oa-daily-item -->`;
+  }
+});
+
+const OpenAssistPlannerTaskItem = TaskItem.extend({
+  addAttributes() {
+    return {
+      ...(this.parent?.() ?? {}),
+      plannerStepID: {
+        default: null,
+        keepOnSplit: false,
+        parseHTML: (element) => element.getAttribute("data-planner-step-id"),
+        renderHTML: (attributes) => attributes.plannerStepID
+          ? { "data-planner-step-id": attributes.plannerStepID }
+          : {}
+      }
+    };
+  },
+  renderMarkdown(node: JSONContent, helpers: MarkdownRendererHelpers) {
+    const checkedChar = node.attrs?.checked ? "x" : " ";
+    return renderNestedMarkdownContent(node, helpers, `- [${checkedChar}] `);
+  }
+});
+
+type PlannerCompletedStepsState = {
+  expandedItemIDs: Set<string>;
+};
+
+const plannerCompletedStepsPluginKey = new PluginKey<PlannerCompletedStepsState>("openAssistPlannerCompletedSteps");
+
+function plannerCompletedStepDecorations(doc: ProseMirrorNode, state: PlannerCompletedStepsState) {
+  const decorations: Decoration[] = [];
+  doc.descendants((node, pos) => {
+    if (node.type.name !== "oaPlannerItem") return true;
+    const metadata = plannerItemMetadata(node.attrs?.metadata);
+    const itemID = String(metadata.id ?? "").trim() || `planner-item-${pos}`;
+    const expanded = state.expandedItemIDs.has(itemID);
+    const steps: Array<{ node: ProseMirrorNode; pos: number }> = [];
+
+    node.descendants((child, relativePos) => {
+      if (child.type.name !== "taskItem" || !String(child.attrs?.plannerStepID ?? "").trim()) return true;
+      steps.push({ node: child, pos: pos + 1 + relativePos });
+      return false;
+    });
+
+    const completedSteps = steps.filter(({ node: step }) => Boolean(step.attrs?.checked));
+    if (!completedSteps.length || !steps.length) return false;
+
+    for (const step of completedSteps) {
+      decorations.push(Decoration.node(step.pos, step.pos + step.node.nodeSize, {
+        class: `planner-completed-step${expanded ? "" : " is-collapsed"}`,
+        "data-planner-completed-step": "true"
+      }));
+    }
+
+    decorations.push(Decoration.widget(steps[0].pos, () => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.contentEditable = "false";
+      button.className = `planner-done-steps-toggle${expanded ? " is-open" : ""}`;
+      button.dataset.plannerDoneToggle = itemID;
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute(
+        "aria-label",
+        `${expanded ? "Collapse" : "Expand"} ${completedSteps.length} completed ${completedSteps.length === 1 ? "step" : "steps"}`
+      );
+
+      const chevron = document.createElement("span");
+      chevron.className = "planner-done-steps-chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "planner-done-steps-label";
+      label.textContent = "Done";
+      const count = document.createElement("span");
+      count.className = "planner-done-steps-count";
+      count.textContent = String(completedSteps.length);
+      button.append(chevron, label, count);
+      return button;
+    }, {
+      side: -1,
+      key: `planner-done:${itemID}:${completedSteps.length}:${expanded ? "open" : "closed"}`
+    }));
+    return false;
+  });
+  return DecorationSet.create(doc, decorations);
+}
+
+const OpenAssistPlannerCompletedSteps = Extension.create<{ enabled: boolean }>({
+  name: "openAssistPlannerCompletedSteps",
+  addOptions() {
+    return { enabled: false };
+  },
+  addProseMirrorPlugins() {
+    if (!this.options.enabled) return [];
+    return [new Plugin<PlannerCompletedStepsState>({
+      key: plannerCompletedStepsPluginKey,
+      state: {
+        init: () => ({ expandedItemIDs: new Set<string>() }),
+        apply: (transaction, current) => {
+          const toggledItemID = transaction.getMeta(plannerCompletedStepsPluginKey) as string | undefined;
+          if (!toggledItemID) return current;
+          const expandedItemIDs = new Set(current.expandedItemIDs);
+          if (expandedItemIDs.has(toggledItemID)) expandedItemIDs.delete(toggledItemID);
+          else expandedItemIDs.add(toggledItemID);
+          return { expandedItemIDs };
+        }
+      },
+      props: {
+        decorations: (editorState) => plannerCompletedStepDecorations(
+          editorState.doc,
+          plannerCompletedStepsPluginKey.getState(editorState) ?? { expandedItemIDs: new Set<string>() }
+        ),
+        handleDOMEvents: {
+          mousedown: (_view, event) => {
+            const target = event.target instanceof HTMLElement
+              ? event.target.closest<HTMLButtonElement>("button[data-planner-done-toggle]")
+              : null;
+            if (!target) return false;
+            event.preventDefault();
+            return true;
+          },
+          click: (view, event) => {
+            const target = event.target instanceof HTMLElement
+              ? event.target.closest<HTMLButtonElement>("button[data-planner-done-toggle]")
+              : null;
+            const itemID = target?.dataset.plannerDoneToggle;
+            if (!itemID) return false;
+            event.preventDefault();
+            view.dispatch(view.state.tr.setMeta(plannerCompletedStepsPluginKey, itemID));
+            return true;
+          }
+        }
+      }
+    })];
+  }
+});
+
+const plannerIdentityPluginKey = new PluginKey("openAssistPlannerIdentity");
+
+const OpenAssistPlannerIdentity = Extension.create<{ enabled: boolean }>({
+  name: "openAssistPlannerIdentity",
+  addOptions() {
+    return { enabled: false };
+  },
+  addProseMirrorPlugins() {
+    if (!this.options.enabled) return [];
+    return [new Plugin({
+      key: plannerIdentityPluginKey,
+      appendTransaction: (transactions, _oldState, newState) => {
+        if (!transactions.some((transaction) => transaction.docChanged)) return null;
+        const tr = newState.tr;
+        let changed = false;
+        newState.doc.descendants((node, position) => {
+          if (node.type.name !== "taskItem" || node.attrs.plannerStepID) return true;
+          const $position = newState.doc.resolve(Math.min(newState.doc.content.size, position + 1));
+          let insidePlannerItem = false;
+          let taskDepth = 0;
+          for (let depth = $position.depth; depth >= 0; depth -= 1) {
+            const ancestorName = $position.node(depth).type.name;
+            if (ancestorName === "oaPlannerItem") insidePlannerItem = true;
+            if (ancestorName === "taskItem") taskDepth += 1;
+          }
+          if (!insidePlannerItem || taskDepth < 2) return true;
+          tr.setNodeMarkup(position, undefined, {
+            ...node.attrs,
+            plannerStepID: crypto.randomUUID()
+          });
+          changed = true;
+          return true;
+        });
+        return changed ? tr.setMeta(plannerIdentityPluginKey, true) : null;
+      }
+    })];
   }
 });
 
@@ -5870,6 +6354,698 @@ function normalizeEditorMarkdown(value: string) {
   return normalizeCalloutContainerSpacing(value.replace(/\r\n/g, "\n"));
 }
 
+function plannerEditorMarkdown(value: string, plannerSourceKind?: "planner" | "note") {
+  const normalized = normalizeEditorMarkdown(value);
+  return normalized;
+}
+
+type PlannerListItemName = "taskItem" | "listItem";
+
+type PlannerListContext = {
+  itemDepth: number;
+  itemIndex: number;
+  itemName: PlannerListItemName;
+  listDepth: number;
+  listName: "taskList" | "bulletList" | "orderedList";
+  nestedListDepth: number;
+  paragraphDepth: number;
+  paragraphOffset: number;
+  text: string;
+  atStart: boolean;
+  atEnd: boolean;
+  insidePlannerTask: boolean;
+};
+
+function plannerListContext(editor: Editor): PlannerListContext | null {
+  const { selection } = editor.state;
+  if (!(selection instanceof TextSelection) || !selection.empty) return null;
+  const { $from } = selection;
+  let itemDepth = -1;
+  let listDepth = -1;
+  let paragraphDepth = -1;
+  let nestedListDepth = 0;
+  let insidePlannerTask = false;
+  for (let depth = $from.depth; depth >= 0; depth -= 1) {
+    const nodeName = $from.node(depth).type.name;
+    if (paragraphDepth < 0 && $from.node(depth).isTextblock) paragraphDepth = depth;
+    if (itemDepth < 0 && (nodeName === "taskItem" || nodeName === "listItem")) {
+      itemDepth = depth;
+      listDepth = depth - 1;
+      continue;
+    }
+    if (itemDepth >= 0 && depth < itemDepth && nodeName === "taskItem") {
+      insidePlannerTask = true;
+    }
+  }
+  for (let depth = 1; depth <= $from.depth; depth += 1) {
+    if (["taskList", "bulletList", "orderedList"].includes($from.node(depth).type.name)) {
+      nestedListDepth += 1;
+    }
+  }
+  if (itemDepth < 0 || listDepth < 0 || paragraphDepth < 0) return null;
+  const itemName = $from.node(itemDepth).type.name;
+  const listName = $from.node(listDepth).type.name;
+  if ((itemName !== "taskItem" && itemName !== "listItem")
+    || (listName !== "taskList" && listName !== "bulletList" && listName !== "orderedList")) {
+    return null;
+  }
+  const itemNode = $from.node(itemDepth);
+  const paragraphNode = $from.node(paragraphDepth);
+  if (paragraphDepth !== itemDepth + 1
+    || $from.index(itemDepth) !== 0
+    || itemNode.firstChild !== paragraphNode
+    || paragraphNode.type.name !== "paragraph") {
+    return null;
+  }
+  return {
+    itemDepth,
+    itemIndex: $from.index(listDepth),
+    itemName,
+    listDepth,
+    listName,
+    nestedListDepth,
+    paragraphDepth,
+    paragraphOffset: $from.parentOffset,
+    text: $from.node(paragraphDepth).textContent,
+    atStart: $from.parentOffset === 0,
+    atEnd: $from.parentOffset === $from.parent.content.size,
+    insidePlannerTask
+  };
+}
+
+function activePlannerListItemName(editor: Editor): PlannerListItemName | null {
+  return plannerListContext(editor)?.itemName ?? null;
+}
+
+function isPlannerOwnedTaskContext(editor: Editor, context = plannerListContext(editor)) {
+  if (!context
+    || context.itemName !== "taskItem"
+    || context.listName !== "taskList"
+    || context.listDepth < 1) {
+    return false;
+  }
+  return isPlannerStepsListItem(editor.state.selection.$from.node(context.listDepth - 1));
+}
+
+function isPlannerStepsLabel(value: string) {
+  return /^steps?\s*:\s*-?\s*$/i.test(value.trim());
+}
+
+function plannerCheckboxMarker(value: string) {
+  const match = value.match(/^\s*\[([ xX])\]\s*(.*)$/);
+  if (!match) return null;
+  return {
+    checked: match[1].toLowerCase() === "x",
+    text: match[2]
+  };
+}
+
+function plannerCheckboxMarkerDetails(value: string) {
+  const marker = plannerCheckboxMarker(value);
+  const prefix = value.match(/^(\s*\[[ xX]\]\s*)/);
+  if (!marker || !prefix) return null;
+  return { ...marker, contentStart: prefix[1].length };
+}
+
+function isPlannerStepsListItem(node: ProseMirrorNode | null | undefined) {
+  return node?.type.name === "listItem"
+    && node.firstChild?.type.name === "paragraph"
+    && isPlannerStepsLabel(node.firstChild.textContent);
+}
+
+function plannerParagraphContentAfterMarker(paragraph: ProseMirrorNode, contentStart: number) {
+  let remaining = contentStart;
+  for (let index = 0; index < paragraph.childCount && remaining > 0; index += 1) {
+    const child = paragraph.child(index);
+    if (!child.isText || !child.text) return null;
+    remaining -= Math.min(remaining, child.text.length);
+  }
+  if (remaining > 0) return null;
+  return paragraph.content.cut(contentStart);
+}
+
+type PlannerConvertedTasks = {
+  convertedTask: ProseMirrorNode;
+  carriedTaskItems: ProseMirrorNode[];
+};
+
+function plannerTasksFromMalformedListItem(
+  item: ProseMirrorNode,
+  schema: Schema
+): PlannerConvertedTasks | null {
+  const paragraph = item.firstChild;
+  const taskListType = schema.nodes.taskList;
+  const taskItemType = schema.nodes.taskItem;
+  if (!paragraph || paragraph.type.name !== "paragraph" || !taskListType || !taskItemType) return null;
+  const marker = plannerCheckboxMarkerDetails(paragraph.textContent);
+  if (!marker) return null;
+  const markedContent = plannerParagraphContentAfterMarker(paragraph, marker.contentStart);
+  if (!markedContent) return null;
+
+  const carriedTaskItems: ProseMirrorNode[] = [];
+  const convertedChildren: ProseMirrorNode[] = [
+    paragraph.type.create(paragraph.attrs, markedContent, paragraph.marks)
+  ];
+  for (let index = 1; index < item.childCount; index += 1) {
+    const child = item.child(index);
+    if (child.type === taskListType) {
+      for (let taskIndex = 0; taskIndex < child.childCount; taskIndex += 1) {
+        carriedTaskItems.push(child.child(taskIndex));
+      }
+    } else {
+      convertedChildren.push(child);
+    }
+  }
+  return {
+    convertedTask: taskItemType.create(
+      { ...taskItemType.defaultAttrs, checked: marker.checked },
+      ProseMirrorFragment.fromArray(convertedChildren)
+    ),
+    carriedTaskItems
+  };
+}
+
+function plannerStepsItemWithTasks(
+  stepsItem: ProseMirrorNode,
+  tasks: ProseMirrorNode[],
+  taskListType: ProseMirrorNode["type"]
+) {
+  const children = Array.from({ length: stepsItem.childCount }, (_, index) => stepsItem.child(index));
+  const existingTaskListIndex = children.findIndex((child) => child.type === taskListType);
+  if (existingTaskListIndex >= 0) {
+    const existingTaskList = children[existingTaskListIndex];
+    children[existingTaskListIndex] = taskListType.create(
+      existingTaskList.attrs,
+      existingTaskList.content.append(ProseMirrorFragment.fromArray(tasks)),
+      existingTaskList.marks
+    );
+  } else {
+    children.push(taskListType.create(null, ProseMirrorFragment.fromArray(tasks)));
+  }
+  return stepsItem.type.create(stepsItem.attrs, ProseMirrorFragment.fromArray(children), stepsItem.marks);
+}
+
+function selectPlannerTask(
+  tr: Transaction,
+  from: number,
+  replacement: ProseMirrorNode,
+  target: ProseMirrorNode,
+  textOffset: number
+) {
+  let targetPosition = -1;
+  const to = Math.min(tr.doc.content.size, from + replacement.nodeSize);
+  tr.doc.nodesBetween(from, to, (node, position) => {
+    if (node === target) {
+      targetPosition = position + 2;
+      return false;
+    }
+    return targetPosition < 0;
+  });
+  if (targetPosition >= 0) {
+    tr.setSelection(TextSelection.near(tr.doc.resolve(targetPosition + textOffset)));
+  }
+}
+
+function insertPlannerStepAtLabel(editor: Editor) {
+  const context = plannerListContext(editor);
+  if (!context
+    || context.itemName !== "listItem"
+    || !context.insidePlannerTask
+    || !context.atEnd
+    || !isPlannerStepsLabel(context.text)) {
+    return false;
+  }
+  return editor.commands.command(({ state, tr, dispatch }) => {
+    const nextContext = plannerListContext(editor);
+    if (!nextContext) return false;
+    const { $from } = state.selection;
+    const taskListType = state.schema.nodes.taskList;
+    const taskItemType = state.schema.nodes.taskItem;
+    const paragraphType = state.schema.nodes.paragraph;
+    if (!taskListType || !taskItemType || !paragraphType) return false;
+
+    const originalItemEnd = $from.end(nextContext.itemDepth);
+    if (nextContext.text !== "Steps:") {
+      tr.replaceWith(
+        $from.start(nextContext.paragraphDepth),
+        $from.end(nextContext.paragraphDepth),
+        state.schema.text("Steps:")
+      );
+    }
+    const mappedItemEnd = tr.mapping.map(originalItemEnd);
+    const mappedItem = tr.doc.resolve(mappedItemEnd).node(nextContext.itemDepth);
+    const emptyTaskItem = taskItemType.create(
+      { checked: false },
+      paragraphType.create()
+    );
+    let childPosition = tr.doc.resolve(mappedItemEnd).start(nextContext.itemDepth);
+    let ownedTaskList: ProseMirrorNode | null = null;
+    let ownedTaskListPosition = -1;
+    for (let index = 0; index < mappedItem.childCount; index += 1) {
+      const child = mappedItem.child(index);
+      if (child.type === taskListType) {
+        ownedTaskList = child;
+        ownedTaskListPosition = childPosition;
+        break;
+      }
+      childPosition += child.nodeSize;
+    }
+    if (ownedTaskList && ownedTaskListPosition > -1) {
+      const insertAt = ownedTaskListPosition + 1;
+      tr.insert(insertAt, emptyTaskItem);
+      tr.setSelection(TextSelection.near(tr.doc.resolve(insertAt + 2)));
+    } else {
+      tr.insert(mappedItemEnd, taskListType.create(null, emptyTaskItem));
+      tr.setSelection(TextSelection.near(tr.doc.resolve(mappedItemEnd + 3)));
+    }
+    dispatch?.(tr.scrollIntoView());
+    return true;
+  });
+}
+
+type PlannerSiblingStepConversionOptions = {
+  addNextTask?: boolean;
+  requireCheckboxMarker?: boolean;
+};
+
+function convertPlannerSiblingToStep(
+  editor: Editor,
+  options: PlannerSiblingStepConversionOptions = {}
+) {
+  const context = plannerListContext(editor);
+  const marker = context ? plannerCheckboxMarkerDetails(context.text) : null;
+  const requireCheckboxMarker = options.requireCheckboxMarker ?? false;
+  if (!context
+    || context.itemName !== "listItem"
+    || !context.insidePlannerTask
+    || context.itemIndex < 1
+    || (requireCheckboxMarker && !marker)
+    || (requireCheckboxMarker
+      && !context.atStart
+      && !context.atEnd
+      && context.paragraphOffset !== marker?.contentStart)) {
+    return false;
+  }
+  const listNode = editor.state.selection.$from.node(context.listDepth);
+  const previousItem = listNode.child(context.itemIndex - 1);
+  if (previousItem.type.name !== "listItem"
+    || previousItem.firstChild?.type.name !== "paragraph"
+    || !isPlannerStepsLabel(previousItem.firstChild.textContent)) {
+    return false;
+  }
+
+  return editor.commands.command(({ state, tr, dispatch }) => {
+    const nextContext = plannerListContext(editor);
+    if (!nextContext) return false;
+    const { $from } = state.selection;
+    const currentList = $from.node(nextContext.listDepth);
+    const currentItem = currentList.child(nextContext.itemIndex);
+    const previous = currentList.child(nextContext.itemIndex - 1);
+    const taskListType = state.schema.nodes.taskList;
+    const taskItemType = state.schema.nodes.taskItem;
+    const paragraphType = state.schema.nodes.paragraph;
+    if (!taskListType
+      || !taskItemType
+      || !paragraphType
+      || previous.type.name !== "listItem"
+      || previous.firstChild?.type.name !== "paragraph"
+      || !isPlannerStepsLabel(previous.firstChild.textContent)) {
+      return false;
+    }
+    const currentParagraph = currentItem.firstChild;
+    const currentMarker = plannerCheckboxMarkerDetails(currentParagraph?.textContent ?? "");
+    const contentStart = currentMarker?.contentStart ?? 0;
+    if (!currentParagraph
+      || currentParagraph.type.name !== "paragraph"
+      || (requireCheckboxMarker && !currentMarker)) {
+      return false;
+    }
+    let remainingPrefix = contentStart;
+    for (let index = 0; index < currentParagraph.childCount && remainingPrefix > 0; index += 1) {
+      const child = currentParagraph.child(index);
+      if (!child.isText || !child.text) return false;
+      remainingPrefix -= Math.min(remainingPrefix, child.text.length);
+    }
+    if (remainingPrefix > 0) return false;
+    const carriedTaskItems: ProseMirrorNode[] = [];
+    const convertedChildren: ProseMirrorNode[] = [
+      currentParagraph.type.create(
+        currentParagraph.attrs,
+        currentParagraph.content.cut(contentStart),
+        currentParagraph.marks
+      )
+    ];
+    for (let index = 1; index < currentItem.childCount; index += 1) {
+      const child = currentItem.child(index);
+      if (child.type === taskListType) {
+        for (let taskIndex = 0; taskIndex < child.childCount; taskIndex += 1) {
+          carriedTaskItems.push(child.child(taskIndex));
+        }
+      } else {
+        convertedChildren.push(child);
+      }
+    }
+    const convertedTask = taskItemType.create(
+      { ...(taskItemType.defaultAttrs ?? {}), checked: currentMarker?.checked ?? false },
+      ProseMirrorFragment.fromArray(convertedChildren)
+    );
+    const insertedTasks = [
+      convertedTask,
+      ...(options.addNextTask ? [taskItemType.create({ checked: false }, paragraphType.create())] : []),
+      ...carriedTaskItems
+    ];
+    const previousChildren = Array.from({ length: previous.childCount }, (_, index) => previous.child(index));
+    const existingTaskListIndex = previousChildren.findIndex((child) => child.type === taskListType);
+    if (existingTaskListIndex >= 0) {
+      const existingTaskList = previousChildren[existingTaskListIndex];
+      previousChildren[existingTaskListIndex] = taskListType.create(
+        existingTaskList.attrs,
+        existingTaskList.content.append(ProseMirrorFragment.fromArray(insertedTasks)),
+        existingTaskList.marks
+      );
+    } else {
+      previousChildren.push(taskListType.create(null, ProseMirrorFragment.fromArray(insertedTasks)));
+    }
+    const updatedPrevious = previous.type.create(
+      previous.attrs,
+      ProseMirrorFragment.fromArray(previousChildren),
+      previous.marks
+    );
+    const currentItemStart = $from.before(nextContext.itemDepth);
+    const previousItemStart = currentItemStart - previous.nodeSize;
+    const currentItemEnd = $from.after(nextContext.itemDepth);
+    tr.replaceWith(previousItemStart, currentItemEnd, updatedPrevious);
+
+    const selectionTarget = options.addNextTask ? insertedTasks[1] : convertedTask;
+    let selectionPosition = -1;
+    tr.doc.nodesBetween(
+      previousItemStart,
+      Math.min(tr.doc.content.size, previousItemStart + updatedPrevious.nodeSize),
+      (node, position) => {
+        if (node === selectionTarget) {
+          selectionPosition = position + 2;
+          return false;
+        }
+        return selectionPosition < 0;
+      }
+    );
+    if (selectionPosition >= 0) {
+      const textOffset = options.addNextTask
+        ? 0
+        : Math.max(0, nextContext.paragraphOffset - contentStart);
+      tr.setSelection(TextSelection.near(tr.doc.resolve(selectionPosition + textOffset)));
+    }
+    dispatch?.(tr.scrollIntoView());
+    return true;
+  });
+}
+
+function convertPlannerBulletMarker(editor: Editor, addNextTask = false) {
+  return convertPlannerSiblingToStep(editor, {
+    addNextTask,
+    requireCheckboxMarker: true
+  });
+}
+
+type PlannerStepsSiblingNormalization = {
+  from: number;
+  to: number;
+  replacement: ProseMirrorNode;
+  selectionTarget: ProseMirrorNode | null;
+  selectionTextOffset: number;
+};
+
+function hasPlannerTaskItemAncestor(state: EditorState, position: number) {
+  const $position = state.doc.resolve(Math.max(0, Math.min(position, state.doc.content.size)));
+  for (let depth = $position.depth; depth >= 0; depth -= 1) {
+    if ($position.node(depth).type.name === "taskItem") return true;
+  }
+  return false;
+}
+
+function findPlannerStepsSiblingNormalization(state: EditorState): PlannerStepsSiblingNormalization | null {
+  const taskListType = state.schema.nodes.taskList;
+  if (!taskListType) return null;
+  let result: PlannerStepsSiblingNormalization | null = null;
+
+  state.doc.descendants((listNode, listPosition) => {
+    if (result) return false;
+    if ((listNode.type.name !== "bulletList" && listNode.type.name !== "orderedList")
+      || !hasPlannerTaskItemAncestor(state, listPosition + 1)) {
+      return true;
+    }
+
+    let itemOffset = 0;
+    for (let stepsIndex = 0; stepsIndex < listNode.childCount; stepsIndex += 1) {
+      const stepsItem = listNode.child(stepsIndex);
+      const stepsItemStart = listPosition + 1 + itemOffset;
+      if (!isPlannerStepsListItem(stepsItem)) {
+        itemOffset += stepsItem.nodeSize;
+        continue;
+      }
+
+      const appendedTasks: ProseMirrorNode[] = [];
+      let runSize = 0;
+      let selectionTarget: ProseMirrorNode | null = null;
+      let selectionTextOffset = 0;
+      for (let itemIndex = stepsIndex + 1; itemIndex < listNode.childCount; itemIndex += 1) {
+        const malformedItem = listNode.child(itemIndex);
+        if (malformedItem.type.name !== "listItem") break;
+        const marker = plannerCheckboxMarkerDetails(malformedItem.firstChild?.textContent ?? "");
+        const converted = marker
+          ? plannerTasksFromMalformedListItem(malformedItem, state.schema)
+          : null;
+        if (!marker || !converted) break;
+
+        const malformedStart = stepsItemStart + stepsItem.nodeSize + runSize;
+        const paragraph = malformedItem.firstChild;
+        if (state.selection instanceof TextSelection
+          && state.selection.empty
+          && paragraph
+          && state.selection.from >= malformedStart + 2
+          && state.selection.from <= malformedStart + 2 + paragraph.content.size) {
+          selectionTarget = converted.convertedTask;
+          selectionTextOffset = Math.max(
+            0,
+            Math.min(marker.text.length, state.selection.from - (malformedStart + 2) - marker.contentStart)
+          );
+        }
+        appendedTasks.push(converted.convertedTask, ...converted.carriedTaskItems);
+        runSize += malformedItem.nodeSize;
+      }
+
+      if (appendedTasks.length > 0) {
+        result = {
+          from: stepsItemStart,
+          to: stepsItemStart + stepsItem.nodeSize + runSize,
+          replacement: plannerStepsItemWithTasks(stepsItem, appendedTasks, taskListType),
+          selectionTarget,
+          selectionTextOffset
+        };
+        return false;
+      }
+      itemOffset += stepsItem.nodeSize;
+    }
+    return !result;
+  });
+  return result;
+}
+
+const openAssistPlannerListControllerKey = new PluginKey("openAssistPlannerListController");
+
+function normalizePlannerStepsSiblings(state: EditorState) {
+  const normalization = findPlannerStepsSiblingNormalization(state);
+  if (!normalization) return null;
+  const tr = state.tr.replaceWith(
+    normalization.from,
+    normalization.to,
+    normalization.replacement
+  );
+  if (normalization.selectionTarget) {
+    selectPlannerTask(
+      tr,
+      normalization.from,
+      normalization.replacement,
+      normalization.selectionTarget,
+      normalization.selectionTextOffset
+    );
+  }
+  return tr.setMeta(openAssistPlannerListControllerKey, { normalized: true });
+}
+
+function removeEmptyPlannerStep(editor: Editor) {
+  const context = plannerListContext(editor);
+  if (!context
+    || !context.atStart
+    || !context.atEnd
+    || context.text
+    || !isPlannerOwnedTaskContext(editor, context)) {
+    return false;
+  }
+  return editor.commands.command(({ state, tr, dispatch }) => {
+    const nextContext = plannerListContext(editor);
+    if (!nextContext || !isPlannerOwnedTaskContext(editor, nextContext)) return false;
+    const { $from } = state.selection;
+    const listNode = $from.node(nextContext.listDepth);
+    if (listNode.childCount === 1) {
+      const listStart = $from.before(nextContext.listDepth);
+      const listEnd = $from.after(nextContext.listDepth);
+      tr.delete(listStart, listEnd);
+      tr.setSelection(TextSelection.near(tr.doc.resolve(tr.mapping.map(listStart)), -1));
+    } else {
+      const itemStart = $from.before(nextContext.itemDepth);
+      const itemEnd = $from.after(nextContext.itemDepth);
+      const bias = nextContext.itemIndex > 0 ? -1 : 1;
+      tr.delete(itemStart, itemEnd);
+      tr.setSelection(TextSelection.near(tr.doc.resolve(tr.mapping.map(itemStart)), bias));
+    }
+    dispatch?.(tr.scrollIntoView());
+    return true;
+  });
+}
+
+function removeEmptyPlannerSibling(editor: Editor) {
+  const context = plannerListContext(editor);
+  if (!context
+    || context.itemName !== "listItem"
+    || !context.insidePlannerTask
+    || context.itemIndex < 1
+    || !context.atStart
+    || !context.atEnd
+    || context.text) {
+    return false;
+  }
+  const listNode = editor.state.selection.$from.node(context.listDepth);
+  if (!isPlannerStepsListItem(listNode.child(context.itemIndex - 1))) return false;
+  return editor.commands.command(({ state, tr, dispatch }) => {
+    const nextContext = plannerListContext(editor);
+    if (!nextContext) return false;
+    const itemStart = state.selection.$from.before(nextContext.itemDepth);
+    const itemEnd = state.selection.$from.after(nextContext.itemDepth);
+    tr.delete(itemStart, itemEnd);
+    tr.setSelection(TextSelection.near(tr.doc.resolve(tr.mapping.map(itemStart)), -1));
+    dispatch?.(tr.scrollIntoView());
+    return true;
+  });
+}
+
+function applyPlannerChecklistCommand(editor: Editor) {
+  const context = plannerListContext(editor);
+  if (!context || !context.insidePlannerTask) return false;
+  if (context.itemName === "listItem" && isPlannerStepsLabel(context.text)) {
+    return insertPlannerStepAtLabel(editor);
+  }
+  if (isPlannerOwnedTaskContext(editor, context)) return true;
+  return convertPlannerSiblingToStep(editor);
+}
+
+function handlePlannerBackspace(editor: Editor) {
+  const context = plannerListContext(editor);
+  if (!context || !context.atStart || !context.insidePlannerTask) return false;
+  if (isPlannerOwnedTaskContext(editor, context)) {
+    if (!context.text) return removeEmptyPlannerStep(editor);
+    // A non-empty planner step is an owned row. Backspace at its boundary must
+    // never merge it with another step or lift it out of the Steps section.
+    return true;
+  }
+  if (context.itemName === "listItem" && context.itemIndex > 0) {
+    const listNode = editor.state.selection.$from.node(context.listDepth);
+    const previousItem = listNode.child(context.itemIndex - 1);
+    if (isPlannerStepsListItem(previousItem)) {
+      if (!context.text) return removeEmptyPlannerSibling(editor);
+      if (plannerCheckboxMarker(context.text)) return convertPlannerBulletMarker(editor);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Planner lists are a small structured editor: labels such as Steps own
+// checkbox children, while ordinary lists keep their normal editing behavior.
+// All hierarchy-changing keys go through this controller so TipTap never has to
+// guess between listItem and taskItem from the text a user happened to type.
+const OpenAssistPlannerListController = Extension.create<{ enabled: boolean }>({
+  name: "openAssistPlannerListController",
+  priority: 1_000,
+  addOptions() {
+    return { enabled: false };
+  },
+  addProseMirrorPlugins() {
+    if (!this.options.enabled) return [];
+    let composing = false;
+    return [
+      new Plugin({
+        key: openAssistPlannerListControllerKey,
+        props: {
+          handleDOMEvents: {
+            compositionstart: () => {
+              composing = true;
+              return false;
+            },
+            compositionend: (view) => {
+              composing = false;
+              queueMicrotask(() => {
+                if (view.dom.isConnected) {
+                  view.dispatch(view.state.tr.setMeta(openAssistPlannerListControllerKey, {
+                    normalizeAfterComposition: true
+                  }));
+                }
+              });
+              return false;
+            }
+          }
+        },
+        appendTransaction: (transactions, _oldState, newState) => {
+          if (composing || !transactions.some((transaction) => (
+            transaction.docChanged
+            || transaction.getMeta(openAssistPlannerListControllerKey)?.normalizeAfterComposition
+          ))) {
+            return null;
+          }
+          return normalizePlannerStepsSiblings(newState);
+        }
+      })
+    ];
+  },
+  addKeyboardShortcuts() {
+    return {
+      Escape: () => {
+        if (!this.options.enabled) return false;
+        return activePlannerListItemName(this.editor) !== null;
+      },
+      Enter: () => {
+        if (!this.options.enabled) return false;
+        if (convertPlannerBulletMarker(this.editor, true)) return true;
+        return insertPlannerStepAtLabel(this.editor);
+      },
+      Backspace: () => {
+        if (!this.options.enabled || !activePlannerListItemName(this.editor)) return false;
+        return handlePlannerBackspace(this.editor);
+      },
+      Space: () => {
+        if (!this.options.enabled) return false;
+        return convertPlannerBulletMarker(this.editor);
+      },
+      Tab: () => {
+        if (!this.options.enabled) return false;
+        const context = plannerListContext(this.editor);
+        if (!context) return false;
+        if (isPlannerOwnedTaskContext(this.editor, context)) return true;
+        const itemName = context.itemName;
+        return this.editor.commands.sinkListItem(itemName);
+      },
+      "Shift-Tab": () => {
+        if (!this.options.enabled) return false;
+        const context = plannerListContext(this.editor);
+        if (!context) return false;
+        if (isPlannerOwnedTaskContext(this.editor, context)) return true;
+        const itemName = context.itemName;
+        return this.editor.commands.liftListItem(itemName);
+      }
+    };
+  }
+});
+
 function shouldKeepAICleanupCallout(bodyText: string, cleanupMode?: NoteAICleanupMode) {
   const lineCount = bodyText.split("\n").filter((line) => line.trim()).length;
   const hasStructuredContent = /^#{1,6}\s+/m.test(bodyText)
@@ -6467,8 +7643,11 @@ function MarkdownEditorSurface({
   dailyItemFilter = "all",
   toolbarAccessory,
   onScheduleSelectionToPlanner,
+  onMovePlannerTaskToDay,
   onPlannerTaskReminder,
-  onToolbarMoreOpenChange
+  onToolbarMoreOpenChange,
+  readOnly = false,
+  readOnlyMessage
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -6499,8 +7678,11 @@ function MarkdownEditorSurface({
   dailyItemFilter?: string;
   toolbarAccessory?: ReactNode;
   onScheduleSelectionToPlanner?: (request: PlannerScheduleRequest) => void;
+  onMovePlannerTaskToDay?: (dayID: string, itemID: string, targetDayID: string) => void | Promise<void>;
   onPlannerTaskReminder?: (itemID: string, x: number, y: number) => void;
   onToolbarMoreOpenChange?: (open: boolean) => void;
+  readOnly?: boolean;
+  readOnlyMessage?: string;
 }) {
   const [mode, setMode] = useState<NoteEditorMode>(initialMode);
   const [richLocked, setRichLocked] = useState(false);
@@ -6607,7 +7789,7 @@ function MarkdownEditorSurface({
   // a bubble-phase React onKeyDown would fire too late to stop it.
   const richSlashKeyDownRef = useRef<((event: globalThis.KeyboardEvent) => void) | null>(null);
   const activeLayoutCellDropRef = useRef<HTMLTableCellElement | null>(null);
-  const latestValueRef = useRef(normalizeEditorMarkdown(value));
+  const latestValueRef = useRef(plannerEditorMarkdown(value, plannerSourceKind));
   useEffect(() => {
     const handleFindShortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
@@ -6637,11 +7819,22 @@ function MarkdownEditorSurface({
         }
       }),
       RichCodeBlock,
+      OpenAssistPlannerDocument,
+      OpenAssistPlannerItem,
       OpenAssistSectionStyle,
       OpenAssistCallout,
       OpenAssistDailyTagDecorations,
       OpenAssistDailyTaskFilterDecorations,
       OpenAssistDailyReminderDecorations,
+      OpenAssistPlannerCompletedSteps.configure({
+        enabled: plannerSourceKind === "planner"
+      }),
+      OpenAssistPlannerListController.configure({
+        enabled: plannerSourceKind === "planner"
+      }),
+      OpenAssistPlannerIdentity.configure({
+        enabled: plannerSourceKind === "planner"
+      }),
       Markdown,
       Placeholder.configure({
         placeholder: () => placeholderRef.current,
@@ -6657,17 +7850,17 @@ function MarkdownEditorSurface({
         }
       }),
       TaskList,
-      TaskItem.configure({
+      OpenAssistPlannerTaskItem.configure({
         nested: true
       })
     ],
-    []
+    [plannerSourceKind]
   );
   const richEditor = useEditor(
     {
       immediatelyRender: false,
       autofocus: false,
-      content: normalizeEditorMarkdown(value),
+      content: plannerEditorMarkdown(value, plannerSourceKind),
       contentType: "markdown",
       extensions: richExtensions,
       editorProps: {
@@ -6677,41 +7870,42 @@ function MarkdownEditorSurface({
         }
       },
       onUpdate: ({ editor }: { editor: Editor }) => {
+        if (readOnly) return;
         const nextMarkdown = normalizeEditorMarkdown(editor.getMarkdown());
         if (nextMarkdown === latestValueRef.current) return;
         latestValueRef.current = nextMarkdown;
         onChange(nextMarkdown);
       }
     },
-    [richExtensions, onChange]
+    [readOnly, richExtensions, onChange]
   );
   useEffect(() => {
-    latestValueRef.current = normalizeEditorMarkdown(value);
-  }, [value]);
+    latestValueRef.current = plannerEditorMarkdown(value, plannerSourceKind);
+  }, [plannerSourceKind, value]);
   useEffect(() => {
     setMode(initialMode === "preview" ? "inline" : initialMode);
   }, [initialMode, sourcePath]);
   useEffect(() => {
     if (!richEditor) return;
-    richEditor.setEditable(mode === "inline" && !richLocked);
-    if (mode !== "inline" || richLocked) {
+    richEditor.setEditable(mode === "inline" && !richLocked && !readOnly);
+    if (mode !== "inline" || richLocked || readOnly) {
       setBlockHandles([]);
       setSlashMenuOpen(false);
       setCalloutMenuOpen(false);
       setChartMenuOpen(false);
       setLayoutMenuOpen(false);
     }
-  }, [mode, richEditor, richLocked]);
+  }, [mode, readOnly, richEditor, richLocked]);
   useEffect(() => {
     if (!richEditor) return;
-    const nextMarkdown = normalizeEditorMarkdown(value);
+    const nextMarkdown = plannerEditorMarkdown(value, plannerSourceKind);
     const currentMarkdown = normalizeEditorMarkdown(richEditor.getMarkdown());
     if (nextMarkdown === currentMarkdown) return;
     richEditor.commands.setContent(nextMarkdown, {
       contentType: "markdown",
       emitUpdate: false
     });
-  }, [richEditor, value]);
+  }, [plannerSourceKind, richEditor, value]);
   const filteredSlashCommands = useMemo(() => {
     const query = slashQuery.trim().toLowerCase();
     const slashInsideList = mode === "inline"
@@ -7045,7 +8239,11 @@ function MarkdownEditorSurface({
     else if (command.id === "h1") richEditor.chain().focus().toggleHeading({ level: 1 }).run();
     else if (command.id === "heading") richEditor.chain().focus().toggleHeading({ level: 2 }).run();
     else if (command.id === "h3") richEditor.chain().focus().toggleHeading({ level: 3 }).run();
-    else if (command.id === "todo") (richEditor.chain().focus() as any).toggleTaskList().run();
+    else if (command.id === "todo") {
+      const handledByPlanner = plannerSourceKind === "planner"
+        && applyPlannerChecklistCommand(richEditor);
+      if (!handledByPlanner) (richEditor.chain().focus() as any).toggleTaskList().run();
+    }
     else if (command.id === "bullets") richEditor.chain().focus().toggleBulletList().run();
     else if (command.id === "numbers") richEditor.chain().focus().toggleOrderedList().run();
     else if (command.id === "quote") richEditor.chain().focus().toggleBlockquote().run();
@@ -7295,6 +8493,26 @@ function MarkdownEditorSurface({
         } else if (tag === "p") {
           if (child.textContent?.trim() !== "") {
             children.push(child);
+          }
+        } else if (tag === "li" && (child.dataset.type === "taskItem" || child.hasAttribute("data-checked"))) {
+          // Checkbox items: the CARD is the handle anchor, not its inner <p>.
+          // Anchoring on the indented paragraph pushed the handle out of the
+          // gutter and left checkbox clicks outside its hit zone, so task
+          // items looked like they had no block menu at all. Nested subtask
+          // lists still get their own handles (markdown gives each list line
+          // its own block, so index parity holds).
+          children.push(child);
+          for (const inner of Array.from(child.children)) {
+            if (!(inner instanceof HTMLElement)) continue;
+            const innerTag = inner.tagName.toLowerCase();
+            if (innerTag === "ul" || innerTag === "ol") traverse(inner);
+            if (innerTag === "div") {
+              for (const nested of Array.from(inner.children)) {
+                if (!(nested instanceof HTMLElement)) continue;
+                const nestedTag = nested.tagName.toLowerCase();
+                if (nestedTag === "ul" || nestedTag === "ol") traverse(nested);
+              }
+            }
           }
         } else if (tag === "ul" || tag === "ol" || tag === "li" || tag === "blockquote" || tag === "div") {
           traverse(child);
@@ -7724,7 +8942,11 @@ function MarkdownEditorSurface({
     else if (action === "strike") didRun = chain.toggleStrike().run();
     else if (action === "quote") didRun = chain.toggleBlockquote().run();
     else if (action === "bullet") didRun = chain.toggleBulletList().run();
-    else if (action === "task") didRun = (chain as any).toggleTaskList().run();
+    else if (action === "task") {
+      const handledByPlanner = plannerSourceKind === "planner"
+        && applyPlannerChecklistCommand(richEditor);
+      didRun = handledByPlanner || (chain as any).toggleTaskList().run();
+    }
     else if (action === "code") didRun = chain.toggleCodeBlock().run();
     if (!didRun) return false;
     syncRichDraft();
@@ -7802,6 +9024,7 @@ function MarkdownEditorSurface({
     return false;
   };
   const handleEditorChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+    if (readOnly) return;
     const nextValue = event.target.value;
     onChange(nextValue);
     updateSlashState(nextValue, event.target.selectionStart ?? nextValue.length);
@@ -8519,18 +9742,6 @@ function MarkdownEditorSurface({
     };
     return payload;
   };
-  const getFreshSpellcheckContext = async (fallback?: () => SpellcheckContextPayload | null): Promise<SpellcheckContextPayload | null> => {
-    spellcheckReplacementRef.current = null;
-    if (!window.openAssistElectron?.getSpellcheckContext) return null;
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, attempt === 0 ? 30 : 35));
-      const payload = await window.openAssistElectron.getSpellcheckContext().catch(() => null);
-      if (!payload?.misspelledWord || !Array.isArray(payload.suggestions)) continue;
-      if (Date.now() - payload.createdAt > 4000) continue;
-      return normalizeSpellcheckPayload(payload);
-    }
-    return fallback?.() ?? null;
-  };
   const applySpellcheckSuggestion = (suggestion: string) => {
     const replacement = spellcheckReplacementRef.current;
     if (replacement?.apply(suggestion)) {
@@ -8626,12 +9837,37 @@ function MarkdownEditorSurface({
       sourceDayID: activeNoteLinkTarget?.ownerKind === "planner" ? activeNoteLinkTarget.noteId : undefined
     });
   };
-  const plannerContextMenuItems = (text: string): SidebarMenuItem[] => {
-    if (!onScheduleSelectionToPlanner || !plannerSourceKind) return [];
+  const movePlannerTaskToDay = (
+    item: DailyItem,
+    targetDayID: string,
+    options: { promptForDate?: boolean } = {}
+  ) => {
+    if (!onMovePlannerTaskToDay) return;
+    const rawPickedDayID = options.promptForDate
+      ? window.prompt("Planner date (YYYY-MM-DD or MM/DD/YYYY)", targetDayID)?.trim()
+      : targetDayID;
+    const pickedDayID = options.promptForDate ? normalizePlannerPickedDate(rawPickedDayID) : targetDayID;
+    if (options.promptForDate && rawPickedDayID && !pickedDayID) {
+      window.alert("Use a date like 2026-06-05 or 06/05/2026.");
+    }
+    if (!pickedDayID || sameID(plannerBaseDayID, pickedDayID)) return;
+    void onMovePlannerTaskToDay(plannerBaseDayID, item.id, pickedDayID);
+  };
+  const plannerContextMenuItems = (text: string, plannerTask?: DailyItem | null): SidebarMenuItem[] => {
+    if (!plannerSourceKind) return [];
     const todayID = plannerDayID();
     const tomorrowID = plannerDayOffset(plannerBaseDayID, 1);
     const nextMondayID = plannerNextMonday(plannerBaseDayID);
     if (plannerSourceKind === "planner") {
+      if (plannerTask && onMovePlannerTaskToDay) {
+        return [
+          { id: "planner-move-today", label: `Move to Today (${plannerShortDate(todayID)})`, icon: <CalendarClock size={14} />, disabled: sameID(plannerBaseDayID, todayID), onSelect: () => movePlannerTaskToDay(plannerTask, todayID) },
+          { id: "planner-move-tomorrow", label: `Move to Tomorrow (${plannerShortDate(tomorrowID)})`, icon: <CalendarClock size={14} />, disabled: sameID(plannerBaseDayID, tomorrowID), onSelect: () => movePlannerTaskToDay(plannerTask, tomorrowID) },
+          { id: "planner-move-next-monday", label: `Move to Next Monday (${plannerShortDate(nextMondayID)})`, icon: <CalendarClock size={14} />, disabled: sameID(plannerBaseDayID, nextMondayID), onSelect: () => movePlannerTaskToDay(plannerTask, nextMondayID) },
+          { id: "planner-move-pick", label: "Move to Picked Date...", icon: <CalendarClock size={14} />, onSelect: () => movePlannerTaskToDay(plannerTask, tomorrowID, { promptForDate: true }) }
+        ];
+      }
+      if (!onScheduleSelectionToPlanner) return [];
       return [
         { id: "planner-move-today", label: `Move to Today (${plannerShortDate(todayID)})`, icon: <CalendarClock size={14} />, disabled: !text || plannerBaseDayID === todayID, onSelect: () => scheduleSelectedToPlanner("move", todayID) },
         { id: "planner-move-tomorrow", label: `Move to Tomorrow (${plannerShortDate(tomorrowID)})`, icon: <CalendarClock size={14} />, disabled: !text, onSelect: () => scheduleSelectedToPlanner("move", tomorrowID) },
@@ -8639,6 +9875,7 @@ function MarkdownEditorSurface({
         { id: "planner-move-pick", label: "Move to Picked Date...", icon: <CalendarClock size={14} />, disabled: !text, onSelect: () => scheduleSelectedToPlanner("move", tomorrowID, { promptForDate: true }) }
       ];
     }
+    if (!onScheduleSelectionToPlanner) return [];
     return [
       { id: "planner-copy-today", label: `Copy to Today (${plannerShortDate(todayID)})`, icon: <Copy size={14} />, disabled: !text, onSelect: () => scheduleSelectedToPlanner("copy", todayID) },
       { id: "planner-copy-tomorrow", label: `Copy to Tomorrow (${plannerShortDate(plannerDayOffset(todayID, 1))})`, icon: <Copy size={14} />, disabled: !text, onSelect: () => scheduleSelectedToPlanner("copy", plannerDayOffset(todayID, 1)) },
@@ -8782,13 +10019,13 @@ function MarkdownEditorSurface({
           icon: <ClipboardPaste size={14} />,
           onSelect: () => { void pasteFromClipboard(); }
         },
-        ...(onScheduleSelectionToPlanner && plannerSourceKind ? [
+        ...((onScheduleSelectionToPlanner || onMovePlannerTaskToDay) && plannerSourceKind ? [
           { id: "divider-planner", label: "" },
           {
             id: "planner-menu",
             label: "Planner",
             icon: <CalendarClock size={14} />,
-            children: plannerContextMenuItems(text)
+            children: plannerContextMenuItems(text, plannerTask)
           }
         ] satisfies SidebarMenuItem[] : []),
         { id: "divider-edit", label: "" },
@@ -8843,7 +10080,8 @@ function MarkdownEditorSurface({
       ]
       });
     };
-    void getFreshSpellcheckContext(() => getTextareaSpellcheckFallback(textarea)).then(showMenu).catch(() => showMenu(null));
+    spellcheckReplacementRef.current = null;
+    showMenu(getTextareaSpellcheckFallback(textarea));
   };
   const openRichEditorContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     if (!richEditor) return;
@@ -8911,13 +10149,13 @@ function MarkdownEditorSurface({
           icon: <ClipboardPaste size={14} />,
           onSelect: () => { void pasteIntoRichEditor(); }
         },
-        ...(onScheduleSelectionToPlanner && plannerSourceKind ? [
+        ...((onScheduleSelectionToPlanner || onMovePlannerTaskToDay) && plannerSourceKind ? [
           { id: "rich-divider-planner", label: "" },
           {
             id: "rich-planner-menu",
             label: "Planner",
             icon: <CalendarClock size={14} />,
-            children: plannerContextMenuItems(plannerText || text)
+            children: plannerContextMenuItems(plannerText || text, plannerTask)
           }
         ] satisfies SidebarMenuItem[] : []),
         {
@@ -8953,7 +10191,8 @@ function MarkdownEditorSurface({
       ]
       });
     };
-    void getFreshSpellcheckContext(() => getRichSpellcheckFallback(spellcheckPoint)).then(showMenu).catch(() => showMenu(null));
+    spellcheckReplacementRef.current = null;
+    showMenu(getRichSpellcheckFallback(spellcheckPoint));
   };
   const slashMenuStyle: CSSProperties | undefined = slashMenuPosition
     ? { left: slashMenuPosition.left, top: slashMenuPosition.top }
@@ -9133,10 +10372,11 @@ function MarkdownEditorSurface({
       </div>
     </div>
   ) : null;
-  const richWriteDisabled = mode === "inline" && richLocked;
-  const lockButtonTitle = richLocked ? "Unlock note editing" : "Lock note editing";
+  const richWriteDisabled = readOnly || (mode === "inline" && richLocked);
+  const lockButtonTitle = readOnly ? "Planner is read-only" : richLocked ? "Unlock note editing" : "Lock note editing";
   const handleToolbarAction = (event: React.MouseEvent<HTMLButtonElement>, action: MarkdownAction) => {
     event.preventDefault();
+    if (readOnly) return;
     if (mode === "inline") rememberRichSelection();
     applyAction(action);
   };
@@ -9157,7 +10397,8 @@ function MarkdownEditorSurface({
       "markdown-editor-surface",
       compact && "compact",
       noteLinksOpen && "has-note-link-panel",
-      readAloudAudio && "has-read-aloud-player"
+      readAloudAudio && "has-read-aloud-player",
+      readOnlyMessage && "has-read-only-message"
     )}>
       <NoteFindBar visible={findVisible} onClose={() => setFindVisible(false)} />
       <div className="note-format-toolbar">
@@ -9278,6 +10519,7 @@ function MarkdownEditorSurface({
             title={lockButtonTitle}
             aria-label={lockButtonTitle}
             aria-pressed={richLocked}
+            disabled={readOnly}
             onClick={() => {
               setEditorMode("inline");
               setRichLocked((current) => !current);
@@ -9534,6 +10776,15 @@ function MarkdownEditorSurface({
           </div>
         </div>
       </div>
+      {readOnlyMessage && (
+        <div className="planner-read-only-warning" role="alert">
+          <TriangleAlert size={16} />
+          <div>
+            <strong>Read-only planner</strong>
+            <span>{readOnlyMessage}</span>
+          </div>
+        </div>
+      )}
       {renderNoteLinkPanel()}
       {readAloudAudio && (
         <div className="note-inline-read-aloud">
@@ -9693,29 +10944,29 @@ function MarkdownEditorSurface({
       {mode === "inline" ? (
         <div
           ref={richEditorBodyRef}
-          className={cx("markdown-editor-body rich-editor-body", richLocked && "is-locked")}
-          onClickCapture={handleRichEditorClick}
-          onDoubleClickCapture={handleRichEditorDoubleClick}
-          onKeyDown={handleRichKeyDown}
-          onKeyUp={handleRichKeyUp}
-          onContextMenu={openRichEditorContextMenu}
-          onDragOver={handleBlockDragOver}
-          onDrop={handleBlockDrop}
+          className={cx("markdown-editor-body rich-editor-body", richLocked && "is-locked", readOnly && "is-read-only")}
+          onClickCapture={readOnly ? undefined : handleRichEditorClick}
+          onDoubleClickCapture={readOnly ? undefined : handleRichEditorDoubleClick}
+          onKeyDown={readOnly ? undefined : handleRichKeyDown}
+          onKeyUp={readOnly ? undefined : handleRichKeyUp}
+          onContextMenu={readOnly ? undefined : openRichEditorContextMenu}
+          onDragOver={readOnly ? undefined : handleBlockDragOver}
+          onDrop={readOnly ? undefined : handleBlockDrop}
           onDragLeave={(event) => {
             if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
             setDropBlockIndex(null);
           }}
         >
-          {renderBlockHandleLayer()}
-          {renderSlashMenu(true)}
-          {renderNoteDailyTagMenu()}
+          {!readOnly && renderBlockHandleLayer()}
+          {!readOnly && renderSlashMenu(true)}
+          {!readOnly && renderNoteDailyTagMenu()}
           {richEditor && <EditorContent editor={richEditor} className="rich-note-editor" />}
           <FloatingContextMenu menu={editorContextMenu} onClose={() => setEditorContextMenu(null)} />
         </div>
       ) : (
         <div className="markdown-editor-body markdown-source-body" ref={markdownEditorBodyRef}>
-          {renderSlashMenu()}
-          {renderNoteDailyTagMenu()}
+          {!readOnly && renderSlashMenu()}
+          {!readOnly && renderNoteDailyTagMenu()}
           {(() => {
             const collapsed = collapseDataUrls ? collapseDataUrlsInMarkdown(value) : null;
             const displayValue = collapsed ? collapsed.displayText : value;
@@ -9744,13 +10995,14 @@ function MarkdownEditorSurface({
                 <textarea
                   ref={assignTextareaRef}
                   value={displayValue}
+                  readOnly={readOnly}
                   onChange={handleCollapsedChange}
-                  onKeyDown={handleEditorKeyDown}
+                  onKeyDown={readOnly ? undefined : handleEditorKeyDown}
                   onClick={(event) => {
                     updateSlashState(event.currentTarget.value, event.currentTarget.selectionStart ?? displayValue.length);
                     updateMarkdownDailyTagState(event.currentTarget.value, event.currentTarget.selectionStart ?? displayValue.length);
                   }}
-                  onContextMenu={openEditorContextMenu}
+                  onContextMenu={readOnly ? undefined : openEditorContextMenu}
                   placeholder={placeholder}
                   spellCheck
                   wrap="soft"
@@ -10528,6 +11780,7 @@ function RealtimeVoiceMark({ size = 16, active = false }: { size?: number; activ
 function liveVoiceProviderLabel(mode?: string, provider?: string) {
   if (mode === "localVoiceAgent") return "Local Voice Agent";
   if (provider === "geminiLive") return "Gemini Live";
+  if (provider === "codexSubscription") return "Codex Voice";
   return "OpenAI Realtime";
 }
 
@@ -10690,23 +11943,11 @@ function RealtimeVoiceGlow({
     let inputEnvelope = 0;
     let outputEnvelope = 0;
     let energyLevel = 0.08;
-    // Per-emitter levels so the glow flows across instead of pulsing in unison.
-    const emitterLevels = new Array(realtimeVoiceGlowEmitterCount).fill(0.08);
-    // Center is brightest; the band tapers toward the edges.
-    const emitterCenterWeights = [0.78, 0.92, 1, 0.92, 0.78];
-    let emitterEls: HTMLElement[] = [];
-    // Travelling-wave phase so the swell drifts gently across the band.
-    let wavePhase = 0;
     const tick = (now: number) => {
       const glowRoot = rootRef.current;
       if (!glowRoot) {
         frame = window.requestAnimationFrame(tick);
         return;
-      }
-      if (emitterEls.length !== realtimeVoiceGlowEmitterCount) {
-        emitterEls = Array.from(
-          glowRoot.querySelectorAll<HTMLElement>(".realtime-voice-glow-emitter")
-        );
       }
 
       try {
@@ -10757,18 +11998,6 @@ function RealtimeVoiceGlow({
         const blend = 1 - Math.exp(-dt / rate);
         energyLevel += (target - energyLevel) * blend;
         glowRoot.style.setProperty("--glow-energy", energyLevel.toFixed(3));
-
-        // A soft wave travels left -> right and speeds up with loudness, so the
-        // glow ripples and flows rather than rising flat across the whole band.
-        wavePhase += dt * (0.85 + energyLevel * 1.9);
-        const emitterBlend = 1 - Math.exp(-dt / 0.09);
-        for (let index = 0; index < realtimeVoiceGlowEmitterCount; index += 1) {
-          const ripple = 0.5 + 0.5 * Math.sin(wavePhase * Math.PI - index * 0.78);
-          const shaped = energyLevel * emitterCenterWeights[index] * (0.58 + 0.42 * ripple);
-          const emitterTarget = Math.max(0.06, shaped);
-          emitterLevels[index] += (emitterTarget - emitterLevels[index]) * emitterBlend;
-          emitterEls[index]?.style.setProperty("--glow-e", emitterLevels[index].toFixed(3));
-        }
       } catch {
         // Audio nodes can be torn down mid-frame when Live Voice stops.
       }
@@ -10790,15 +12019,7 @@ function RealtimeVoiceGlow({
       ref={rootRef}
       className={cx("realtime-voice-glow", `state-${status}`, entered && "entered")}
       aria-hidden="true"
-    >
-      {Array.from({ length: realtimeVoiceGlowEmitterCount }, (_, index) => (
-        <span
-          key={index}
-          className="realtime-voice-glow-emitter"
-          data-emitter={index}
-        />
-      ))}
-    </div>
+    />
   );
 }
 
@@ -11214,10 +12435,53 @@ function truncateActivityDetail(value: string) {
   return `${value.slice(0, room).trimEnd()}${ACTIVITY_DETAIL_TRUNCATED_SUFFIX}`;
 }
 
+/** Split a detail string that starts with JSON and may continue with plain result text. */
+function splitLeadingJson(detail: string): { jsonText: string | null; rest: string } {
+  const text = detail.trim();
+  if (!text.startsWith("{") && !text.startsWith("[")) {
+    return { jsonText: null, rest: text };
+  }
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (char === "\\") {
+        escape = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return {
+          jsonText: text.slice(0, index + 1),
+          rest: text.slice(index + 1).trim()
+        };
+      }
+    }
+  }
+  return { jsonText: null, rest: text };
+}
+
 function parseActivityPayload(detail: string): Record<string, unknown> | null {
-  if (!detail.startsWith("{") || !detail.endsWith("}")) return null;
+  const { jsonText } = splitLeadingJson(detail);
+  const candidate = jsonText && jsonText.startsWith("{") ? jsonText : (
+    detail.startsWith("{") && detail.endsWith("}") ? detail : null
+  );
+  if (!candidate) return null;
   try {
-    const parsed = JSON.parse(detail);
+    const parsed = JSON.parse(candidate);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : null;
@@ -11232,6 +12496,57 @@ function stringValue(value: unknown) {
 
 function numberValue(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function humanizeMcpToolName(name: string) {
+  const raw = name.trim();
+  if (!raw) return "";
+  const leaf = raw.includes("__") ? (raw.split("__").filter(Boolean).pop() || raw) : raw;
+  return leaf
+    .replace(/^mcp[_-]?/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compactActivityResult(rest: string) {
+  const value = rest.replace(/\s+/g, " ").trim();
+  if (!value) return "";
+  if (/^no matching deferred tools found\.?$/i.test(value)) return "No matching tools";
+  if (value.startsWith("[{") || value.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        if (!parsed.length) return "No results";
+        const toolNames = parsed
+          .map((entry) => {
+            if (!entry || typeof entry !== "object") return "";
+            const record = entry as Record<string, unknown>;
+            return humanizeMcpToolName(stringValue(record.tool_name ?? record.name ?? record.title));
+          })
+          .filter(Boolean);
+        if (toolNames.length) {
+          const shown = toolNames.slice(0, 2).join(", ");
+          return toolNames.length > 2 ? `${shown} +${toolNames.length - 2} more` : shown;
+        }
+        return `${parsed.length} result${parsed.length === 1 ? "" : "s"}`;
+      }
+    } catch {
+      // Truncated / partial JSON arrays are common in streamed tool output.
+      const names = [...value.matchAll(/"tool_name"\s*:\s*"([^"]+)"/g)]
+        .map((match) => humanizeMcpToolName(match[1] || ""))
+        .filter(Boolean);
+      if (names.length) {
+        const unique = [...new Set(names)];
+        const shown = unique.slice(0, 2).join(", ");
+        return unique.length > 2 ? `${shown} +${unique.length - 2} more` : shown;
+      }
+      if (/"type"\s*:\s*"tool_reference"/i.test(value)) return "Found matching tools";
+    }
+  }
+  // Never dump raw JSON into the one-line summary.
+  if (value.startsWith("{") || value.startsWith("[")) return "See details";
+  return value.length > 96 ? `${value.slice(0, 93)}…` : value;
 }
 
 function activitySummaryFromPayload(title: string, payload: Record<string, unknown>) {
@@ -11265,24 +12580,113 @@ function activitySummaryFromPayload(title: string, payload: Record<string, unkno
 function fallbackActivitySummary(detail: string) {
   const filePath = detail.match(/"file_path"\s*:\s*"([^"]+)"/)?.[1]
     ?? detail.match(/"path"\s*:\s*"([^"]+)"/)?.[1];
-  const pattern = detail.match(/"pattern"\s*:\s*"([^"]+)"/)?.[1];
+  const pattern = detail.match(/"pattern"\s*:\s*"([^"]+)"/)?.[1]
+    ?? detail.match(/"query"\s*:\s*"([^"]+)"/)?.[1];
   const offset = detail.match(/"offset"\s*:\s*(\d+)/)?.[1];
   const limit = detail.match(/"limit"\s*:\s*(\d+)/)?.[1];
   if (pattern && filePath) return `${pattern} in ${compactPath(filePath)}`;
+  if (pattern) return pattern;
   if (filePath) return [compactPath(filePath), offset ? `offset ${offset}` : "", limit ? `${limit} lines` : ""].filter(Boolean).join(" · ");
   return "";
 }
 
 function formatActivityDetail(detail: string, payload: Record<string, unknown> | null) {
-  if (payload) return JSON.stringify(payload, null, 2);
+  const { jsonText, rest } = splitLeadingJson(detail);
+  if (payload) {
+    const pretty = JSON.stringify(payload, null, 2);
+    return rest ? `${pretty}\n\n${rest}` : pretty;
+  }
+  if (jsonText) {
+    try {
+      const parsed = JSON.parse(jsonText);
+      const pretty = JSON.stringify(parsed, null, 2);
+      return rest ? `${pretty}\n\n${rest}` : pretty;
+    } catch {
+      // fall through
+    }
+  }
   return detail;
+}
+
+/*
+ The local-MCP dispatcher tools stream through with machine names
+ ("Mcp Openassist Local Mcp Call Tool") and raw JSON blobs for both arguments
+ and results. Present them like first-class steps instead: name the actual
+ target tool ("My work items · via ado mcp"), show the query for discovery,
+ and reduce results to a short outcome note. Raw JSON stays available under
+ the Details toggle.
+ */
+function parseLocalMCPResultJSON(detail: string): Record<string, unknown> | null {
+  try {
+    const outer = JSON.parse(detail);
+    const text = Array.isArray(outer)
+      ? (outer.find((entry) => typeof (entry as { text?: unknown })?.text === "string") as { text?: string } | undefined)?.text
+      : undefined;
+    if (typeof text === "string") {
+      const inner = JSON.parse(text);
+      if (inner && typeof inner === "object" && !Array.isArray(inner)) return inner as Record<string, unknown>;
+    }
+  } catch {
+    // Not a tool-result envelope.
+  }
+  return null;
+}
+
+function localMCPPresentation(rawTitle: string, rawDetail: string): { title: string; summary: string } | null {
+  const normalized = rawTitle.replace(/[_\s]+/g, " ").trim().toLowerCase();
+  const isFind = /local mcp\s*find tools/.test(normalized);
+  const isCall = /local mcp\s*call tool/.test(normalized);
+  if (!isFind && !isCall) return null;
+  const detail = rawDetail.trim();
+  let args: Record<string, unknown> | null = null;
+  try {
+    const parsed = JSON.parse(detail);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
+  } catch {
+    // Detail may be a result envelope or free text instead.
+  }
+  const result = parseLocalMCPResultJSON(detail);
+  const toolID = String(args?.toolID ?? result?.toolID ?? "").trim();
+  const [server, tool] = toolID.includes("::") ? toolID.split("::") : ["", toolID];
+  if (isFind) {
+    const query = String(args?.query ?? args?.service ?? args?.request ?? "").trim();
+    const tools = (result?.tools ?? result?.matches) as unknown;
+    const found = Array.isArray(tools) ? `${tools.length} match${tools.length === 1 ? "" : "es"}` : "";
+    return {
+      title: "Finding the right connected tool",
+      summary: [query ? `"${query}"` : "", found].filter(Boolean).join(" · ")
+    };
+  }
+  const prettyTool = tool
+    ? sentenceCaseWords(tool.split(/[_.-]+/).filter(Boolean).join(" "))
+    : "Connected tool";
+  const bits: string[] = [];
+  if (server) bits.push(`via ${server.replace(/[_-]+/g, " ")}`);
+  const innerArgs = args?.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments)
+    ? args.arguments as Record<string, unknown>
+    : null;
+  if (innerArgs) {
+    const argBits = Object.entries(innerArgs)
+      .filter(([, value]) => (typeof value === "string" && value.length <= 42) || typeof value === "number" || typeof value === "boolean")
+      .slice(0, 3)
+      .map(([key, value]) => `${key} ${JSON.stringify(value)}`);
+    if (argBits.length) bits.push(argBits.join(" · "));
+  }
+  if (result) bits.push(result.ok === true ? "completed" : result.ok === false ? "failed" : "");
+  return { title: prettyTool, summary: bits.filter(Boolean).join(" · ") };
 }
 
 function activityPresentation(title: string, rawDetail: string) {
   const detail = normalizeActivityRawDetail(rawDetail);
+  const { rest } = splitLeadingJson(detail);
   const payload = parseActivityPayload(detail);
   const payloadSummary = payload ? activitySummaryFromPayload(title, payload) : "";
-  const summary = payloadSummary || fallbackActivitySummary(detail) || detail;
+  const fallback = fallbackActivitySummary(detail);
+  const resultNote = compactActivityResult(rest);
+  const head = payloadSummary || fallback;
+  const summary = head && resultNote && !head.includes(resultNote)
+    ? `${head} · ${resultNote}`
+    : head || resultNote || detail;
   return {
     summary: summary.length > 170 ? `${summary.slice(0, 167)}...` : summary,
     detail: formatActivityDetail(detail, payload)
@@ -11479,14 +12883,27 @@ function MessageArtifacts({
         const size = readableFileSize(artifact.size);
         const dimensions = artifact.width && artifact.height ? `${artifact.width} x ${artifact.height}` : "";
         const isSmallImage = artifact.kind === "image" && artifact.width && artifact.height && Math.max(artifact.width, artifact.height) <= 1024;
+        const isVideo = artifact.mimeType?.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(artifact.path || artifact.name);
         const format = artifact.mimeType?.split("/")[1]?.toUpperCase();
-        const subtitle = [artifact.kind === "image" ? "Generated image" : "Generated file", dimensions, format, size, compactPath(artifact.path)]
+        const subtitle = [artifact.kind === "image" ? "Generated image" : isVideo ? "Generated video" : "Generated file", dimensions, format, size, compactPath(artifact.path)]
           .filter(Boolean)
           .join(" · ");
         return (
           <div key={artifact.id || artifact.path} className={cx("message-artifact-card", "liquid-glass-surface", isSmallImage && "is-low-res")}>
             <LiquidGlassLayer tone="card" cornerRadius={12} />
-            {artifact.kind === "image" && artifact.dataURL ? (
+            {isVideo && artifact.path ? (
+              <button
+                type="button"
+                className="message-artifact-preview"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openArtifact(artifact);
+                }}
+                title="Open video"
+              >
+                <video src={`file://${encodeURI(artifact.path)}`} muted playsInline preload="metadata" />
+              </button>
+            ) : artifact.kind === "image" && artifact.dataURL ? (
               <button
                 type="button"
                 className="message-artifact-preview"
@@ -11648,8 +13065,12 @@ type SidebarMenuItem = {
   disabled?: boolean;
   compact?: boolean;
   onSelect?: () => void;
-  children?: SidebarMenuItem[];
+  children?: SidebarMenuItem[] | (() => SidebarMenuItem[]);
 };
+
+function sidebarMenuItemChildren(item: SidebarMenuItem) {
+  return typeof item.children === "function" ? item.children() : item.children ?? [];
+}
 
 type FloatingContextMenuState = {
   x: number;
@@ -11680,7 +13101,7 @@ function FloatingContextMenu({
 
   const renderItem = (item: SidebarMenuItem, depth = 0) => {
     if (!item.label) return <div key={item.id} className="sidebar-context-divider" />;
-    const hasChildren = Boolean(item.children?.length);
+    const hasChildren = typeof item.children === "function" || Boolean(item.children?.length);
     return (
       <div
         key={item.id}
@@ -11710,7 +13131,7 @@ function FloatingContextMenu({
         </button>
         {hasChildren && submenu === item.id && (
           <div className="sidebar-context-submenu">
-            {item.children?.map((child) => renderItem(child, depth + 1))}
+            {sidebarMenuItemChildren(item).map((child) => renderItem(child, depth + 1))}
           </div>
         )}
       </div>
@@ -11923,6 +13344,7 @@ function SidebarContextMenu({
   onLinkProjectFolder,
   onRemoveProjectFolderLink,
   onMoveProjectToFolder,
+  onReorderProject,
   onHideProject,
   onUnhideProject,
   onDeleteProject,
@@ -11953,6 +13375,7 @@ function SidebarContextMenu({
   onLinkProjectFolder: (project: ProjectItem) => void;
   onRemoveProjectFolderLink: (project: ProjectItem) => void;
   onMoveProjectToFolder: (project: ProjectItem, folderID?: string | null) => void;
+  onReorderProject: (projectID: string, targetProjectID: string, position: "before" | "after") => void;
   onHideProject: (project: ProjectItem) => void;
   onUnhideProject: (project: ProjectItem) => void;
   onDeleteProject: (project: ProjectItem) => void;
@@ -12037,7 +13460,7 @@ function SidebarContextMenu({
         id: "project-actions",
         label: "Project",
         icon: <FolderPlus size={14} />,
-        children: projectAddItems()
+        children: () => projectAddItems()
       },
       {
         id: "create-group",
@@ -12054,7 +13477,7 @@ function SidebarContextMenu({
           id: "unhide-projects",
           label: "Unhide Project or Group",
           icon: <Eye size={14} />,
-          children: hiddenProjects.map((project) => ({
+          children: () => hiddenProjects.map((project) => ({
             id: `unhide-project-${project.id}`,
             label: `${project.kind === "folder" ? "Group" : "Project"}: ${project.title}`,
             icon: project.kind === "folder" ? <Folder size={14} /> : projectIcon(project),
@@ -12086,10 +13509,10 @@ function SidebarContextMenu({
         { id: "divider-project-top", label: "" }
       ] : []),
       { id: "rename-project", label: isProject ? "Rename Project" : "Rename Group", icon: <Pencil size={14} />, onSelect: () => onRenameProject(project) },
-      { id: "change-project-icon", label: "Change Icon", icon: projectIcon(project), children: projectIconItems(project) },
+      { id: "change-project-icon", label: "Change Icon", icon: projectIcon(project), children: () => projectIconItems(project) },
       ...(isProject ? [
         { id: "link-folder", label: project.linkedFolderPath ? "Change Folder" : "Link Folder", icon: <FolderPlus size={14} />, onSelect: () => onLinkProjectFolder(project) },
-        { id: "move-project", label: "Move to Group", icon: <Folder size={14} />, children: projectMoveItems(project) },
+        { id: "move-project", label: "Move to Group", icon: <Folder size={14} />, children: () => projectMoveItems(project) },
         ...(project.linkedFolderPath ? [
           { id: "remove-folder-link", label: "Remove Folder Link", icon: <FolderMinus size={14} />, onSelect: () => onRemoveProjectFolderLink(project) }
         ] : [])
@@ -12098,7 +13521,7 @@ function SidebarContextMenu({
           id: "project-actions-inside-group",
           label: "Project Inside Group",
           icon: <FolderPlus size={14} />,
-          children: projectAddItems(project.id)
+          children: () => projectAddItems(project.id)
         }
       ]),
       { id: "divider-project-bottom", label: "" },
@@ -12132,7 +13555,7 @@ function SidebarContextMenu({
           id: "move-thread-project",
           label: thread.projectID ? "Move to Project" : "Add to Project",
           icon: <FolderPlus size={14} />,
-          children: threadProjectItems(thread)
+          children: () => threadProjectItems(thread)
         } : {
           id: "create-project",
           label: "Create Project",
@@ -12153,7 +13576,7 @@ function SidebarContextMenu({
 
   const renderItem = (item: SidebarMenuItem, depth = 0) => {
     if (!item.label) return <div key={item.id} className="sidebar-context-divider" />;
-    const hasChildren = Boolean(item.children?.length);
+    const hasChildren = typeof item.children === "function" || Boolean(item.children?.length);
     return (
       <div
         key={item.id}
@@ -12182,7 +13605,7 @@ function SidebarContextMenu({
         </button>
         {hasChildren && submenu === item.id && (
           <div className="sidebar-context-submenu">
-            {item.children?.map((child) => renderItem(child, depth + 1))}
+            {sidebarMenuItemChildren(item).map((child) => renderItem(child, depth + 1))}
           </div>
         )}
       </div>
@@ -12228,6 +13651,7 @@ function NoteRowMeta({ context, timeMs }: { context?: string; timeMs?: number })
 }
 
 const projectNoteDragType = "application/x-openassist-project-note";
+const projectRowDragType = "application/x-openassist-project-row";
 
 function projectNoteDragPayload(dataTransfer: DataTransfer) {
   try {
@@ -12788,6 +14212,7 @@ type SidebarRemoteAccessSettings = Pick<
   | "remoteAccessServerRunning"
   | "remoteAccessDeviceCount"
   | "remoteAccessTunnelHelperInstalling"
+  | "remoteAccessSyncPeers"
 >;
 
 function SidebarRemoteAccessNav({
@@ -12874,6 +14299,118 @@ function SidebarRemoteAccessNav({
   );
 }
 
+type ProjectLocationTone = "local" | "online" | "ready" | "syncing" | "offline";
+
+function projectPeerLocationTone(peer?: MacSyncPeerStatus): ProjectLocationTone {
+  if (!peer) return "offline";
+  if (peer.syncing) return "syncing";
+  const recentCutoff = Date.now() - 15 * 60_000;
+  const lastInbound = peer.inboundLastSeenAt ? Date.parse(peer.inboundLastSeenAt) : 0;
+  const lastSync = peer.lastSyncedAt ? Date.parse(peer.lastSyncedAt) : 0;
+  if (!peer.lastError && (lastInbound >= recentCutoff || lastSync >= recentCutoff)) return "online";
+  if (!peer.lastError && peer.hasRoute) return "ready";
+  return "offline";
+}
+
+function ProjectLocationIndicator({
+  project,
+  peers
+}: {
+  project: ProjectItem;
+  peers: MacSyncPeerStatus[];
+}) {
+  if (project.kind === "folder") return null;
+  const localPath = String(project.linkedFolderPath ?? "").trim();
+  const peersByMachineID = new Map(peers.map((peer) => [peer.machineID.trim().toLowerCase(), peer]));
+  const remoteByMachineID = new Map<string, {
+    machineID: string;
+    machineName: string;
+    path: string;
+    peer?: MacSyncPeerStatus;
+    tone: ProjectLocationTone;
+  }>();
+  for (const hint of project.peerLinkedFolders ?? []) {
+    const machineID = String(hint.machineID ?? "").trim().toLowerCase();
+    const folderPath = String(hint.path ?? "").trim();
+    if (!machineID || !folderPath) continue;
+    const peer = peersByMachineID.get(machineID);
+    remoteByMachineID.set(machineID, {
+      machineID,
+      machineName: String(hint.machineName ?? peer?.name ?? "Peer Mac").trim() || "Peer Mac",
+      path: folderPath,
+      peer,
+      tone: projectPeerLocationTone(peer)
+    });
+  }
+  const remoteLocations = [...remoteByMachineID.values()].sort((left, right) =>
+    left.machineName.localeCompare(right.machineName) || left.machineID.localeCompare(right.machineID)
+  );
+  if (!localPath && !remoteLocations.length) return null;
+
+  const remoteTone = remoteLocations.some((location) => location.tone === "syncing")
+    ? "syncing"
+    : remoteLocations.some((location) => location.tone === "online")
+      ? "online"
+      : remoteLocations.some((location) => location.tone === "ready")
+        ? "ready"
+        : "offline";
+  const tone: ProjectLocationTone = remoteLocations.length ? remoteTone : "local";
+  const locationCount = Number(Boolean(localPath)) + remoteLocations.length;
+  const label = localPath && remoteLocations.length
+    ? `${locationCount} locations`
+    : localPath
+      ? "This Mac"
+      : remoteLocations.length === 1
+        ? remoteLocations[0].machineName
+        : `${remoteLocations.length} Macs`;
+  const toneLabel = tone === "syncing"
+    ? "Syncing"
+    : tone === "online"
+      ? "Connected recently"
+      : tone === "ready"
+        ? "Reachable, not recently contacted"
+        : tone === "offline"
+          ? "Unavailable"
+          : "Local folder";
+  const tooltipLines = [
+    `${label} · ${toneLabel}`,
+    ...(localPath ? [`This Mac\n${localPath}`] : []),
+    ...remoteLocations.map((location) => {
+      const status = location.tone === "syncing"
+        ? "Syncing"
+        : location.tone === "online"
+          ? "Connected recently"
+          : location.tone === "ready"
+            ? "Reachable"
+            : "Unavailable";
+      return `${location.machineName} · ${status}\n${location.path}`;
+    })
+  ];
+  const LocationIcon = localPath && remoteLocations.length
+    ? Waypoints
+    : remoteLocations.length
+      ? Globe2
+      : HardDrive;
+
+  return (
+    <span
+      className={cx("project-location", `state-${tone}`)}
+      title={tone === "local" ? undefined : tooltipLines.join("\n\n")}
+      data-tooltip={tone === "local" ? "This Mac" : undefined}
+      aria-label={tone === "local" ? "Folder location: This Mac" : `Folder location: ${tooltipLines.join(". ")}`}
+    >
+      <LocationIcon
+        className="project-location-icon"
+        size={tone === "local" ? 10 : 12}
+        strokeWidth={tone === "local" ? 1.6 : 1.9}
+        aria-hidden="true"
+      />
+      {tone !== "local" ? <span className="project-location-label">{label}</span> : null}
+      {tone !== "local" ? <span className="project-location-dot" aria-hidden="true" /> : null}
+    </span>
+  );
+}
+
 function Sidebar({
   activeView,
   onChangeView,
@@ -12890,8 +14427,7 @@ function Sidebar({
   hiddenProjects,
   liveVoiceThreads,
   liveVoiceActive,
-  liveVoiceWorkCount,
-  liveVoiceWorkActive,
+  liveVoiceWorkTasksByThreadID,
   threads,
   notes,
   threadNotes,
@@ -12954,6 +14490,7 @@ function Sidebar({
   onLinkProjectFolder,
   onRemoveProjectFolderLink,
   onMoveProjectToFolder,
+  onReorderProject,
   onHideProject,
   onUnhideProject,
   onDeleteProject,
@@ -12979,8 +14516,7 @@ function Sidebar({
   hiddenProjects: ProjectItem[];
   liveVoiceThreads: ThreadItem[];
   liveVoiceActive: boolean;
-  liveVoiceWorkCount: number;
-  liveVoiceWorkActive: boolean;
+  liveVoiceWorkTasksByThreadID: Record<string, RealtimeWorkTask[]>;
   threads: ThreadItem[];
   notes: NoteItem[];
   threadNotes: ThreadNoteListItem[];
@@ -13043,6 +14579,7 @@ function Sidebar({
   onLinkProjectFolder: (project: ProjectItem) => void;
   onRemoveProjectFolderLink: (project: ProjectItem) => void;
   onMoveProjectToFolder: (project: ProjectItem, folderID?: string | null) => void;
+  onReorderProject: (projectID: string, targetProjectID: string, position: "before" | "after") => void;
   onHideProject: (project: ProjectItem) => void;
   onUnhideProject: (project: ProjectItem) => void;
   onDeleteProject: (project: ProjectItem) => void;
@@ -13064,6 +14601,8 @@ function Sidebar({
   const [projectDraftName, setProjectDraftName] = useState("");
   const [listSearch, setListSearch] = useState("");
   const [noteDropProjectID, setNoteDropProjectID] = useState<string | null>(null);
+  const [projectDropTarget, setProjectDropTarget] = useState<{ id: string; position: "before" | "after" } | null>(null);
+  const draggedProjectIDRef = useRef<string | null>(null);
   const [contextMenu, setContextMenu] = useState<SidebarContextMenuState | null>(null);
   const visibleThreads = useMemo(() => {
     const firstPage = threads.slice(0, threadLimit);
@@ -13267,14 +14806,21 @@ function Sidebar({
       </button>
     );
     if (!isRealtimeVoiceThread) return <Fragment key={thread.id}>{threadButton}</Fragment>;
+    // Day rotation gives each Live Voice log its own thread ID, so the badge
+    // must count only THIS row's runs — not every task ever merged into the
+    // shared in-memory dict, which would show yesterday's total on today's
+    // row (and vice versa) once an archived day log appears in the sidebar.
+    const threadWorkTasks = liveVoiceWorkTasksByThreadID[thread.id] ?? [];
+    const threadWorkCount = threadWorkTasks.length;
+    const threadWorkActive = threadWorkTasks.some((task) => task.state === "queued" || task.state === "running");
     return (
       <div className="live-voice-thread-row" key={thread.id}>
         {threadButton}
-        {liveVoiceWorkCount > 0 && (
+        {threadWorkCount > 0 && (
           <button
             type="button"
-            className={cx("live-voice-work-button", liveVoiceWorkActive && "is-active")}
-            aria-label={`Open Agent Work, ${liveVoiceWorkCount} ${liveVoiceWorkCount === 1 ? "run" : "runs"}`}
+            className={cx("live-voice-work-button", threadWorkActive && "is-active")}
+            aria-label={`Open Agent Work, ${threadWorkCount} ${threadWorkCount === 1 ? "run" : "runs"}`}
             title="Open current and recent Agent Work"
             onClick={(event) => {
               event.preventDefault();
@@ -13283,8 +14829,8 @@ function Sidebar({
             }}
           >
             <Waypoints size={14} aria-hidden="true" />
-            <span>{Math.min(liveVoiceWorkCount, 99)}</span>
-            {liveVoiceWorkActive && <i aria-hidden="true" />}
+            <span>{Math.min(threadWorkCount, 99)}</span>
+            {threadWorkActive && <i aria-hidden="true" />}
           </button>
         )}
       </div>
@@ -13451,6 +14997,25 @@ function Sidebar({
                 ) : createParentID ? (
                   <small>Inside {selectedProject?.title}</small>
                 ) : null}
+                {!showNotesSection && projectDraftKind === "project" && (
+                  <>
+                    <div className="project-create-divider"><span>or</span></div>
+                    <button
+                      type="button"
+                      className="project-create-folder-option"
+                      onClick={() => {
+                        setIsCreatingProject(false);
+                        onOpenProjectFolder(createParentID ?? null);
+                      }}
+                    >
+                      <span className="project-create-folder-icon"><FolderPlus size={15} strokeWidth={1.9} /></span>
+                      <span className="project-create-folder-text">
+                        <strong>Open Folder as Project</strong>
+                        <span>Named after the folder, linked automatically</span>
+                      </span>
+                    </button>
+                  </>
+                )}
                 <div className="project-create-actions">
                   <button onClick={() => setIsCreatingProject(false)}>Cancel</button>
                   <button disabled={!projectDraftName.trim()} onClick={() => void saveProjectDraft()}>
@@ -13467,11 +15032,40 @@ function Sidebar({
                   return (
                     <Fragment key={project.id}>
                       <button
-                        className={cx("project-row", selected && "expanded", sameID(noteDropProjectID, project.id) && "note-drop-target")}
+                        className={cx(
+                          "project-row",
+                          selected && "expanded",
+                          sameID(noteDropProjectID, project.id) && "note-drop-target",
+                          draggedProjectIDRef.current && sameID(draggedProjectIDRef.current, project.id) && "project-row-dragging",
+                          projectDropTarget && sameID(projectDropTarget.id, project.id) && `project-drop-${projectDropTarget.position}`
+                        )}
                         style={{ paddingLeft: 8 + depth * 24 }}
+                        draggable={!listSearchQuery}
                         onClick={() => onSelectProject(project.id)}
+                        onDragStart={(event) => {
+                          event.dataTransfer.setData(projectRowDragType, project.id);
+                          event.dataTransfer.effectAllowed = "move";
+                          draggedProjectIDRef.current = project.id;
+                        }}
+                        onDragEnd={() => {
+                          draggedProjectIDRef.current = null;
+                          setProjectDropTarget(null);
+                        }}
                         onDragOver={(event) => {
-                          if (!showNotesSection || project.kind === "folder" || !Array.from(event.dataTransfer.types).includes(projectNoteDragType)) return;
+                          const types = Array.from(event.dataTransfer.types);
+                          if (types.includes(projectRowDragType)) {
+                            const draggedID = draggedProjectIDRef.current;
+                            if (!draggedID || sameID(draggedID, project.id)) return;
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = "move";
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            const position: "before" | "after" = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+                            if (!projectDropTarget || !sameID(projectDropTarget.id, project.id) || projectDropTarget.position !== position) {
+                              setProjectDropTarget({ id: project.id, position });
+                            }
+                            return;
+                          }
+                          if (!showNotesSection || project.kind === "folder" || !types.includes(projectNoteDragType)) return;
                           event.preventDefault();
                           event.dataTransfer.dropEffect = "move";
                           setNoteDropProjectID(project.id);
@@ -13479,8 +15073,20 @@ function Sidebar({
                         onDragLeave={(event) => {
                           if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
                           if (sameID(noteDropProjectID, project.id)) setNoteDropProjectID(null);
+                          if (projectDropTarget && sameID(projectDropTarget.id, project.id)) setProjectDropTarget(null);
                         }}
                         onDrop={(event) => {
+                          if (Array.from(event.dataTransfer.types).includes(projectRowDragType)) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const draggedID = event.dataTransfer.getData(projectRowDragType) || draggedProjectIDRef.current;
+                            const target = projectDropTarget && sameID(projectDropTarget.id, project.id) ? projectDropTarget : null;
+                            draggedProjectIDRef.current = null;
+                            setProjectDropTarget(null);
+                            if (!draggedID || sameID(draggedID, project.id)) return;
+                            onReorderProject(draggedID, project.id, target?.position ?? "after");
+                            return;
+                          }
                           if (!showNotesSection || project.kind === "folder") return;
                           const payload = projectNoteDragPayload(event.dataTransfer);
                           if (!payload) return;
@@ -13528,6 +15134,10 @@ function Sidebar({
                           <strong>{project.title}</strong>
                           <small>{projectSidebarSubtitle(project)}</small>
                         </span>
+                        <ProjectLocationIndicator
+                          project={project}
+                          peers={remoteAccessSettings.remoteAccessSyncPeers ?? []}
+                        />
                       </button>
                     </Fragment>
                   );
@@ -13734,7 +15344,10 @@ function Sidebar({
         state={contextMenu}
         projects={projects}
         hiddenProjects={hiddenProjects}
-        threads={threads}
+        // Live Voice logs are rendered in their own sidebar section, but they
+        // use the same thread actions. Include them in context-menu lookup so
+        // archived day logs can be unarchived or permanently deleted.
+        threads={[...liveVoiceThreads, ...threads]}
         selectedThreadID={selectedThreadID}
         onClose={() => setContextMenu(null)}
         onCreateProject={onCreateProject}
@@ -13751,6 +15364,7 @@ function Sidebar({
         onLinkProjectFolder={onLinkProjectFolder}
         onRemoveProjectFolderLink={onRemoveProjectFolderLink}
         onMoveProjectToFolder={onMoveProjectToFolder}
+        onReorderProject={onReorderProject}
         onHideProject={onHideProject}
         onUnhideProject={onUnhideProject}
         onDeleteProject={onDeleteProject}
@@ -13930,6 +15544,8 @@ function TopBar({
 
 function ComposerContextBar({
   usage,
+  modelID,
+  modelDisplayName,
   providerName,
   providerKey,
   providerOptions,
@@ -13937,13 +15553,23 @@ function ComposerContextBar({
   onSelectProvider
 }: {
   usage?: ProviderUsageSnapshot | null;
+  modelID: string;
+  modelDisplayName: string;
   providerName: string;
   providerKey: ProviderKey;
   providerOptions: RuntimeProviderOption[];
   providerStatus?: string | null;
   onSelectProvider: (provider: ProviderKey) => void;
 }) {
-  const windows = [usage?.primary, usage?.secondary].filter(Boolean) as NonNullable<ProviderUsageSnapshot["primary"]>[];
+  const selectedModelKeys = new Set([modelID, modelDisplayName]
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean));
+  const selectedModelWindows = (usage?.modelSpecific ?? []).filter((window) =>
+    selectedModelKeys.has(window.modelName.trim().toLowerCase())
+    || Boolean(window.modelID && selectedModelKeys.has(window.modelID.trim().toLowerCase()))
+  );
+  const windows = [usage?.primary, usage?.secondary, ...selectedModelWindows]
+    .filter(Boolean) as NonNullable<ProviderUsageSnapshot["primary"]>[];
   const context = usage?.context ?? null;
   const [showRemaining, setShowRemaining] = useState(false);
   const [providerOpen, setProviderOpen] = useState(false);
@@ -14681,8 +16307,9 @@ function MessageBubbleBase({
   }
 
   if (message.role === "activity") {
-    const activityTitle = message.activityTitle || "Provider Activity";
     const activityDetail = message.activityDetail || message.text.replace(/^Command\n/, "");
+    const localMCP = localMCPPresentation(message.activityTitle || "", activityDetail.trim());
+    const activityTitle = localMCP?.title || message.activityTitle || "Provider Activity";
     const activityStatus = message.activityStatus || (message.status === "running" ? "running" : "completed");
     const presentation = activityPresentation(activityTitle, activityDetail);
     const isImageGeneration = message.activityKind === "imageGeneration";
@@ -14691,11 +16318,13 @@ function MessageBubbleBase({
     const hasExpandableDetail = !isImageGeneration && Boolean(presentation.detail.trim());
     const summaryText = isImageGeneration
       ? generatedImageURL ? "Generated image is ready." : "Generating image..."
-      : presentation.summary;
+      : localMCP ? localMCP.summary : presentation.summary;
     const statusLabel = activityStatusLabel(activityStatus);
-    const ActivityIcon = message.activityKind === "webSearch"
-      ? Search
-      : message.activityKind === "imageGeneration"
+    const ActivityIcon = message.activityKind === "memory"
+      ? Brain
+      : message.activityKind === "webSearch"
+        ? Search
+        : message.activityKind === "imageGeneration"
         ? Paintbrush
         : message.activityKind === "browserAutomation"
           ? Monitor
@@ -15043,6 +16672,9 @@ function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
   const appendLiveTurnItems = (turnMessages: ChatMessage[]) => {
     let activityBuffer: ChatMessage[] = [];
     let thinkingBuffer: ChatMessage[] = [];
+    // Keep the "Claude/Codex is working" placeholder until the end of this
+    // live turn so it never slots between thinking and tool rows.
+    let pendingRunning: ChatMessage | null = null;
 
     const flushActivities = () => {
       if (!activityBuffer.length) return;
@@ -15060,12 +16692,24 @@ function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
       });
       activityBuffer = [];
     };
-    const flushThinking = () => {
+    // When thinking is interrupted by tools/messages, mark that group done so
+    // earlier "Thinking…" rows don't stay live/blue while later work runs.
+    const finalizeThinkingMessages = (messages: ChatMessage[]) => messages.map((message) => {
+      if (message.activityStatus === "failed" || message.status === "failed") return message;
+      if (message.activityStatus === "completed" && message.status !== "running") return message;
+      return {
+        ...message,
+        status: "completed" as const,
+        activityStatus: "completed" as const,
+        updatedAt: typeof message.updatedAt === "number" ? message.updatedAt : Date.now()
+      };
+    });
+    const flushThinking = (markCompleted = false) => {
       if (!thinkingBuffer.length) return;
       items.push({
         kind: "thinking",
         id: `thinking-${thinkingBuffer[0].id}`,
-        messages: thinkingBuffer
+        messages: markCompleted ? finalizeThinkingMessages(thinkingBuffer) : thinkingBuffer
       });
       thinkingBuffer = [];
     };
@@ -15092,31 +16736,34 @@ function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
           if (!activityPreviewURL(message)) {
             continue;
           }
-          flushThinking();
+          flushThinking(true);
           flushActivities();
           items.push({ kind: "message", message });
           continue;
         }
         if (isRealtimeDelegationActivity(message)) {
-          flushThinking();
+          flushThinking(true);
           activityBuffer.push(message);
           continue;
         }
-        flushThinking();
+        flushThinking(true);
         activityBuffer.push(message);
         continue;
       }
-      flushThinking();
-      if (message.role === "assistant" && message.status === "running" && activityBuffer.length) {
-        items.push({ kind: "message", message });
-        flushActivities();
+      if (message.role === "assistant" && message.status === "running") {
+        pendingRunning = message;
         continue;
       }
+      flushThinking(true);
       flushActivities();
       items.push({ kind: "message", message });
     }
-    flushThinking();
+    // Tail of the live turn may still be thinking — keep running status.
+    flushThinking(false);
     flushActivities();
+    if (pendingRunning) {
+      items.push({ kind: "message", message: pendingRunning });
+    }
   };
 
   let turnBuffer: ChatMessage[] = [];
@@ -15146,19 +16793,26 @@ function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
 
   const flushTurn = (isTail = false) => {
     if (!turnBuffer.length) return;
-    const finalIndex = findFinalAssistantMessageIndex(turnBuffer);
-    if (finalIndex >= 0) {
-      const finalMessage = turnBuffer[finalIndex];
-      const messagesBeforeFinal = turnBuffer.slice(0, finalIndex);
-      const messagesAfterFinal = turnBuffer.slice(finalIndex + 1);
-      if (appendCollapsedTurn(messagesBeforeFinal, "turn-completed", finalMessage?.source)) {
-      } else {
-        const innerItems = buildCompletedTurnInnerItems(messagesBeforeFinal);
-        // Nothing interesting collapsed — just emit the inner items inline.
-        innerItems.forEach((item) => items.push(item));
+    // A turn buffer can hold MULTIPLE completed answers — e.g. a "Try again"
+    // re-run lands in the same buffer when nothing splits the turn. Collapse
+    // each answer's own preceding work separately; folding everything before
+    // the LAST answer swallowed the earlier attempt's answer and merged both
+    // attempts' tool steps into one oversized "Worked through N steps".
+    if (findFinalAssistantMessageIndex(turnBuffer) >= 0) {
+      let remaining = turnBuffer;
+      let firstFinal = findFirstFinalAssistantMessageIndex(remaining);
+      while (firstFinal >= 0) {
+        const finalMessage = remaining[firstFinal];
+        const messagesBeforeFinal = remaining.slice(0, firstFinal);
+        if (messagesBeforeFinal.length && !appendCollapsedTurn(messagesBeforeFinal, "turn-completed", finalMessage?.source)) {
+          // Nothing interesting collapsed — just emit the inner items inline.
+          buildCompletedTurnInnerItems(messagesBeforeFinal).forEach((item) => items.push(item));
+        }
+        items.push({ kind: "message", message: finalMessage });
+        remaining = remaining.slice(firstFinal + 1);
+        firstFinal = findFirstFinalAssistantMessageIndex(remaining);
       }
-      if (finalMessage) items.push({ kind: "message", message: finalMessage });
-      if (messagesAfterFinal.length) appendLiveTurnItems(messagesAfterFinal);
+      if (remaining.length) appendLiveTurnItems(remaining);
       turnBuffer = [];
       return;
     }
@@ -15266,10 +16920,41 @@ function findFinalAssistantMessageIndex(messages: ChatMessage[]) {
   return -1;
 }
 
+function findFirstFinalAssistantMessageIndex(messages: ChatMessage[]) {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (
+      message?.role === "assistant"
+      && message.status !== "running"
+      && message.text.trim().length > 0
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function cleanReasoningDisplayText(text: string) {
+  let cleaned = text.replace(/\r\n/g, "\n").trim();
+  if (!cleaned) return "";
+  // Strip common provider placeholders that aren't useful to show end users.
+  // Keep real reasoning text intact — only remove the known boilerplate lines.
+  cleaned = cleaned
+    .replace(/\b[\w .+-]+\s+is thinking through the request\.?/gi, "")
+    .replace(/\b[\w .+-]+\s+used private reasoning for this answer\.?/gi, "")
+    .replace(/^\s*private reasoning\s*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+  // Ignore leftover punctuation-only junk like ".." after stripping placeholders.
+  if (!cleaned || /^[.\s…·•-]+$/.test(cleaned)) return "";
+  if (/^(reasoning|thinking|\[\]|\{\}|null|undefined|"")$/i.test(cleaned)) return "";
+  return cleaned;
+}
+
 function reasoningActivityText(message: ChatMessage) {
-  const text = (message.activityDetail || message.text || "").trim();
+  const text = cleanReasoningDisplayText(message.activityDetail || message.text || "");
   if (!text) return "";
-  if (/^(reasoning|thinking|\[\]|\{\}|null|undefined|"")$/i.test(text)) return "";
   return text;
 }
 
@@ -15487,7 +17172,12 @@ function isImageGenerationActivity(activity: ChatMessage) {
 }
 
 function hasPendingApproval(activity: ChatMessage) {
-  return Boolean(activity.approvalRequestID != null && activity.approvalOptions?.length && !activity.approvalResolved && activity.activityStatus === "waiting");
+  return Boolean(
+    activity.approvalRequestID != null
+    && (activity.approvalOptions?.length || activity.approvalQuestions?.length)
+    && !activity.approvalResolved
+    && activity.activityStatus === "waiting"
+  );
 }
 
 function isSameApprovalActivity(existing: ChatMessage, target: ChatMessage) {
@@ -15520,12 +17210,45 @@ function activeRunPendingApprovalActivity(run?: ActiveThreadRun | null) {
   return activeRunActivities(run).find(hasPendingApproval);
 }
 
+function sentenceCaseWords(value: string) {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part, index) => (
+      index === 0
+        ? part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+        : part.toLowerCase()
+    ))
+    .join(" ");
+}
+
+function humanizeToolTitle(title: string) {
+  const raw = title.replace(/\s+/g, " ").trim();
+  if (!raw) return "Tool";
+  if (/^[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+$/.test(raw)) {
+    // ToolSearch -> Tool search, WebSearch -> Web search
+    return sentenceCaseWords(raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2"));
+  }
+  if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/i.test(raw)) {
+    return sentenceCaseWords(raw.split("_").filter(Boolean).join(" "));
+  }
+  if (/^mcp__/i.test(raw) || raw.includes("__")) {
+    const leaf = raw.split("__").filter(Boolean).pop() || raw;
+    return humanizeToolTitle(leaf.replace(/[-.]+/g, " "));
+  }
+  return raw;
+}
+
 function workStepTitle(activity: ChatMessage) {
   const kind = normalizedActivityKind(activity.activityKind);
   if (kind === "reasoning") return "Reasoning";
-  if (kind === "assistantprogress") return "Agent Message";
-  if (kind === "imagegeneration") return "Image Generation";
-  return activity.activityTitle || "Tool";
+  if (kind === "assistantprogress") return "Agent message";
+  if (kind === "imagegeneration") return "Image generation";
+  if (kind === "websearch") return "Web search";
+  if (kind === "mcptoolcall") {
+    return humanizeToolTitle(activity.activityTitle || "MCP tool");
+  }
+  return humanizeToolTitle(activity.activityTitle || "Tool");
 }
 
 function ApprovalActions({
@@ -15535,7 +17258,34 @@ function ApprovalActions({
   activity: ChatMessage;
   onRespondToApproval?: ApprovalResponder;
 }) {
+  const [answers, setAnswers] = useState<Record<string, string[]>>({});
+  const [freeText, setFreeText] = useState<Record<string, string>>({});
   if (!hasPendingApproval(activity) || !onRespondToApproval) return null;
+  const questions = activity.approvalQuestions ?? [];
+  const toggleAnswer = (questionID: string, label: string, multiSelect: boolean) => {
+    setAnswers((current) => {
+      const selected = current[questionID] ?? [];
+      const next = multiSelect
+        ? selected.includes(label) ? selected.filter((value) => value !== label) : [...selected, label]
+        : [label];
+      return { ...current, [questionID]: next };
+    });
+  };
+  const submitQuestions = () => {
+    const submitted: Record<string, string | string[]> = {};
+    for (const question of questions) {
+      const selected = answers[question.id] ?? [];
+      const extra = (freeText[question.id] ?? "").trim();
+      const values = extra ? [...selected, extra] : selected;
+      submitted[question.id] = question.multiSelect ? values : values[0] ?? "";
+    }
+    onRespondToApproval(activity, {
+      id: "submit-answers",
+      label: "Submit",
+      tone: "approve",
+      result: { decision: "answers", answers: submitted }
+    });
+  };
   return (
     <div className="approval-actions liquid-glass-surface" onClick={(event) => event.stopPropagation()}>
       <LiquidGlassLayer tone="row" cornerRadius={8} />
@@ -15543,7 +17293,57 @@ function ApprovalActions({
         <Shield size={13} />
         Approval needed
       </span>
-      <span className="approval-actions-buttons">
+      {questions.length > 0 && (
+        <div className="approval-question-list">
+          {questions.map((question) => (
+            <div className="approval-question" key={question.id}>
+              <span className="approval-question-prompt">{question.prompt}</span>
+              {question.options.length > 0 && (
+                <span className="approval-actions-buttons">
+                  {question.options.map((option) => {
+                    const selected = (answers[question.id] ?? []).includes(option.label);
+                    return (
+                      <button
+                        key={option.label}
+                        type="button"
+                        className={cx("approval-action-button", selected && "approve")}
+                        title={option.description || option.label}
+                        onClick={() => toggleAnswer(question.id, option.label, question.multiSelect)}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </span>
+              )}
+              {question.allowFreeText && (
+                <input
+                  className="approval-question-input"
+                  value={freeText[question.id] ?? ""}
+                  placeholder="Other answer"
+                  onChange={(event) => setFreeText((current) => ({ ...current, [question.id]: event.target.value }))}
+                />
+              )}
+            </div>
+          ))}
+          <span className="approval-actions-buttons">
+            <button type="button" className="approval-action-button approve" onClick={submitQuestions}>Submit</button>
+            <button
+              type="button"
+              className="approval-action-button danger"
+              onClick={() => onRespondToApproval(activity, {
+                id: "cancel-answers",
+                label: "Cancel",
+                tone: "danger",
+                result: { decision: "cancel" }
+              })}
+            >
+              Cancel
+            </button>
+          </span>
+        </div>
+      )}
+      {activity.approvalOptions?.length ? <span className="approval-actions-buttons">
         {activity.approvalOptions?.map((option) => (
           <button
             key={option.id}
@@ -15555,7 +17355,7 @@ function ApprovalActions({
             {option.label}
           </button>
         ))}
-      </span>
+      </span> : null}
     </div>
   );
 }
@@ -15606,8 +17406,18 @@ function knowledgePreviewSummary(request: KnowledgeWriteRequest) {
     const destination = knowledgeApprovalDestination(request);
     return `Will create note "${preview.title}"${destination ? ` in ${destination}` : ""}`;
   }
+  if (preview.kind === "peer_file_fetch") {
+    return `Will copy ${preview.relativePath} from ${preview.fromMachineName}${preview.overwrites ? " · overwrites local file" : ""}`;
+  }
   if (preview.kind === "replace_markdown") return "Will replace markdown after approval";
   return "Preview ready";
+}
+
+function knowledgePreviewFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "Unknown";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
 type KnowledgeDiffLine = { kind: "same" | "added" | "removed"; text: string };
@@ -15792,6 +17602,19 @@ function KnowledgePreviewDetails({ request }: { request: KnowledgeWriteRequest }
       <div className="knowledge-approval-diff" aria-label="Daily item removal preview">
         <strong>Removing planner task</strong>
         <pre><span className="knowledge-approval-diff-line removed"><span className="knowledge-approval-diff-marker">-</span><span>{preview.itemID} from {preview.dayID}</span></span></pre>
+      </div>
+    );
+  }
+  if (preview.kind === "peer_file_fetch") {
+    return (
+      <div className="knowledge-approval-diff" aria-label="Peer file fetch preview">
+        <div className="knowledge-approval-meta-grid">
+          <span><small>File</small><strong>{preview.relativePath}</strong></span>
+          <span><small>From</small><strong>{preview.fromMachineName}</strong></span>
+          <span><small>Size</small><strong>{knowledgePreviewFileSize(preview.size)}</strong></span>
+          <span><small>Destination</small><strong>{preview.targetPath}</strong></span>
+        </div>
+        {preview.overwrites ? <p className="knowledge-approval-message">This will replace the existing local file.</p> : null}
       </div>
     );
   }
@@ -15984,6 +17807,19 @@ function FilePreviewPanel({
       );
     }
 
+    if (preview.kind === "video") {
+      return preview.fileURL ? (
+        <div className="file-preview-image-wrap">
+          <video className="file-preview-video" src={preview.fileURL} controls playsInline preload="metadata" />
+        </div>
+      ) : (
+        <div className="file-preview-empty state-error">
+          <TriangleAlert size={28} />
+          <strong>Video preview is unavailable.</strong>
+        </div>
+      );
+    }
+
     if (preview.kind === "pdf") {
       return preview.dataURL ? (
         <iframe className="file-preview-pdf" src={preview.dataURL} title={preview.name} />
@@ -16154,11 +17990,14 @@ function WorkSummaryStep({
   approvalsEnabled?: boolean;
 }) {
   const kind = normalizedActivityKind(activity.activityKind);
-  const title = workStepTitle(activity);
   const rawDetail = (activity.activityDetail || activity.text || "").replace(/^Command\n/, "").trim();
+  const localMCP = localMCPPresentation(activity.activityTitle || "", rawDetail);
+  const title = localMCP?.title || workStepTitle(activity);
   const presentation = activityPresentation(title, rawDetail);
-  const genericSummary = /^(reasoning|thinking|user message|agent message|assistant message|\[\]|\{\}|null|undefined|"")$/i.test(presentation.summary.trim());
-  const summary = genericSummary || presentation.summary.trim() === title.trim() ? "" : presentation.summary.trim();
+  const genericSummary = /^(reasoning|thinking|user message|agent message|assistant message|see details|\[\]|\{\}|null|undefined|"")$/i.test(presentation.summary.trim());
+  const summary = localMCP
+    ? localMCP.summary
+    : genericSummary || presentation.summary.trim() === title.trim() ? "" : presentation.summary.trim();
   const detail = presentation.detail.trim();
   const hasDetail = detail.length > 0 && detail !== summary && detail !== title;
   const [detailOpen, setDetailOpen] = useState(false);
@@ -16176,11 +18015,11 @@ function WorkSummaryStep({
             : kind === "plan"
               ? ListTodo
               : kind === "reasoning"
-                ? Brain
+                ? TextQuote
                 : kind === "assistantprogress"
                   ? MessageSquare
                   : kind === "subagent"
-                    ? BrainCircuit
+                    ? Workflow
                     : Terminal;
 
   return (
@@ -16220,25 +18059,25 @@ function formatThinkingDuration(ms: number) {
 
 function ThinkingGroupBase({ messages, embedded = false }: { messages: ChatMessage[]; embedded?: boolean }) {
   const text = messages
-    .map((message) => (message.activityDetail || message.text || "").trim())
+    .map((message) => cleanReasoningDisplayText(message.activityDetail || message.text || ""))
     .filter(Boolean)
     .join("\n\n");
-  const isThinking = messages.some((message) =>
-    message.activityStatus === "running" || message.activityStatus === "pending" || message.status === "running"
-  );
+  const isThinking = messages.some((message) => {
+    // Prefer activityStatus: once a reasoning block is completed/failed, never
+    // treat it as live just because a parent turn message is still running.
+    if (message.activityStatus === "completed" || message.activityStatus === "failed") return false;
+    return message.activityStatus === "running"
+      || message.activityStatus === "pending"
+      || message.status === "running";
+  });
   // Show the reasoning live while the model is thinking, then auto-collapse it
   // into a compact "Thought for Ns" toggle so it doesn't read as chat content.
   const [expanded, setExpanded] = useState(() => isThinking);
   useEffect(() => {
     if (!isThinking) setExpanded(false);
   }, [isThinking]);
-  if (!text) return null;
   const provider = messages.find((message) => message.provider)?.provider || "Codex";
   const motionProps = embedded ? {} : messageMotion;
-  // Framer Motion `layout` is intentionally OFF for chat rows: with it on,
-  // every height change of the streaming bubble re-measured and re-animated
-  // every sibling row, which made the whole chat feel laggy while responding.
-  const layoutProps = {};
   const startedAt = messages.reduce(
     (min, message) => typeof message.createdAt === "number" ? Math.min(min, message.createdAt) : min,
     Number.POSITIVE_INFINITY
@@ -16253,43 +18092,64 @@ function ThinkingGroupBase({ messages, embedded = false }: { messages: ChatMessa
     : elapsedMs >= 400
       ? `Thought for ${formatThinkingDuration(elapsedMs)}`
       : "Thought process";
-  const reasoningBody = (
+  const hasBody = Boolean(text);
+  // Private-reasoning providers may only emit placeholder copy. Still show a
+  // quiet label so the completed turn stays coherent without dumping junk.
+  if (!hasBody && !isThinking && embedded) {
+    return (
+      <div className={cx("thinking-summary-line", "thinking-summary-line-embedded", "thinking-summary-line-empty")}>
+        <span className="reasoning-label">{thoughtLabel}</span>
+      </div>
+    );
+  }
+  if (!hasBody && !isThinking) return null;
+  const reasoningBody = hasBody ? (
     <div className={cx("assistant-copy", "thinking-copy", "reasoning-body", `assistant-copy-${providerKey(provider)}`)}>
       <MarkdownPreview markdown={text} className="assistant-markdown-shell thinking-markdown-shell" emptyText="" />
     </div>
-  );
-  if (embedded) {
-    return (
-      <motion.div {...layoutProps} {...motionProps} className="message-row assistant-message thinking-message">
-        {reasoningBody}
-      </motion.div>
-    );
-  }
+  ) : null;
   // Collapse via a CSS grid-rows transition while keeping the markdown mounted.
   // This avoids framer-motion height/layout animations and re-parsing the
   // (often math/code-heavy) reasoning on every toggle, which caused the jank.
   return (
     <motion.div
       {...motionProps}
-      className={cx("work-summary-line", "thinking-summary-line", `work-summary-line-${providerKey(provider)}`, expanded && "expanded")}
+      className={cx(
+        "work-summary-line",
+        "thinking-summary-line",
+        embedded && "thinking-summary-line-embedded",
+        `work-summary-line-${providerKey(provider)}`,
+        expanded && "expanded",
+        isThinking && "is-live"
+      )}
     >
       <button
-        className={cx("work-summary-toggle", "reasoning-toggle", isThinking && "is-active")}
+        className={cx("work-summary-toggle", "reasoning-toggle", isThinking && "is-live")}
         aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
+        disabled={!hasBody}
+        onClick={() => {
+          if (hasBody) setExpanded((value) => !value);
+        }}
       >
-        <span className={cx("reasoning-glyph", isThinking && "is-live")} aria-hidden="true">
-          <Brain size={13} />
-          {isThinking && <span className="reasoning-glyph-dot" />}
+        {isThinking && (
+          <span className="reasoning-live-indicator" aria-hidden="true">
+            <span className="reasoning-live-dot" />
+            <span className="reasoning-live-dot" />
+            <span className="reasoning-live-dot" />
+          </span>
+        )}
+        <span className={cx("reasoning-label", isThinking && "is-live")}>
+          {isThinking ? `${thoughtLabel}…` : thoughtLabel}
         </span>
-        <span className="reasoning-label">{isThinking ? `${thoughtLabel}…` : thoughtLabel}</span>
-        <ChevronRight size={14} />
+        {hasBody && <ChevronRight size={14} className="reasoning-chevron" />}
       </button>
-      <div className={cx("thinking-collapse", expanded && "expanded")}>
-        <div className="thinking-collapse-inner">
-          {reasoningBody}
+      {hasBody && (
+        <div className={cx("thinking-collapse", expanded && "expanded")}>
+          <div className="thinking-collapse-inner">
+            {reasoningBody}
+          </div>
         </div>
-      </div>
+      )}
     </motion.div>
   );
 }
@@ -16342,7 +18202,10 @@ function WorkActivityGroupBase({
       : `Tool work · ${Math.max(displayActivities.length, 1)} ${displayActivities.length === 1 ? "step" : "steps"}`;
   const latest = [...displayActivities].reverse().find((activity) => activity.activityTitle || activity.activityDetail || activity.text);
   const latestTitle = latest?.activityTitle || "Tool activity";
-  const latestSummary = latest ? activityPresentation(latestTitle, latest.activityDetail || latest.text).summary : "";
+  const latestLocalMCP = latest ? localMCPPresentation(latest.activityTitle || "", (latest.activityDetail || latest.text || "").trim()) : null;
+  const latestSummary = latestLocalMCP
+    ? [latestLocalMCP.title, latestLocalMCP.summary].filter(Boolean).join(" · ")
+    : latest ? activityPresentation(latestTitle, latest.activityDetail || latest.text).summary : "";
   const canStopWork = active && status === "running" && Boolean(onStopWork);
   const motionProps = embedded ? {} : messageMotion;
   // Framer Motion `layout` is intentionally OFF for chat rows: with it on,
@@ -16361,6 +18224,22 @@ function WorkActivityGroupBase({
     : pausedHistory
       ? (hasRealtimeDelegation ? "Paused Realtime conversation work" : "Paused tool work")
       : completedWorkTitle(displayActivities);
+  // Inside a completed-turn disclosure, list steps flat — no second
+  // "Worked through N steps" nest. Keeps the post-response UI calm.
+  if (embedded && !isLive) {
+    return (
+      <div className={cx("work-summary-flat", `work-summary-line-${providerKey(provider)}`)}>
+        {displayActivities.map((activity) => (
+          <WorkSummaryStep
+            key={activity.id}
+            activity={activity}
+            onRespondToApproval={onRespondToApproval}
+            approvalsEnabled={false}
+          />
+        ))}
+      </div>
+    );
+  }
   // Both live (running/failed/approval) and completed states share the slim
   // "work-summary-line" look so the card stays visually consistent before and
   // after the agent finishes. When live, a modifier class adds the provider
@@ -16373,13 +18252,15 @@ function WorkActivityGroupBase({
         "work-summary-line",
         `work-summary-line-${providerKey(provider)}`,
         expanded && "expanded",
+        // Live tool work stays on the same slim line as completed steps —
+        // no heavy glass card chrome. Only failed/approval get stronger cues.
         isLive && "live",
         isLive && status === "running" && "running",
         isLive && status === "failed" && "failed",
-        isLive && activeApprovalActivity && "needs-approval"
+        isLive && activeApprovalActivity && "needs-approval",
+        embedded && "work-summary-line-embedded"
       )}
     >
-      {isLive && <LiquidGlassLayer tone="card" cornerRadius={8} active={status === "running" || Boolean(activeApprovalActivity)} />}
       <button
         className="work-summary-toggle"
         aria-expanded={expanded}
@@ -16637,23 +18518,35 @@ function RealtimeWorkShelf({
   const elapsed = formatWorkingElapsed(Math.max(0, Math.floor((elapsedUntil - lead.startedAt) / 1000)));
   const latestUpdate = lead.progress || lead.error || lead.prompt;
   const isLive = Boolean(active.length);
-  const statusText = active.length > 1
-    ? `${active.length} active`
-    : `${realtimeWorkStatusLabel(lead)} · ${elapsed}`;
+  const tone: "live" | "done" | "failed" = isLive
+    ? "live"
+    : lead.state === "failed" || lead.state === "cancelled"
+      ? "failed"
+      : "done";
+  const statusLabel = active.length > 1 ? `${active.length} active` : realtimeWorkStatusLabel(lead);
+  // Live runs surface the streaming progress line; finished runs surface the task
+  // itself so the user can tell *which* run this was at a glance.
+  const detailText = (isLive ? latestUpdate : lead.prompt || lead.error || latestUpdate || "")
+    .replace(/\s+/g, " ")
+    .trim();
   return (
-    <div className={cx("realtime-work-shelf", "liquid-glass-surface", isLive && "is-live")} role="status" aria-live="polite" aria-label="Agent work">
+    <div className={cx("realtime-work-shelf", "liquid-glass-surface", `is-${tone}`)} role="status" aria-live="polite" aria-label="Agent work">
       <LiquidGlassLayer tone="row" cornerRadius={12} active={isLive} />
       <button type="button" className="realtime-work-shelf-main" onClick={onToggle} aria-expanded={expanded}>
-        <span className={cx("realtime-work-shelf-icon", isLive && "is-live")} aria-hidden="true">
-          <Waypoints size={16} />
+        <span className={cx("realtime-work-shelf-icon", `is-${tone}`)} aria-hidden="true">
+          {tone === "live" ? <Waypoints size={16} /> : tone === "done" ? <Check size={15} /> : <TriangleAlert size={15} />}
           {isLive && <span className="realtime-work-shelf-pulse" />}
         </span>
         <span className="realtime-work-shelf-copy">
           <span className="realtime-work-shelf-headline">
             <strong>{isLive ? "Agent Work" : "Recent Agent Work"}</strong>
-            <small className="realtime-work-shelf-status">{statusText}</small>
+            <span className={cx("realtime-work-shelf-pill", `is-${tone}`)}>{statusLabel}</span>
+            {active.length <= 1 && <small className="realtime-work-shelf-status">{elapsed}</small>}
           </span>
-          <span className="realtime-work-shelf-detail">{lead.workerProvider}{latestUpdate ? ` · ${latestUpdate}` : ""}</span>
+          <span className="realtime-work-shelf-detail">
+            <span className="realtime-work-shelf-provider">{lead.workerProvider}</span>
+            {detailText && <span className="realtime-work-shelf-detail-text">{detailText}</span>}
+          </span>
         </span>
         <ChevronRight size={15} className={cx("realtime-work-shelf-chev", expanded && "is-open")} />
       </button>
@@ -16969,7 +18862,9 @@ function CompletedTurnGroupBase({
   onOpenAgentWork?: (taskID: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const stepLabel = `Worked through ${toolStepCount} ${toolStepCount === 1 ? "step" : "steps"}`;
+  const stepLabel = toolStepCount === 1
+    ? "1 step"
+    : `${toolStepCount} steps`;
   const hasRealtimeSource = source === "realtimeVoice" || innerItems.some(
     (inner) => inner.kind === "work" && inner.activities.some(isRealtimeDelegationActivity)
   );
@@ -16994,9 +18889,9 @@ function CompletedTurnGroupBase({
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
       >
-        <span>{stepLabel}</span>
+        <span>Worked through {stepLabel}</span>
         {hasRealtimeSource && <small className="work-source-pill">Realtime conversation</small>}
-        <ChevronRight size={15} />
+        <ChevronRight size={14} className="reasoning-chevron" />
       </button>
       {!expanded && <ActivityPreviewStrip activities={previewActivities} className="work-summary-preview-strip completed-turn-preview-strip" />}
       <AnimatePresence initial={false}>
@@ -17606,6 +19501,8 @@ function Composer({
   skills,
   onChange,
   onSend,
+  onSteerMessage,
+  onQueueMessage,
   onStop,
   onScrollToLatest,
   onAttachImages,
@@ -17660,6 +19557,8 @@ function Composer({
   skills: SkillItem[];
   onChange: (value: string) => void;
   onSend: () => void;
+  onSteerMessage?: (text: string) => void;
+  onQueueMessage?: (text: string) => void;
   onStop?: () => void;
   onScrollToLatest?: () => void;
   onAttachImages: (files: File[]) => void;
@@ -17790,15 +19689,24 @@ function Composer({
     if (!isListening) focusComposerInput();
     onVoiceInput();
   };
-  const activePermissionOption = codexPermissionOptions.find((option) => option.value === permissionMode) ?? codexPermissionOptions[0];
+  const permissionOptions = activeProviderKey === "claudeCode" ? claudePermissionOptions : codexPermissionOptions;
+  const activePermissionOption = permissionOptions.find((option) => option.value === permissionMode) ?? permissionOptions[0];
   const ActivePermissionIcon = activePermissionOption.Icon;
   const modelSections = modelFamilySections(activeProviderKey, modelName, modelOptions);
   const selectedModelSection = modelSections.find((section) =>
-    section.models.some((model) => model.id.toLowerCase() === modelName.trim().toLowerCase())
+    section.models.some((model) =>
+      model.id.toLowerCase() === modelName.trim().toLowerCase()
+      || model.resolvedModel?.toLowerCase() === modelName.trim().toLowerCase()
+    )
   )?.key;
   const selectedModelOption = modelSections
     .flatMap((section) => section.models)
-    .find((model) => model.id.toLowerCase() === modelName.trim().toLowerCase());
+    .find((model) =>
+      model.id.toLowerCase() === modelName.trim().toLowerCase()
+      || model.resolvedModel?.toLowerCase() === modelName.trim().toLowerCase()
+    );
+  const showReasoningEffort = activeProviderKey === "codex"
+    || (activeProviderKey === "claudeCode" && Boolean(selectedModelOption?.supportedReasoningEfforts?.length));
   const [expandedModelSections, setExpandedModelSections] = useState<string[]>([]);
   const compactModelName = selectedModelOption?.displayName ?? compactComposerModelName(modelName);
   const hasText = value.trim().length > 0;
@@ -17854,6 +19762,14 @@ function Composer({
   // its draft state too, but its draft uses a debounced sync, so relying on the
   // parent's value to flow back can leave the just-sent text visible. Clearing
   // locally first guarantees the box empties as soon as you send.
+  const clearComposerLocalValue = () => {
+    valueRef.current = "";
+    setValue("");
+    handledMentionDeleteRef.current = false;
+    pendingSelectionRef.current = 0;
+    setMentionCursor(0);
+    setDismissedMentionKey(null);
+  };
   const handleSend = () => {
     if (disabled || !hasContent) return;
     onSend();
@@ -17861,12 +19777,19 @@ function Composer({
     // reads the prompt from its own draft ref (sometimes after an await), so we
     // must not touch that ref here or we'd send an empty message. The parent
     // clears its draft state itself after capturing the prompt.
-    valueRef.current = "";
-    setValue("");
-    handledMentionDeleteRef.current = false;
-    pendingSelectionRef.current = 0;
-    setMentionCursor(0);
-    setDismissedMentionKey(null);
+    clearComposerLocalValue();
+  };
+  // While a task runs: Enter steers it, Cmd+Enter queues for after, and Esc
+  // pressed twice stops it.
+  const escapeStopArmedAtRef = useRef(0);
+  const [escapeStopArmed, setEscapeStopArmed] = useState(false);
+  const handleRunningSubmit = (mode: "steer" | "queue") => {
+    const text = valueRef.current.trim();
+    if (!text) return;
+    const handler = mode === "queue" ? onQueueMessage : onSteerMessage;
+    handler?.(text);
+    onChange("");
+    clearComposerLocalValue();
   };
   const insertMention = (entry: ComposerMentionEntry) => {
     const next = replaceActiveComposerMention(value, textareaRef.current?.selectionStart ?? mentionCursor, entry.insertText);
@@ -18137,14 +20060,37 @@ function Composer({
                   return;
                 }
               }
+              if (event.key === "Escape" && showStopButton && onStop) {
+                event.preventDefault();
+                const now = Date.now();
+                if (now - escapeStopArmedAtRef.current < 1_500) {
+                  escapeStopArmedAtRef.current = 0;
+                  setEscapeStopArmed(false);
+                  onStop();
+                } else {
+                  escapeStopArmedAtRef.current = now;
+                  setEscapeStopArmed(true);
+                  window.setTimeout(() => {
+                    if (Date.now() - escapeStopArmedAtRef.current >= 1_450) setEscapeStopArmed(false);
+                  }, 1_600);
+                }
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
+                if (showStopButton && (onSteerMessage || onQueueMessage)) {
+                  handleRunningSubmit(event.metaKey ? "queue" : "steer");
+                  return;
+                }
                 handleSend();
               }
             }}
             onKeyUp={updateMentionCursor}
             onSelect={updateMentionCursor}
           />
+          {escapeStopArmed && showStopButton && (
+            <p className="composer-esc-stop-hint">Press Esc again to stop the running task</p>
+          )}
         </div>
         <div className="composer-tools">
           <div className="quick-actions" ref={actionsMenuRef}>
@@ -18210,7 +20156,7 @@ function Composer({
               )}
             </AnimatePresence>
           </div>
-          {activeProviderKey === "codex" && (
+          {(activeProviderKey === "codex" || activeProviderKey === "claudeCode") && (
             <div className="composer-menu-wrap composer-permission-wrap" ref={permissionMenuRef}>
               <PillButton
                 className="permission-pill"
@@ -18230,7 +20176,7 @@ function Composer({
                 {permissionOpen && (
                   <motion.div {...popoverMotion} className="composer-popover permission-popover liquid-glass-surface">
                     <LiquidGlassLayer tone="popover" cornerRadius={12} />
-                    {codexPermissionOptions.map((option) => {
+                    {permissionOptions.map((option) => {
                       const isSelected = option.value === permissionMode;
                       const OptionIcon = option.Icon;
                       return (
@@ -18272,14 +20218,16 @@ function Composer({
               >
                 <span className="composer-model-name">{compactModelName}</span>
               </button>
-              <button
-                type="button"
-                className="composer-effort-button"
-                aria-label={`Cycle reasoning effort. Current: ${reasoningEffort}`}
-                onClick={onCycleReasoning}
-              >
-                <span className="composer-effort-label">{reasoningEffort}</span>
-              </button>
+              {showReasoningEffort && (
+                <button
+                  type="button"
+                  className="composer-effort-button"
+                  aria-label={`Cycle reasoning effort. Current: ${reasoningEffort}`}
+                  onClick={onCycleReasoning}
+                >
+                  <span className="composer-effort-label">{reasoningEffort}</span>
+                </button>
+              )}
             </div>
             <AnimatePresence>
               {modelOpen && (
@@ -18373,15 +20321,14 @@ function Composer({
 	                  ? <RealtimeVoiceMark size={18} active={liveVoiceConnected} />
 	                  : <Mic size={18} />}
 	              </IconButton>
-              <span
-                className={cx(
-                  "composer-voice-mode-badge",
-                  primaryVoiceMode === "live" ? "mode-live" : activeDictationEngine === "Cloud Providers" ? "mode-cloud" : activeDictationEngine === "whisper.cpp" ? "mode-local" : "mode-device"
-                )}
-                title={primaryVoiceMode === "live" ? liveVoiceOptionDetail : activeDictationDetail}
-              >
-                {primaryVoiceMode === "live" ? "Live" : activeDictationModeLabel}
-              </span>
+              {primaryVoiceMode === "live" && (
+                <span
+                  className="composer-voice-mode-badge mode-live"
+                  title={liveVoiceOptionDetail}
+                >
+                  Live
+                </span>
+              )}
 		              <button
 	                type="button"
 	                className="composer-voice-switch-button"
@@ -18457,6 +20404,8 @@ function Composer({
         </div>
         <ComposerContextBar
           usage={usage}
+          modelID={modelName}
+          modelDisplayName={selectedModelOption?.displayName ?? compactModelName}
           providerName={providerName}
           providerKey={activeProviderKey}
           providerOptions={providerOptions}
@@ -18530,10 +20479,13 @@ function ThreadsView({
   onRemoveAttachment,
   onClearAttachmentError,
   onSend,
+  onSteerMessage,
+  onQueueMessage,
   onStop,
   onVoiceInput,
   onLiveVoice,
   onTodayLiveVoice,
+  onClearLiveVoiceLog,
   onToggleLiveVoiceMuted,
   onOpenRealtimeSettings,
   onOpenKnowledgeSettings,
@@ -18609,10 +20561,13 @@ function ThreadsView({
   onRemoveAttachment: (id: string) => void;
   onClearAttachmentError: () => void;
   onSend: () => void;
+  onSteerMessage?: (text: string) => void;
+  onQueueMessage?: (text: string) => void;
   onStop: () => void;
   onVoiceInput: () => void;
   onLiveVoice: () => void;
   onTodayLiveVoice: () => void;
+  onClearLiveVoiceLog: () => void;
   onToggleLiveVoiceMuted: () => void;
   onOpenRealtimeSettings: () => void;
   onOpenKnowledgeSettings: () => void;
@@ -18864,13 +20819,24 @@ function ThreadsView({
                 <strong>Today Live Voice log</strong>
                 <small>This thread stores realtime voice history. Typed messages are disabled so you do not send here by mistake.</small>
               </span>
-              <button
-                type="button"
-                onClick={onTodayLiveVoice}
-                disabled={liveVoiceStatus === "connecting"}
-              >
-                {todayLiveVoiceActionLabel}
-              </button>
+              <div className="realtime-thread-banner-actions">
+                <button
+                  type="button"
+                  className="realtime-thread-clear-button"
+                  aria-label="Clear this day’s Voice Log"
+                  title="Clear this day’s Voice Log"
+                  onClick={onClearLiveVoiceLog}
+                >
+                  <Trash2 size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={onTodayLiveVoice}
+                  disabled={liveVoiceStatus === "connecting"}
+                >
+                  {todayLiveVoiceActionLabel}
+                </button>
+              </div>
             </div>
           )}
           {hasMoreMessagesBefore && (
@@ -18947,7 +20913,7 @@ function ThreadsView({
       </section>
       {isRealtimeVoiceThread ? (
         <div className="composer-wrap realtime-voice-composer-wrap">
-          <div className="composer-stack">
+          <div className={cx("composer-stack", Boolean(realtimeWorkShelf) && "has-agent-work")}>
             <RealtimeTranscript
               placement="composer"
               active={liveVoiceSessionActive}
@@ -19013,6 +20979,8 @@ function ThreadsView({
         skills={skills}
         onChange={onComposerDraft ?? onComposerText}
         onSend={onSend}
+        onSteerMessage={onSteerMessage}
+        onQueueMessage={onQueueMessage}
         onStop={onStop}
         onScrollToLatest={jumpToLatest}
         onAttachImages={onAttachImages}
@@ -19037,6 +21005,225 @@ function ThreadsView({
   );
 }
 
+// The side-chat send path wraps a selection or a synced-context delta around
+// the user's question. For display, split those wrappers back out so the bubble
+// shows the actual question with the context collapsed to a short quote chip.
+function parseSideChatUserMessage(raw: string): { quote?: string; question: string } {
+  const text = raw ?? "";
+  const selectionMatch = text.match(/^About this selected part of the main chat:\n"""\n([\s\S]*?)\n"""\n\n([\s\S]*)$/);
+  if (selectionMatch) {
+    const quote = selectionMatch[1].trim();
+    return { quote: quote.length > 140 ? `${quote.slice(0, 139)}…` : quote, question: selectionMatch[2].trim() };
+  }
+  const taskIndex = text.lastIndexOf("Current user task:\n");
+  if (taskIndex >= 0 && /new messages in the main Open Assist chat/.test(text)) {
+    return { quote: "Synced context", question: text.slice(taskIndex + "Current user task:\n".length).trim() };
+  }
+  return { question: text.trim() };
+}
+
+// Side chat: lightweight panel docked beside the main chat. Uses simple
+// bubbles for speed, but still surfaces generated images/artifacts so image
+// requests are not "silent successes" with only text.
+function SideChatDock({
+  title,
+  messages,
+  running,
+  statusText,
+  composerText,
+  selection,
+  newMainMessages,
+  syncNote,
+  onSyncContext,
+  onClearSelection,
+  onComposerTextChange,
+  onSend,
+  onClose,
+  onDestroy,
+  onOpenArtifact
+}: {
+  title: string;
+  messages: ChatMessage[];
+  running: boolean;
+  statusText?: string;
+  composerText: string;
+  selection?: string | null;
+  newMainMessages: number;
+  syncNote?: string | null;
+  onSyncContext: () => void;
+  onClearSelection: () => void;
+  onComposerTextChange: (value: string) => void;
+  onSend: () => void;
+  onClose: () => void;
+  onDestroy: () => void;
+  onOpenArtifact?: ArtifactOpenHandler;
+}) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const list = listRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [messages.length, running, statusText]);
+  const visibleMessages = messages.filter((message) => {
+    if (message.role === "user" || message.role === "assistant") return true;
+    if (message.role !== "activity") return false;
+    // Keep image generations and any activity that already has a previewable image.
+    if (message.activityKind === "imageGeneration") return true;
+    if (activityPreviewURL(message) || message.imagePath || message.imageDataURL) return true;
+    // Quiet status lines for non-image tools while running; hide empty noise when done.
+    return message.status === "running" || message.activityStatus === "running" || message.activityStatus === "pending";
+  });
+  return (
+    <aside className="side-chat-panel" aria-label="Side chat">
+      <header className="side-chat-header">
+        <div className="side-chat-header-text">
+          <span className="side-chat-header-title">Side chat</span>
+          <span className="side-chat-header-subtitle" title={title}>from {title}</span>
+        </div>
+        <div className="side-chat-header-actions">
+          <button
+            className="side-chat-header-button"
+            aria-label="Discard side chat"
+            title="Discard side chat"
+            onClick={onDestroy}
+          >
+            <Trash2 size={14} />
+          </button>
+          <button
+            className="side-chat-header-button"
+            aria-label="Close side chat"
+            title="Close (keeps the side chat for later)"
+            onClick={onClose}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      </header>
+      <div className="side-chat-messages" ref={listRef}>
+        {visibleMessages.length === 0 && (
+          <div className="side-chat-empty">
+            Ask a side question here. This chat starts with a copy of the main conversation and disappears after 30 minutes of inactivity.
+          </div>
+        )}
+        {visibleMessages.map((message) => {
+          if (message.role === "activity") {
+            const imageURL = activityPreviewURL(message) || String(message.imageDataURL ?? "").trim();
+            const imagePath = String(message.imagePath ?? "").trim();
+            const isImage = message.activityKind === "imageGeneration" || Boolean(imageURL) || Boolean(imagePath);
+            const isRunning = message.status === "running" || message.activityStatus === "running" || message.activityStatus === "pending";
+            return (
+              <div key={message.id} className={cx("side-chat-activity", isImage && "has-image")}>
+                {isRunning && <span className="side-chat-spinner" aria-hidden="true" />}
+                <span>{message.activityTitle || message.text || (isImage ? "Generating image" : "Working")}</span>
+                {imageURL ? (
+                  <button
+                    type="button"
+                    className="side-chat-image-thumb"
+                    title="Open image"
+                    aria-label="Open generated image"
+                    onClick={() => openImagePreviewDataURL(imageURL)}
+                  >
+                    <img src={imageURL} alt={message.imageName || message.imagePrompt || "Generated image"} draggable={false} />
+                  </button>
+                ) : imagePath ? (
+                  <button
+                    type="button"
+                    className="side-chat-image-path"
+                    title={imagePath}
+                    onClick={() => {
+                      if (onOpenArtifact) {
+                        onOpenArtifact({
+                          id: message.id,
+                          name: message.imageName || fileNameFromPath(imagePath) || "Generated image",
+                          path: imagePath,
+                          kind: "image"
+                        });
+                        return;
+                      }
+                      void window.openAssistElectron?.openLocalPath?.(imagePath);
+                    }}
+                  >
+                    Open image
+                  </button>
+                ) : null}
+              </div>
+            );
+          }
+          if (message.role === "user") {
+            const parsed = parseSideChatUserMessage(message.text ?? "");
+            return (
+              <div key={message.id} className="side-chat-bubble is-user">
+                {parsed.quote && (
+                  <span className="side-chat-bubble-quote" title={parsed.quote}>
+                    <MessageSquareQuote size={11} aria-hidden="true" />
+                    {parsed.quote}
+                  </span>
+                )}
+                <span className="side-chat-bubble-text">{parsed.question}</span>
+              </div>
+            );
+          }
+          return (
+            <div key={message.id} className="side-chat-bubble is-assistant">
+              <MarkdownPreview markdown={message.text ?? ""} className="assistant-markdown-shell" emptyText="" />
+              <MessageArtifacts artifacts={message.artifacts} onOpenArtifact={onOpenArtifact} />
+            </div>
+          );
+        })}
+        {running && statusText && <div className="side-chat-status">{statusText}</div>}
+      </div>
+      {newMainMessages > 0 && (
+        <div className="side-chat-sync-row">
+          <span>Main chat has {newMainMessages} new message{newMainMessages === 1 ? "" : "s"}</span>
+          <button type="button" onClick={onSyncContext}>
+            <RefreshCw size={12} aria-hidden="true" />
+            Sync
+          </button>
+        </div>
+      )}
+      {syncNote && <div className="side-chat-sync-note">{syncNote}</div>}
+      {selection ? (
+        <div className="side-chat-selection-row">
+          <span className="side-chat-selection-chip" title={selection}>
+            <MessageSquareQuote size={12} aria-hidden="true" />
+            1 selection
+            <button
+              className="side-chat-selection-clear"
+              aria-label="Remove selection"
+              title="Remove selection"
+              onClick={onClearSelection}
+            >
+              <X size={11} />
+            </button>
+          </span>
+        </div>
+      ) : null}
+      <div className="side-chat-composer">
+        <textarea
+          value={composerText}
+          placeholder={selection ? "Ask about the selection..." : "Ask a side question..."}
+          rows={2}
+          disabled={running}
+          onChange={(event) => onComposerTextChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              onSend();
+            }
+          }}
+        />
+        <button
+          className="side-chat-send"
+          aria-label="Send side chat message"
+          disabled={running || !composerText.trim()}
+          onClick={onSend}
+        >
+          <ArrowUp size={15} />
+        </button>
+      </div>
+    </aside>
+  );
+}
+
 function AssistantInspectorPanel({
   panel,
   sessionInstructions,
@@ -19044,6 +21231,8 @@ function AssistantInspectorPanel({
   threadNoteDraft,
   threadMemory,
   filePreviewState,
+  sideChatContent,
+  onSwitchPanel,
   onClose,
   onSessionInstructions,
   onClearSessionInstructions,
@@ -19052,6 +21241,8 @@ function AssistantInspectorPanel({
   onCreateThreadNote,
   onSelectThreadNote,
   onRefreshMemory,
+  onRetryMemory,
+  onSetMemoryPolicy,
   onOpenFilePreviewExternal,
   onRevealFilePreview,
   onCopyFilePreviewPath
@@ -19062,6 +21253,8 @@ function AssistantInspectorPanel({
   threadNoteDraft: string;
   threadMemory: ThreadMemorySnapshot | null;
   filePreviewState: FilePreviewState | null;
+  sideChatContent?: ReactNode;
+  onSwitchPanel?: (panel: "thread-note" | "side-chat") => void;
   onClose: () => void;
   onSessionInstructions: (value: string) => void;
   onClearSessionInstructions: () => void;
@@ -19070,6 +21263,8 @@ function AssistantInspectorPanel({
   onCreateThreadNote: () => void;
   onSelectThreadNote: (noteID: string) => void;
   onRefreshMemory: () => void;
+  onRetryMemory: () => void;
+  onSetMemoryPolicy: (patch: { useMemory?: boolean; learnFromChat?: boolean }) => void;
   onOpenFilePreviewExternal: (artifact: MessageArtifact) => void;
   onRevealFilePreview: (artifact: MessageArtifact) => void;
   onCopyFilePreviewPath: (artifact: MessageArtifact) => void;
@@ -19093,6 +21288,8 @@ function AssistantInspectorPanel({
 
   const title = panel === "thread-note"
     ? "Thread Note"
+    : panel === "side-chat"
+      ? "Side Chat"
     : panel === "file-preview"
       ? "File Preview"
     : panel === "memory"
@@ -19100,6 +21297,8 @@ function AssistantInspectorPanel({
       : "Session Instructions";
   const icon = panel === "thread-note"
     ? <FileText size={17} />
+    : panel === "side-chat"
+      ? <GitBranch size={17} />
     : panel === "file-preview"
       ? <Eye size={17} />
     : panel === "memory"
@@ -19113,12 +21312,35 @@ function AssistantInspectorPanel({
         "assistant-inspector",
         "liquid-glass-surface",
         panel === "thread-note" && "thread-note-inspector",
+        panel === "side-chat" && "thread-note-inspector side-chat-inspector",
         panel === "file-preview" && "file-preview-inspector"
       )}
       style={{ transformOrigin: "top right" }}
     >
       <LiquidGlassLayer tone="panel" cornerRadius={16} />
-      {panel !== "thread-note" && (
+      {(panel === "thread-note" || panel === "side-chat") && onSwitchPanel && (
+        <div className="inspector-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={panel === "thread-note"}
+            className={cx(panel === "thread-note" && "active")}
+            onClick={() => onSwitchPanel("thread-note")}
+          >
+            <FileText size={13} aria-hidden="true" />
+            Note
+          </button>
+          <button
+            role="tab"
+            aria-selected={panel === "side-chat"}
+            className={cx(panel === "side-chat" && "active")}
+            onClick={() => onSwitchPanel("side-chat")}
+          >
+            <GitBranch size={13} aria-hidden="true" />
+            Side chat
+          </button>
+        </div>
+      )}
+      {panel !== "thread-note" && panel !== "side-chat" && (
         <div className="inspector-header">
           <div>
             {icon}
@@ -19128,6 +21350,15 @@ function AssistantInspectorPanel({
             <X size={17} />
           </IconButton>
         </div>
+      )}
+
+      {panel === "side-chat" && (
+        sideChatContent ?? (
+          <div className="thread-note-empty-card">
+            <h3>No side chat yet</h3>
+            <p>Open a side chat to ask questions without touching the main conversation.</p>
+          </div>
+        )
       )}
 
       {panel === "session-instructions" && (
@@ -19223,23 +21454,90 @@ function AssistantInspectorPanel({
       )}
 
       {panel === "memory" && (
-        <div className="inspector-stack">
-          <div className="inspector-footer">
-            <span className={cx("status-dot-line", threadMemory?.exists && "active")}>
-              <Brain size={14} />
-              {threadMemory?.exists ? "Memory file found" : "No memory file yet"}
+        <div className="inspector-stack memory-inspector-stack">
+          <div className="memory-policy-controls">
+            <Checkbox
+              checked={threadMemory?.useMemory === true}
+              label="Use memory in this chat"
+              onToggle={threadMemory?.canUseMemory
+                ? () => onSetMemoryPolicy({ useMemory: !threadMemory.useMemory })
+                : undefined}
+            />
+            <Checkbox
+              checked={threadMemory?.learnFromChat === true}
+              label="Learn from this chat"
+              onToggle={threadMemory?.canLearnFromChat
+                ? () => onSetMemoryPolicy({ learnFromChat: !threadMemory.learnFromChat })
+                : undefined}
+            />
+            {!threadMemory?.canUseMemory && (
+              <small className="inspector-help">Turn on Memory in Settings to use chat memory.</small>
+            )}
+            {threadMemory?.canUseMemory && !threadMemory?.canLearnFromChat && (
+              <small className="inspector-help">Background Memory and Knowledge Access are required to learn from this chat.</small>
+            )}
+          </div>
+          <div className="memory-state-list">
+            <div className={cx("memory-state-row", threadMemory?.conversationHistory.available && "active")}>
+              <HistoryIcon size={15} aria-hidden="true" />
+              <div>
+                <strong>Conversation history</strong>
+                <span>
+                  {threadMemory?.conversationHistory.available
+                    ? `${threadMemory.conversationHistory.turnCount} completed ${threadMemory.conversationHistory.turnCount === 1 ? "turn" : "turns"}`
+                    : "No completed conversation history yet"}
+                </span>
+              </div>
+            </div>
+            <div className={cx("memory-state-row", threadMemory?.learnedSummary.state === "ready" && "active", threadMemory?.learnedSummary.state === "error" && "error")}>
+              <BrainCircuit size={15} aria-hidden="true" />
+              <div>
+                <strong>Learned summary</strong>
+                <span>
+                  {threadMemory?.learnedSummary.state === "pending"
+                    ? "Conversation history available; learning pending"
+                    : threadMemory?.learnedSummary.state === "learning"
+                      ? "Learning from completed turns"
+                      : threadMemory?.learnedSummary.state === "retrying"
+                        ? "Temporary problem; retry scheduled"
+                        : threadMemory?.learnedSummary.state === "ready"
+                          ? "Ready for scoped recall"
+                          : threadMemory?.learnedSummary.state === "error"
+                            ? `Needs attention${threadMemory.learnedSummary.safeErrorCode ? ` · ${threadMemory.learnedSummary.safeErrorCode.replace(/_/g, " ")}` : ""}`
+                            : "No learned summary yet"}
+                </span>
+              </div>
+              {threadMemory?.learnedSummary.state === "error" && (
+                <button type="button" className="memory-row-action" onClick={onRetryMemory}>
+                  Retry
+                </button>
+              )}
+            </div>
+            <div className={cx("memory-state-row", (threadMemory?.durableMemoryCount ?? 0) > 0 && "active")}>
+              <Brain size={15} aria-hidden="true" />
+              <div>
+                <strong>Durable memories</strong>
+                <span>{threadMemory?.durableMemoryCount ?? 0} available for this chat and project</span>
+              </div>
+            </div>
+          </div>
+          <div className="inspector-footer memory-refresh-footer">
+            <span className="status-dot-line">
+              Status only
             </span>
             <button className="soft-button" onClick={onRefreshMemory}>
               <RefreshCw size={14} />
               Refresh
             </button>
           </div>
-          <textarea
-            className="inspector-textarea monospace readonly"
-            value={threadMemory?.markdown || ""}
-            readOnly
-            placeholder="No saved memory for this chat yet."
-          />
+          <div className="memory-preview-body">
+            <MarkdownPreview
+              markdown={threadMemory?.markdown || ""}
+              sourcePath={threadMemory?.path}
+              className="memory-markdown-preview"
+              emptyText="No saved memory for this chat yet."
+            />
+          </div>
           {threadMemory?.path && <small className="path-line">{threadMemory.path}</small>}
         </div>
       )}
@@ -20161,6 +22459,19 @@ function reminderTimeLabel(value?: string | null) {
   return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
+function completionTimeLabel(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+}
+
 function dailyCategoryKey(area?: string) {
   return cleanDailyTagLabel(area).toLowerCase();
 }
@@ -20493,6 +22804,8 @@ function DailyItemsPanel({
   onOpenNoteLink,
   variant = "daily",
   inline = false,
+  readOnly = false,
+  onMoveItemToDay,
   onMoveItemToBacklog,
   onScheduleBacklogItem
 }: {
@@ -20510,6 +22823,8 @@ function DailyItemsPanel({
   onOpenNoteLink: (target: NoteLinkTarget) => void;
   variant?: "daily" | "backlog";
   inline?: boolean;
+  readOnly?: boolean;
+  onMoveItemToDay?: (dayID: string, itemID: string, targetDayID: string) => Promise<void>;
   onMoveItemToBacklog?: (dayID: string, itemID: string) => Promise<void>;
   onScheduleBacklogItem?: (itemID: string, targetDayID: string) => Promise<void>;
 }) {
@@ -20541,6 +22856,18 @@ function DailyItemsPanel({
   const [backlogSortOldest, setBacklogSortOldest] = useState(false);
   const [backlogScopeID, setBacklogScopeID] = useState("");
   const [backlogCollapseOverrides, setBacklogCollapseOverrides] = useState<Map<string, boolean>>(() => new Map());
+  const [openStepIDs, setOpenStepIDs] = useState<Set<string>>(() => new Set());
+  const [backlogViewMode, setBacklogViewMode] = useState<"list" | "cards">(() =>
+    typeof window !== "undefined" && window.localStorage.getItem("oa-backlog-view") === "list" ? "list" : "cards");
+  useEffect(() => {
+    if (isBacklog) window.localStorage.setItem("oa-backlog-view", backlogViewMode);
+  }, [backlogViewMode, isBacklog]);
+  const toggleStepsOpen = (itemID: string) => setOpenStepIDs((current) => {
+    const next = new Set(current);
+    if (next.has(itemID)) next.delete(itemID);
+    else next.add(itemID);
+    return next;
+  });
   const isBacklogGroupCollapsed = (key: string) => backlogCollapseOverrides.get(key) ?? false;
   const toggleBacklogGroup = (key: string) =>
     setBacklogCollapseOverrides((current) => {
@@ -20638,7 +22965,9 @@ function DailyItemsPanel({
       item.area,
       dailyItemListLabel(item, projectByID),
       item.section,
-      normalizeDailyFreeTags(item.tags).join(" ")
+      normalizeDailyFreeTags(item.tags).join(" "),
+      item.completedAt,
+      completionTimeLabel(item.completedAt)
     ].filter(Boolean).join(" ").toLowerCase().includes(normalizedBacklogQuery);
   };
   const sortBacklog = (list: DailyItem[]) => {
@@ -20649,6 +22978,7 @@ function DailyItemsPanel({
   const openItems = isBacklog ? sortBacklog(backlogVisibleItems.filter((item) => !item.checked)) : scopedItems;
   const doneItems = isBacklog ? sortBacklog(backlogVisibleItems.filter((item) => item.checked)) : [];
   const backlogQueryActive = isBacklog && normalizedBacklogQuery.length > 0;
+  const showCompletedBacklogItems = showDoneBacklog || backlogQueryActive;
   const submitQuickItem = async () => {
     const title = quickTitle.trim();
     if (!title) return;
@@ -20753,6 +23083,28 @@ function DailyItemsPanel({
     await onUpsertItem(draftInputForSave(editDraft));
     setEditTagRange(null);
   };
+  const toggleStepChecked = (item: DailyItem, stepID: string) => {
+    const steps = item.steps.map((step) => step.id === stepID ? { ...step, checked: !step.checked } : step);
+    void onUpsertItem(draftInputForSave({ ...item, steps }));
+  };
+  const renderInlineSteps = (item: DailyItem) => (
+    <div className="daily-backlog-steps">
+      {item.steps.map((step) => (
+        <button
+          key={step.id}
+          type="button"
+          className={cx("daily-backlog-step", step.checked && "done")}
+          onClick={(event) => {
+            event.stopPropagation();
+            toggleStepChecked(item, step.id);
+          }}
+        >
+          <span className="daily-backlog-step-box">{step.checked && <Check size={10} />}</span>
+          <span className="daily-backlog-step-text">{step.text}</span>
+        </button>
+      ))}
+    </div>
+  );
   const saveMovedDraft = async (targetDayID: string) => {
     if (!editDraft || !targetDayID) return;
     if (isBacklog) {
@@ -20760,10 +23112,11 @@ function DailyItemsPanel({
       setExpandedID(null);
       return;
     }
-    await onUpsertItem(draftInputForSave(editDraft, targetDayID));
-    if (targetDayID !== editDraft.dayID) await onDeleteItem(editDraft.dayID, editDraft.id);
+    if (sameID(targetDayID, editDraft.dayID)) return;
+    await onMoveItemToDay?.(editDraft.dayID, editDraft.id, targetDayID);
+    setExpandedID(null);
   };
-  const renderItemCard = (item: DailyItem) => {
+  const renderItemCard = (item: DailyItem, hideListMeta = false) => {
     const tags = dailyItemScopeTags(item, projectByID);
     const freeTags = normalizeDailyFreeTags(item.tags);
     const itemDayID = item.dayID || dayID;
@@ -20774,12 +23127,16 @@ function DailyItemsPanel({
     const isRealtimeFocused = Boolean(realtimeFocus?.itemID && sameID(realtimeFocus.itemID, item.id));
     const categoryColor = plannerCategoryColor(categories, item.area);
     const reminderLabel = reminderTimeLabel(item.reminderAt);
+    const completedLabel = item.checked ? completionTimeLabel(item.completedAt) : "";
     const backlogMeta = [
-      listLabel !== "No List" ? listLabel : "",
+      !hideListMeta && listLabel !== "No List" ? listLabel : "",
       sectionLabel !== "General" ? sectionLabel : "",
       freeTags.length ? freeTags.join(", ") : "",
-      item.links.length > 0 ? `${item.links.length} linked` : ""
+      item.links.length > 0 ? `${item.links.length} linked` : "",
+      (item.detailsMarkdown ?? "").trim() ? "notes" : ""
     ].filter(Boolean);
+    const stepsDone = item.steps.filter((step) => step.checked).length;
+    const stepsOpen = openStepIDs.has(item.id);
     const noteLinkPickerOpen = noteLinkPickerItemID === item.id;
     const linkedNoteKeys = new Set(draft.links.map((link) => noteLinkTargetKey(link)).filter(Boolean));
     const itemListID = dailyItemListID(draft);
@@ -21052,23 +23409,52 @@ function DailyItemsPanel({
           </label>
         </div>
         <div className="daily-detail-section daily-detail-section-steps">
-          <label>
-            Steps
-            <textarea
-              value={draft.steps.map((step) => `${step.checked ? "[x]" : "[ ]"} ${step.text}`).join("\n")}
-              onChange={(event) => updateDraft({
-                steps: event.target.value
-                  .split("\n")
-                  .map((line, index) => {
-                    const match = line.match(/^\s*\[([ xX])\]\s*(.+?)\s*$/);
-                    const text = (match?.[2] ?? line).trim();
-                    return text ? { id: draft.steps[index]?.id ?? `step-${index + 1}`, text, checked: match?.[1]?.toLowerCase() === "x" } : null;
-                  })
-                  .filter((step): step is DailyItem["steps"][number] => Boolean(step))
-              })}
-              placeholder={"[ ] First step\n[ ] Next step"}
-            />
-          </label>
+          <label>Steps</label>
+          <div className="daily-steps-editor">
+            {draft.steps.map((step, stepIndex) => (
+              <div key={step.id} className="daily-steps-editor-row">
+                <button
+                  type="button"
+                  className={cx("daily-step-check", step.checked && "checked")}
+                  aria-label={step.checked ? "Mark step not done" : "Mark step done"}
+                  onClick={() => updateDraft({
+                    steps: draft.steps.map((current) => current.id === step.id ? { ...current, checked: !current.checked } : current)
+                  })}
+                >
+                  {step.checked && <Check size={11} />}
+                </button>
+                <input
+                  value={step.text}
+                  placeholder="Describe this step"
+                  onChange={(event) => updateDraft({
+                    steps: draft.steps.map((current) => current.id === step.id ? { ...current, text: event.target.value } : current)
+                  })}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    const next = [...draft.steps];
+                    next.splice(stepIndex + 1, 0, { id: crypto.randomUUID(), text: "", checked: false });
+                    updateDraft({ steps: next });
+                  }}
+                />
+                <button
+                  type="button"
+                  className="daily-steps-remove"
+                  aria-label="Remove step"
+                  onClick={() => updateDraft({ steps: draft.steps.filter((current) => current.id !== step.id) })}
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="daily-steps-add"
+              onClick={() => updateDraft({ steps: [...draft.steps, { id: crypto.randomUUID(), text: "", checked: false }] })}
+            >
+              <Plus size={13} /> Add step
+            </button>
+          </div>
         </div>
         <div className="daily-detail-section daily-detail-section-links">
           {renderLinkedNotes("detail")}
@@ -21111,9 +23497,13 @@ function DailyItemsPanel({
             </button>
             <button type="button" className="daily-backlog-title" onClick={() => beginEditing(item)}>
               <strong>{item.title}</strong>
-              {(backlogMeta.length > 0 || reminderLabel) && (
+              {(backlogMeta.length > 0 || reminderLabel || item.checked) && (
                 <span className="daily-backlog-meta">
-                  {[...backlogMeta, reminderLabel ? `Reminds ${reminderLabel}` : ""].filter(Boolean).join(" · ")}
+                  {[
+                    ...backlogMeta,
+                    reminderLabel ? `Reminds ${reminderLabel}` : "",
+                    item.checked ? (completedLabel ? `Completed ${completedLabel}` : "Completed") : ""
+                  ].filter(Boolean).join(" · ")}
                 </span>
               )}
             </button>
@@ -21125,10 +23515,39 @@ function DailyItemsPanel({
                 </>
               ) : null}
             </span>
+            <span className="daily-backlog-row-actions">
+              {item.steps.length > 0 && (
+                <button
+                  type="button"
+                  className={cx("daily-backlog-steps-chip", stepsOpen && "open", stepsDone === item.steps.length && "complete")}
+                  title={stepsOpen ? "Hide steps" : "Show steps"}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toggleStepsOpen(item.id);
+                  }}
+                >
+                  <ListChecks size={12} /> {stepsDone}/{item.steps.length}
+                </button>
+              )}
+              {!item.checked && onScheduleBacklogItem && (
+                <button
+                  type="button"
+                  className="daily-backlog-today-action"
+                  title="Move to today"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void onScheduleBacklogItem(item.id, plannerDayID());
+                  }}
+                >
+                  <Sun size={12} /> Today
+                </button>
+              )}
+            </span>
             <button type="button" className="daily-icon-button" aria-label="Delete backlog item" onClick={() => void onDeleteItem(itemDayID, item.id)}>
               <Trash2 size={14} />
             </button>
           </div>
+          {stepsOpen && item.steps.length > 0 && renderInlineSteps(item)}
           {expanded && details && createPortal(
             <div
               className="daily-item-slideover-overlay"
@@ -21226,7 +23645,77 @@ function DailyItemsPanel({
       </article>
     );
   };
-  const renderBacklogRows = (list: DailyItem[]) => list.map(renderItemCard);
+  const renderBacklogCard = (item: DailyItem, hideListMeta = false) => {
+    const listLabel = dailyItemListLabel(item, projectByID);
+    const stepsDone = item.steps.filter((step) => step.checked).length;
+    const stepsOpen = openStepIDs.has(item.id);
+    const itemDayID = item.dayID || dayID;
+    const categoryColor = plannerCategoryColor(categories, item.area);
+    const completedLabel = item.checked ? completionTimeLabel(item.completedAt) : "";
+    return (
+      <article
+        key={item.id}
+        className={cx("daily-backlog-card", item.checked && "done")}
+        style={categoryColor ? ({ ["--backlog-row-accent" as string]: categoryColor } as React.CSSProperties) : undefined}
+      >
+        <div className="daily-backlog-card-head">
+          <button
+            type="button"
+            className="daily-check"
+            aria-label={item.checked ? "Mark not done" : "Mark done"}
+            onClick={() => void onToggleItem(itemDayID, item.id, !item.checked)}
+          >
+            {item.checked && <Check size={14} />}
+          </button>
+          {!hideListMeta && listLabel !== "No List" && <span className="daily-backlog-card-list">{listLabel}</span>}
+          {!item.checked && onScheduleBacklogItem && (
+            <button
+              type="button"
+              className="daily-backlog-today-action"
+              title="Move to today"
+              onClick={() => void onScheduleBacklogItem(item.id, plannerDayID())}
+            >
+              <Sun size={12} /> Today
+            </button>
+          )}
+          <button type="button" className="daily-icon-button" aria-label="Delete backlog item" onClick={() => void onDeleteItem(itemDayID, item.id)}>
+            <Trash2 size={13} />
+          </button>
+        </div>
+        <button type="button" className="daily-backlog-card-title" onClick={() => beginEditing(item)}>
+          {item.title}
+        </button>
+        {item.checked && (
+          <span className="daily-backlog-card-completed">
+            {completedLabel ? `Completed ${completedLabel}` : "Completed"}
+          </span>
+        )}
+        {item.steps.length > 0 && (
+          <div className="daily-backlog-card-progress">
+            <span className="daily-backlog-card-bar">
+              <span style={{ width: `${Math.round((stepsDone / item.steps.length) * 100)}%` }} />
+            </span>
+            <button
+              type="button"
+              className={cx("daily-backlog-steps-chip", stepsOpen && "open", stepsDone === item.steps.length && "complete")}
+              title={stepsOpen ? "Hide steps" : "Show steps"}
+              onClick={() => toggleStepsOpen(item.id)}
+            >
+              <ListChecks size={12} /> {stepsDone}/{item.steps.length}
+            </button>
+          </div>
+        )}
+        {stepsOpen && item.steps.length > 0 && renderInlineSteps(item)}
+        {expandedID === item.id && (
+          <div className="daily-backlog-card-editor-host">{renderItemCard(item, hideListMeta)}</div>
+        )}
+      </article>
+    );
+  };
+  const renderBacklogRows = (list: DailyItem[], hideListMeta = false) =>
+    isBacklog && backlogViewMode === "cards"
+      ? <div className="daily-backlog-cardgrid">{list.map((item) => renderBacklogCard(item, hideListMeta))}</div>
+      : list.map((item) => renderItemCard(item, hideListMeta));
   const renderOrganizationGroups = (list: DailyItem[]) => {
     const groups = groupDailyItemsByOrganization(list, categories, projectByID);
     const listItemsOf = (listGroup: DailyOrganizationGroup["lists"][number]) =>
@@ -21325,7 +23814,7 @@ function DailyItemsPanel({
                                       <small>{section.items.length}</small>
                                     </header>
                                   )}
-                                  {renderBacklogRows(section.items)}
+                                  {renderBacklogRows(section.items, true)}
                                 </section>
                               );
                             })}
@@ -21368,9 +23857,105 @@ function DailyItemsPanel({
       }
     }
     const anyExpanded = groups.some((category) => !isBacklogGroupCollapsed(category.key));
+    const viewToggle = (
+      <div className="daily-backlog-viewtoggle" role="group" aria-label="Backlog view">
+        <button
+          type="button"
+          className={cx(backlogViewMode === "cards" && "active")}
+          onClick={() => setBacklogViewMode("cards")}
+        >
+          <LayoutGrid size={13} /> Board
+        </button>
+        <button
+          type="button"
+          className={cx(backlogViewMode === "list" && "active")}
+          onClick={() => setBacklogViewMode("list")}
+        >
+          <ListTodo size={13} /> List
+        </button>
+      </div>
+    );
+    if (backlogViewMode === "cards") {
+      const boardColumns = groups.length > 1
+        ? groups.map((category) => ({
+          key: category.key,
+          label: category.label,
+          color: category.color,
+          items: category.lists.flatMap(listItemsOf),
+          showListMeta: true
+        }))
+        : (groups[0]?.lists ?? []).map((list) => ({
+          key: list.key,
+          label: list.label,
+          color: list.color ?? groups[0]?.color,
+          items: listItemsOf(list),
+          showListMeta: false
+        }));
+      return (
+        <div className="daily-backlog-groups daily-backlog-groups-board">
+          <div className="daily-backlog-grouptools">
+            {viewToggle}
+          </div>
+          <div className="daily-backlog-board">
+            {boardColumns.map((column) => {
+              if (!column.items.length) return null;
+              return (
+                <section
+                  key={column.key}
+                  className="daily-backlog-board-column"
+                  style={column.color ? ({ ["--backlog-group-accent" as string]: column.color } as React.CSSProperties) : undefined}
+                >
+                  <header className="daily-backlog-board-head">
+                    <span className="daily-backlog-group-dot" style={{ background: column.color ?? "var(--muted)" }} />
+                    <strong>{column.label}</strong>
+                    <span className="daily-backlog-digest-count">{column.items.length}</span>
+                  </header>
+                  <div className="daily-backlog-board-cards">
+                    {column.items.map((item) => renderBacklogCard(item, !column.showListMeta))}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="daily-backlog-groups">
+        <div className="daily-backlog-digest">
+          {groups.map((category) => {
+            const digestItems = category.lists.flatMap(listItemsOf);
+            if (!digestItems.length) return null;
+            return (
+              <button
+                key={category.key}
+                type="button"
+                className="daily-backlog-digest-card"
+                style={category.color ? ({ ["--backlog-group-accent" as string]: category.color } as React.CSSProperties) : undefined}
+                onClick={() => {
+                  setBacklogCollapseOverrides((current) => {
+                    const next = new Map(current);
+                    next.set(category.key, false);
+                    return next;
+                  });
+                  window.setTimeout(() => {
+                    dailyListRef.current
+                      ?.querySelector(`[data-backlog-group="${CSS.escape(category.key)}"]`)
+                      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  }, 60);
+                }}
+              >
+                <span className="daily-backlog-digest-head">
+                  <span className="daily-backlog-group-dot" style={{ background: category.color ?? "var(--muted)" }} />
+                  <strong>{category.label}</strong>
+                  <span className="daily-backlog-digest-count">{digestItems.length}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
         <div className="daily-backlog-grouptools">
+          {viewToggle}
           <button
             type="button"
             className="daily-backlog-collapse-all"
@@ -21387,6 +23972,7 @@ function DailyItemsPanel({
           return (
             <section
               key={category.key}
+              data-backlog-group={category.key}
               className={cx("daily-backlog-group-card", collapsed && "collapsed")}
               style={category.color ? ({ ["--backlog-group-accent" as string]: category.color } as React.CSSProperties) : undefined}
             >
@@ -21430,7 +24016,7 @@ function DailyItemsPanel({
                         </button>
                         {!listCollapsed && (
                           <div className="daily-backlog-table">
-                            {renderBacklogRows(items)}
+                            {renderBacklogRows(items, true)}
                           </div>
                         )}
                       </div>
@@ -21656,14 +24242,16 @@ function DailyItemsPanel({
         <div className="daily-done-section">
           <button
             type="button"
-            className={cx("daily-done-toggle", showDoneBacklog && "open")}
-            aria-expanded={showDoneBacklog}
-            onClick={() => setShowDoneBacklog((current) => !current)}
+            className={cx("daily-done-toggle", showCompletedBacklogItems && "open")}
+            aria-expanded={showCompletedBacklogItems}
+            onClick={() => {
+              if (!backlogQueryActive) setShowDoneBacklog((current) => !current);
+            }}
           >
-            {showDoneBacklog ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            {showCompletedBacklogItems ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             <span>Done ({doneItems.length})</span>
           </button>
-          {showDoneBacklog && (
+          {showCompletedBacklogItems && (
             <div className="daily-backlog-table daily-done-list">
               {renderBacklogRows(doneItems)}
             </div>
@@ -21673,7 +24261,11 @@ function DailyItemsPanel({
     </section>
   );
   if (inlinePanel) {
-    return <div className="daily-items-inline">{panel}</div>;
+    return (
+      <fieldset className="daily-items-inline" disabled={readOnly} aria-label={readOnly ? "Read-only planner items" : undefined}>
+        {panel}
+      </fieldset>
+    );
   }
   return (
     <div className="daily-items-menu">
@@ -22044,6 +24636,7 @@ function PlannerView({
   plannerDays,
   selectedDayID,
   backlogOpen,
+  backlogMigrationWarning,
   backlogItems,
   projects,
   categories,
@@ -22073,6 +24666,7 @@ function PlannerView({
   onUpsertBacklogItem,
   onToggleBacklogItem,
   onDeleteBacklogItem,
+  onMoveDailyItemToDay,
   onMoveDailyItemToBacklog,
   onScheduleBacklogItem,
   liveVoiceStatus,
@@ -22095,6 +24689,7 @@ function PlannerView({
   plannerDays: PlannerDaySummary[];
   selectedDayID: string;
   backlogOpen: boolean;
+  backlogMigrationWarning?: string;
   backlogItems: DailyItem[];
   projects: ProjectItem[];
   categories: PlannerCategory[];
@@ -22124,6 +24719,7 @@ function PlannerView({
   onUpsertBacklogItem: (item: DailyItemInput) => Promise<void>;
   onToggleBacklogItem: (itemID: string, checked: boolean) => Promise<void>;
   onDeleteBacklogItem: (itemID: string) => Promise<void>;
+  onMoveDailyItemToDay: (dayID: string, itemID: string, targetDayID: string) => Promise<void>;
   onMoveDailyItemToBacklog: (dayID: string, itemID: string) => Promise<void>;
   onScheduleBacklogItem: (itemID: string, targetDayID: string) => Promise<void>;
   liveVoiceStatus: LiveVoiceStatus;
@@ -22144,6 +24740,9 @@ function PlannerView({
   const [categoryManagerOpen, setCategoryManagerOpen] = useState(false);
   const todayID = plannerDayID();
   const currentDayID = selectedDayID || todayID;
+  const plannerMigrationWarning = noteDetail && "migrationWarning" in noteDetail
+    ? noteDetail.migrationWarning
+    : undefined;
   const visibleDays = useMemo(
     () => buildVisiblePlannerDays(plannerDays, currentDayID, noteDetail?.path),
     [currentDayID, noteDetail?.path, plannerDays]
@@ -22607,6 +25206,15 @@ function PlannerView({
                   <p>Tasks without a scheduled date.</p>
                 </div>
               </header>
+              {backlogMigrationWarning && (
+                <div className="planner-read-only-warning" role="alert">
+                  <TriangleAlert size={16} />
+                  <div>
+                    <strong>Read-only planner</strong>
+                    <span>{backlogMigrationWarning}</span>
+                  </div>
+                </div>
+              )}
               {(() => {
                 const totalOpen = backlogItems.filter((item) => !item.checked).length;
                 const totalDone = backlogItems.filter((item) => item.checked).length;
@@ -22651,6 +25259,7 @@ function PlannerView({
                 onLinkItemNote={onLinkDailyItemNote}
                 onOpenNoteLink={onOpenNoteLink}
                 variant="backlog"
+                readOnly={Boolean(backlogMigrationWarning)}
                 onScheduleBacklogItem={onScheduleBacklogItem}
               />
             </div>
@@ -22669,8 +25278,8 @@ function PlannerView({
                 sourcePath={noteDetail.path}
                 saveStatusLabel={saveStatusLabel}
                 saveStatusKind={noteSaveStatus.kind}
-                onSave={onSaveNote}
-                showSaveButton={noteSaveStatus.kind === "dirty" || noteSaveStatus.kind === "error"}
+                onSave={plannerMigrationWarning ? undefined : onSaveNote}
+                showSaveButton={!plannerMigrationWarning && (noteSaveStatus.kind === "dirty" || noteSaveStatus.kind === "error")}
                 noteLinkOptions={noteLinkOptions}
                 activeNoteLinkTarget={activeNoteLinkTarget}
                 noteLinks={noteLinks}
@@ -22680,18 +25289,21 @@ function PlannerView({
                   title: noteDetail.title,
                   canRename: false
                 }}
-                onApplyNoteCleanup={onApplyNoteCleanup}
+                onApplyNoteCleanup={plannerMigrationWarning ? undefined : onApplyNoteCleanup}
                 plannerSourceKind="planner"
                 plannerSourceTitle={plannerReadableDate(currentDayID)}
+                readOnly={Boolean(plannerMigrationWarning)}
+                readOnlyMessage={plannerMigrationWarning}
                 dailyProjects={projects}
                 dailyCategories={categories}
                 dailyItems={dailyItems}
                 dailyItemFilter={dailyItemFilter}
-                onPlannerTaskReminder={(itemID, x, y) => {
+                onMovePlannerTaskToDay={plannerMigrationWarning ? undefined : onMoveDailyItemToDay}
+                onPlannerTaskReminder={plannerMigrationWarning ? undefined : (itemID, x, y) => {
                   const item = dailyItems.find((candidate) => candidate.id === itemID);
                   if (item) openCanvasReminder(item, x, y);
                 }}
-                toolbarAccessory={(
+                toolbarAccessory={plannerMigrationWarning ? undefined : (
                   <div className="planner-toolbar-actions">
                     <DailyItemsPanel
                       dayID={currentDayID}
@@ -22706,11 +25318,12 @@ function PlannerView({
                       onDeleteItem={onDeleteDailyItem}
                       onLinkItemNote={onLinkDailyItemNote}
                       onOpenNoteLink={onOpenNoteLink}
+                      onMoveItemToDay={onMoveDailyItemToDay}
                       onMoveItemToBacklog={onMoveDailyItemToBacklog}
                     />
                   </div>
                 )}
-                onScheduleSelectionToPlanner={onScheduleSelectionToPlanner}
+                onScheduleSelectionToPlanner={plannerMigrationWarning ? undefined : onScheduleSelectionToPlanner}
               />
             </article>
           ) : (
@@ -24261,13 +26874,202 @@ const knowledgeExternalAccessModeOptions: Array<{
   label: string;
   detail: string;
 }> = [
-  { id: "simple", label: "Simple", detail: "Recommended, focused tools" },
-  { id: "advanced", label: "Advanced", detail: "More planner/history tools" },
-  { id: "full", label: "Full", detail: "Everything, noisy" }
+  { id: "simple", label: "Simple", detail: "Recommended · the focused day-to-day set" },
+  { id: "advanced", label: "Advanced", detail: "Adds deep search, history, and organizing" },
+  { id: "full", label: "Full", detail: "Every tool plus note browsing (noisy)" }
 ];
 
 function knowledgeExternalAccessModeLabel(mode?: string) {
   return knowledgeExternalAccessModeOptions.find((option) => option.id === mode)?.label ?? "Simple";
+}
+
+/** Friendly grouping for the mode-comparison dialog. Unknown tools fall into
+ *  the last group so newly added bridge tools always show up somewhere. */
+const integrationToolGroupMap: Record<string, string> = {
+  oa_quick_add_task: "Quick actions",
+  oa_quick_save_note: "Quick actions",
+  oa_quick_read: "Quick actions",
+  oa_plan_write: "Quick actions",
+  oa_request_daily_item: "Planner & tasks",
+  oa_request_backlog_item: "Planner & tasks",
+  oa_update_daily_item: "Planner & tasks",
+  oa_complete_daily_item: "Planner & tasks",
+  oa_list_daily_items: "Planner & tasks",
+  oa_list_backlog_items: "Planner & tasks",
+  oa_list_open_tasks: "Planner & tasks",
+  oa_request_carry_forward: "Planner & tasks",
+  oa_request_move_to_backlog: "Planner & tasks",
+  oa_request_tasks_from_note: "Planner & tasks",
+  oa_request_reference: "Notes & references",
+  oa_read: "Notes & references",
+  oa_read_today: "Notes & references",
+  oa_note_style_guide: "Notes & references",
+  oa_request_patch: "Notes & references",
+  oa_request_organize: "Notes & references",
+  oa_backlinks: "Notes & references",
+  oa_search: "Search & recall",
+  oa_search_everything: "Search & recall",
+  oa_read_search_result: "Search & recall",
+  oa_personal_recall_search: "Search & recall",
+  oa_personal_recall_read: "Search & recall",
+  oa_list_projects: "Projects & lists",
+  oa_create_project: "Projects & lists",
+  oa_list_planner_categories: "Projects & lists",
+  oa_list_planner_lists: "Projects & lists",
+  oa_memory_save: "Memory",
+  oa_memory_list: "Memory",
+  oa_memory_read: "Memory",
+  oa_memory_delete: "Memory",
+  oa_list_approvals: "Approvals",
+  oa_apply_approval: "Approvals",
+  oa_reject_approval: "Approvals",
+  oa_request_image_generation: "Images",
+  oa_get_image_generation: "Images",
+  oa_request_codex_image_generation: "Images",
+  oa_get_codex_image_generation: "Images",
+  oa_read_journal: "Journal & history",
+  oa_peer_search_files: "Mac sync files",
+  oa_peer_fetch_file: "Mac sync files"
+};
+
+const integrationToolGroupOrder = [
+  "Quick actions",
+  "Planner & tasks",
+  "Notes & references",
+  "Search & recall",
+  "Projects & lists",
+  "Memory",
+  "Approvals",
+  "Images",
+  "Journal & history",
+  "Mac sync files",
+  "More tools"
+];
+
+function humanizeIntegrationToolName(name: string) {
+  const cleaned = name.replace(/^oa_/, "").replace(/_/g, " ");
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+function IntegrationModeExplainerDialog({
+  modes,
+  activeMode,
+  initialTab,
+  busyID,
+  onSelectMode,
+  onClose
+}: {
+  modes: OpenAssistIntegrationModeCatalogEntry[];
+  activeMode: KnowledgeExternalAccessMode;
+  initialTab: KnowledgeExternalAccessMode;
+  busyID?: string;
+  onSelectMode: (mode: KnowledgeExternalAccessMode) => void;
+  onClose: () => void;
+}) {
+  const [tab, setTab] = useState<KnowledgeExternalAccessMode>(initialTab);
+
+  useEffect(() => {
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  const entry = modes.find((mode) => mode.id === tab) ?? modes[0];
+  if (!entry) return null;
+  const tierIndex = modes.findIndex((mode) => mode.id === entry.id);
+  const previousTier = tierIndex > 0 ? modes[tierIndex - 1] : null;
+  const previousNames = new Set((previousTier?.tools ?? []).map((tool) => tool.name));
+  const addedCount = previousTier ? entry.tools.filter((tool) => !previousNames.has(tool.name)).length : 0;
+
+  const groups = new Map<string, Array<{ name: string; summary: string; added: boolean }>>();
+  for (const tool of entry.tools) {
+    const group = integrationToolGroupMap[tool.name] ?? "More tools";
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push({ ...tool, added: previousTier ? !previousNames.has(tool.name) : false });
+  }
+  const orderedGroups = integrationToolGroupOrder.filter((group) => groups.has(group));
+
+  return (
+    <div className="integration-mode-overlay" onClick={onClose} role="presentation">
+      <div
+        className="integration-mode-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="What each external agent mode includes"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="integration-mode-dialog-head">
+          <span>
+            <strong>What each mode includes</strong>
+            <small>The tools OpenAssist exposes to Cursor, Codex, and other MCP clients.</small>
+          </span>
+          <button className="icon-button" onClick={onClose} aria-label="Close">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="segmented integration-mode-dialog-tabs">
+          {modes.map((mode) => (
+            <button
+              key={mode.id}
+              className={cx(tab === mode.id && "selected")}
+              onClick={() => setTab(mode.id)}
+            >
+              {knowledgeExternalAccessModeLabel(mode.id)}
+              <em>{mode.toolCount} tools</em>
+            </button>
+          ))}
+        </div>
+        <div className="integration-mode-dialog-summary">
+          <p>{entry.description}</p>
+          <div className="integration-mode-dialog-facts">
+            <span><b>{entry.toolCount}</b> tools</span>
+            {previousTier ? (
+              <span><b>+{addedCount}</b> over {knowledgeExternalAccessModeLabel(previousTier.id)}</span>
+            ) : null}
+            <span className={cx(entry.resourcesVisible ? "on" : "off")}>
+              Note browsing {entry.resourcesVisible ? "on" : "off"}
+            </span>
+          </div>
+        </div>
+        <div className="integration-mode-dialog-body">
+          {orderedGroups.map((group) => (
+            <div className="integration-mode-tool-group" key={group}>
+              <strong>{group}</strong>
+              <div>
+                {groups.get(group)!.map((tool) => (
+                  <span
+                    className={cx("integration-mode-tool-chip", tool.added && "is-added")}
+                    key={tool.name}
+                    title={`${tool.name} — ${tool.summary}`}
+                  >
+                    {humanizeIntegrationToolName(tool.name)}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="integration-mode-dialog-foot">
+          {entry.id === activeMode ? (
+            <span className="integration-mode-dialog-current">This is your current mode.</span>
+          ) : (
+            <button
+              className="primary"
+              disabled={busyID === `mode:${entry.id}`}
+              onClick={() => {
+                onSelectMode(entry.id);
+                onClose();
+              }}
+            >
+              {busyID === `mode:${entry.id}` ? "Switching..." : `Use ${knowledgeExternalAccessModeLabel(entry.id)} mode`}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function formatOllamaCatalogOptionLabel(option: OllamaCatalogModelOption): string {
@@ -24363,9 +27165,16 @@ function SettingsContent({
   const [screenSnipTheme, setScreenSnipTheme] = useState<string>("prism");
   const [knowledgeRequests, setKnowledgeRequests] = useState<KnowledgeWriteRequest[]>([]);
   const [knowledgeActionMessage, setKnowledgeActionMessage] = useState<string | undefined>(undefined);
+  const [memoryDreamActionMessage, setMemoryDreamActionMessage] = useState<string | undefined>(undefined);
+  const [memoryDreamBusy, setMemoryDreamBusy] = useState(false);
+  const [junkCleanupPreview, setJunkCleanupPreview] = useState<StorageCleanupPreview | null>(null);
+  const [junkCleanupResult, setJunkCleanupResult] = useState<StorageCleanupResult | null>(null);
+  const [junkCleanupBusy, setJunkCleanupBusy] = useState<"preview" | "cleanup" | null>(null);
+  const [junkCleanupMessage, setJunkCleanupMessage] = useState("");
   const [integrationStatus, setIntegrationStatus] = useState<OpenAssistIntegrationStatus | null>(null);
   const [integrationActionMessage, setIntegrationActionMessage] = useState<string | undefined>(undefined);
   const [integrationBusyID, setIntegrationBusyID] = useState<string | undefined>(undefined);
+  const [integrationModeExplainer, setIntegrationModeExplainer] = useState<KnowledgeExternalAccessMode | null>(null);
   const [connectorSnapshot, setConnectorSnapshot] = useState<ConnectorSnapshot | null>(null);
   const [nativePermissionSnapshot, setNativePermissionSnapshot] = useState<NativePermissionBrokerSnapshot | null>(null);
   const [connectorActionMessage, setConnectorActionMessage] = useState<string | undefined>(undefined);
@@ -24449,12 +27258,30 @@ function SettingsContent({
     setAppearanceStatus("");
     setAssistantVoiceActionMessage(undefined);
     setKnowledgeActionMessage(undefined);
+    setMemoryDreamActionMessage(undefined);
     setIntegrationActionMessage(undefined);
     if (section !== "app") {
       setPendingColorTheme(null);
       onPreviewColorTheme?.(null);
     }
   }, [section]);
+
+  const consolidateMemoriesNow = useCallback(async () => {
+    if (!window.openAssistElectron?.memoryDreamNow) {
+      setMemoryDreamActionMessage("Background memory is not available in this build.");
+      return;
+    }
+    setMemoryDreamBusy(true);
+    setMemoryDreamActionMessage(undefined);
+    try {
+      const result = await window.openAssistElectron.memoryDreamNow();
+      setMemoryDreamActionMessage(result.message);
+    } catch (error) {
+      setMemoryDreamActionMessage(error instanceof Error ? error.message : "Memory consolidation failed.");
+    } finally {
+      setMemoryDreamBusy(false);
+    }
+  }, []);
 
   const refreshIntegrationStatus = useCallback(async () => {
     try {
@@ -25445,6 +28272,26 @@ function SettingsContent({
             onToggle={() => onUpdateSetting("knowledgeRealtimeVoiceAccessEnabled", !(settings?.knowledgeRealtimeVoiceAccessEnabled ?? true))}
           />
           <Checkbox
+            checked={settings?.memoryDreamingEnabled ?? true}
+            label="Background memory"
+            onToggle={() => onUpdateSetting("memoryDreamingEnabled", !(settings?.memoryDreamingEnabled ?? true))}
+          />
+          <div className="settings-inline-actions">
+            <button
+              className="secondary-action"
+              disabled={
+                memoryDreamBusy
+                || !(settings?.memoryEnabled ?? true)
+                || !(settings?.memoryDreamingEnabled ?? true)
+                || !(settings?.knowledgeAccessEnabled ?? true)
+              }
+              onClick={() => void consolidateMemoriesNow()}
+            >
+              {memoryDreamBusy ? "Consolidating..." : "Consolidate memories now"}
+            </button>
+          </div>
+          {memoryDreamActionMessage ? <p className="ready-line">{memoryDreamActionMessage}</p> : null}
+          <Checkbox
             checked={settings?.realtimeLocalMCPEnabled ?? true}
             label="Allow GPT Realtime to use approved local MCP tools"
             onToggle={() => onUpdateSetting("realtimeLocalMCPEnabled", !(settings?.realtimeLocalMCPEnabled ?? true))}
@@ -25523,26 +28370,67 @@ function SettingsContent({
               One-click setup writes the MCP config with a backup. Add the behavior skill so external agents route tasks to backlog and references to notes.
             </p>
             <div className="integration-mode-panel">
-              <span>
+              <span className="integration-mode-panel-heading">
                 <strong>External agent mode</strong>
                 <small>
-                  {knowledgeExternalAccessModeLabel(externalAccessMode)} exposes {exposedToolSummary} and {resourcesVisible ? "allows resource browsing." : "hides resource browsing."}
+                  {knowledgeExternalAccessModeLabel(externalAccessMode)} exposes {exposedToolSummary} and {resourcesVisible ? "allows note browsing." : "hides note browsing."}
                 </small>
               </span>
-              <div className="segmented integration-mode-segmented">
-                {knowledgeExternalAccessModeOptions.map((option) => (
-                  <button
-                    key={option.id}
-                    className={cx(externalAccessMode === option.id && "selected")}
-                    disabled={integrationBusyID === `mode:${option.id}`}
-                    title={option.detail}
-                    onClick={() => void updateIntegrationMode(option.id)}
-                  >
-                    {option.label}
-                  </button>
-                ))}
+              <div className="integration-mode-cards">
+                {knowledgeExternalAccessModeOptions.map((option) => {
+                  const catalogEntry = integrationStatus?.modes?.find((mode) => mode.id === option.id);
+                  const selected = externalAccessMode === option.id;
+                  const busy = integrationBusyID === `mode:${option.id}`;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      className={cx("integration-mode-card", selected && "selected")}
+                      disabled={busy}
+                      onClick={() => {
+                        if (!selected) void updateIntegrationMode(option.id);
+                      }}
+                    >
+                      <span className="integration-mode-card-title">
+                        {option.label}
+                        {selected ? <em>Current</em> : null}
+                      </span>
+                      <small>{option.detail}</small>
+                      <span className="integration-mode-card-facts">
+                        <b>{catalogEntry ? `${catalogEntry.toolCount} tools` : busy ? "Switching..." : " "}</b>
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          className="integration-mode-card-more"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setIntegrationModeExplainer(option.id);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key !== "Enter" && event.key !== " ") return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setIntegrationModeExplainer(option.id);
+                          }}
+                        >
+                          What's inside?
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
+            {integrationModeExplainer && (integrationStatus?.modes?.length ?? 0) > 0 ? (
+              <IntegrationModeExplainerDialog
+                modes={integrationStatus?.modes ?? []}
+                activeMode={externalAccessMode}
+                initialTab={integrationModeExplainer}
+                busyID={integrationBusyID}
+                onSelectMode={(mode) => void updateIntegrationMode(mode)}
+                onClose={() => setIntegrationModeExplainer(null)}
+              />
+            ) : null}
             <div className="integration-fast-path-panel">
               <strong>Common fast actions</strong>
               <div>
@@ -25679,6 +28567,38 @@ function SettingsContent({
     const cloudTranscriptionNeedsKey = cloudTranscriptionActive && cloudTranscriptionProvider !== "ChatGPT / Codex Session";
     const liveVoiceMode = settings?.liveVoiceMode || "openaiRealtime";
     const realtimeVoiceProvider = settings?.realtimeVoiceProvider || "openaiRealtime";
+    const showCodexSubscriptionMode = Boolean(settings?.codexSubscriptionVoiceAvailable || liveVoiceMode === "codexSubscription");
+    const availableLiveVoiceModeOptions = showCodexSubscriptionMode
+      ? [
+          liveVoiceModeOptions[0],
+          {
+            value: "codexSubscription",
+            label: settings?.codexSubscriptionVoiceAvailable
+              ? "Codex Voice (Beta)"
+              : "Codex Voice (Beta) · Unavailable"
+          },
+          liveVoiceModeOptions[1]
+        ]
+      : liveVoiceModeOptions;
+    const changeLiveVoiceMode = (value: string) => {
+      const nextMode = value || "openaiRealtime";
+      const updates: SettingsUpdatePatch[] = nextMode === "codexSubscription"
+        ? [
+            { key: "liveVoiceMode", value: "codexSubscription" },
+            { key: "realtimeVoiceProvider", value: "codexSubscription" }
+          ]
+        : nextMode === "openaiRealtime" && realtimeVoiceProvider === "codexSubscription"
+          ? [
+              { key: "liveVoiceMode", value: "openaiRealtime" },
+              { key: "realtimeVoiceProvider", value: "openaiRealtime" }
+            ]
+          : [{ key: "liveVoiceMode", value: nextMode }];
+      if (onUpdateSettings) {
+        void onUpdateSettings(updates);
+        return;
+      }
+      void Promise.all(updates.map((update) => onUpdateSetting(update.key, update.value)));
+    };
     const installedWhisperModels = settings?.whisperInstalledModels ?? [];
     const installedWhisperModelsLabel = installedWhisperModels.length
       ? installedWhisperModels.join(", ")
@@ -25763,7 +28683,7 @@ function SettingsContent({
             <RealtimeVoiceMark size={23} />
             <span>
               <strong>Live Voice</strong>
-              <small>Choose cloud realtime or the local voice agent.</small>
+              <small>Choose cloud realtime, Codex Voice, or the local voice agent.</small>
             </span>
           </div>
           <Checkbox
@@ -25774,9 +28694,26 @@ function SettingsContent({
           <SettingsSelect
             label="Live Voice mode"
             value={liveVoiceMode}
-            options={liveVoiceModeOptions}
-            onChange={(value) => onUpdateSetting("liveVoiceMode", value || "openaiRealtime")}
+            options={availableLiveVoiceModeOptions}
+            onChange={changeLiveVoiceMode}
           />
+          {!settings?.codexSubscriptionVoiceAvailable && liveVoiceMode !== "codexSubscription" && (
+            <div className="provider-credential-box">
+              <span>
+                <strong>Codex Voice (Beta)</strong>
+                <small>{settings?.codexSubscriptionVoiceMessage || "Checking compatibility..."}</small>
+              </span>
+              <div className="inline-actions">
+                {settings?.codexSubscriptionVoiceStatus === "signed_out" && (
+                  <button onClick={() => void onOpenTarget("codexLogin")}>Sign in</button>
+                )}
+                <button onClick={onRefresh}>Retry</button>
+              </div>
+              <small>
+                Uses your existing Codex sign-in automatically · Codex {settings?.codexSubscriptionCodexVersion || "unknown"}
+              </small>
+            </div>
+          )}
           <SettingsSelect
             label="Worker policy"
             value={settings?.realtimeWorkerPolicy || "auto"}
@@ -25813,6 +28750,24 @@ function SettingsContent({
               <SelectRow label="Provider handoff" value="Uses the active provider when delegated" tone="ready" />
               <small>Use whisper.cpp or Cloud Providers below. Apple Speech is not used by Local Voice Agent.</small>
             </>
+          )}
+          {liveVoiceMode === "codexSubscription" && (
+            <div className="provider-credential-box">
+              <span>
+                <strong>Codex Voice (Beta)</strong>
+                <small>{settings?.codexSubscriptionVoiceMessage || "Managed by Codex"}</small>
+              </span>
+              <SelectRow label="Plan" value={settings?.codexSubscriptionPlanName || "Managed by Codex"} tone="ready" />
+              <SelectRow label="Codex version" value={settings?.codexSubscriptionCodexVersion || "Unknown"} />
+              <SelectRow label="Voice model" value="Managed by Codex" />
+              <div className="inline-actions">
+                {settings?.codexSubscriptionVoiceStatus === "signed_out" && (
+                  <button onClick={() => void onOpenTarget("codexLogin")}>Sign in</button>
+                )}
+                <button onClick={onRefresh}>Retry</button>
+              </div>
+              <small>Uses your existing Codex sign-in automatically. Beta feature; plan limits still apply.</small>
+            </div>
           )}
           {liveVoiceMode === "openaiRealtime" && (
             <>
@@ -27919,17 +30874,128 @@ function SettingsContent({
 
   if (section === "app") {
     const versionLabel = `Version ${settings?.appVersion || "1.0.7"} (${settings?.buildNumber || "69"})`;
+    const retentionDays = settings?.junkCleanupRetentionDays ?? 30;
+    const visibleCleanup = junkCleanupResult ?? junkCleanupPreview;
+    const previewCleanup = async () => {
+      const electron = window.openAssistElectron;
+      if (!electron?.previewJunkCleanup) return;
+      setJunkCleanupBusy("preview");
+      setJunkCleanupMessage("");
+      setJunkCleanupResult(null);
+      try {
+        const preview = await electron.previewJunkCleanup(retentionDays);
+        setJunkCleanupPreview(preview);
+        setJunkCleanupMessage(preview.itemCount
+          ? `${preview.itemCount} disposable ${preview.itemCount === 1 ? "item" : "items"} can be removed.`
+          : "Nothing needs cleanup for this time range.");
+      } catch (error) {
+        setJunkCleanupMessage(error instanceof Error ? error.message : "Could not preview cleanup.");
+      } finally {
+        setJunkCleanupBusy(null);
+      }
+    };
+    const cleanUpNow = async () => {
+      const electron = window.openAssistElectron;
+      if (!electron?.runJunkCleanup) return;
+      setJunkCleanupBusy("cleanup");
+      setJunkCleanupMessage("");
+      try {
+        const result = await electron.runJunkCleanup(retentionDays, junkCleanupPreview?.confirmationToken);
+        setJunkCleanupResult(result);
+        setJunkCleanupPreview(result);
+        setJunkCleanupMessage(result.errors.length
+          ? `Freed ${cleanupSizeLabel(result.freedBytes)}. ${result.errors.length} ${result.errors.length === 1 ? "item could" : "items could"} not be removed.`
+          : `Cleanup finished. Freed ${cleanupSizeLabel(result.freedBytes)}.`);
+      } catch (error) {
+        setJunkCleanupMessage(error instanceof Error ? error.message : "Cleanup failed.");
+      } finally {
+        setJunkCleanupBusy(null);
+      }
+    };
     return (
       <div className="settings-stack single" key="app">
         <SettingsSectionTabs
           tabs={[
             { id: "app-permissions", label: "Permissions" },
+            { id: "app-storage", label: "Storage" },
             { id: "app-diagnostics", label: "Diagnostics" },
             { id: "app-about", label: "About" }
           ]}
         />
         <div id="app-permissions">
           <MacOSPermissionsCard />
+        </div>
+
+        <div className="settings-card storage-cleanup-card" id="app-storage">
+          <div className="card-heading">
+            <HardDrive size={22} />
+            <span>
+              <strong>Storage Cleanup</strong>
+              <small>Remove old generated files, finished worker records, logs, and backup copies.</small>
+            </span>
+          </div>
+          <Checkbox
+            checked={settings?.junkCleanupEnabled ?? false}
+            label="Clean up automatically once a day"
+            onToggle={() => onUpdateSetting("junkCleanupEnabled", !(settings?.junkCleanupEnabled ?? false))}
+          />
+          <SettingsSelect
+            label="Remove disposable data older than"
+            value={String(retentionDays)}
+            options={[
+              { value: "7", label: "7 days" },
+              { value: "30", label: "30 days" },
+              { value: "90", label: "90 days" },
+              { value: "180", label: "180 days" }
+            ]}
+            onChange={(value) => {
+              setJunkCleanupPreview(null);
+              setJunkCleanupResult(null);
+              setJunkCleanupMessage("");
+              void onUpdateSetting("junkCleanupRetentionDays", Number(value));
+            }}
+          />
+          <p className="settings-helper-line">
+            Saved notes, planner items, normal chats, memories, models, and active work are never included. The newest copy in each backup folder is always kept.
+          </p>
+          {visibleCleanup && (
+            <div className="storage-cleanup-preview" aria-live="polite">
+              <div className="storage-cleanup-total">
+                <span>
+                  <strong>{cleanupSizeLabel(visibleCleanup.sizeBytes)}</strong>
+                  <small>{visibleCleanup.itemCount} {visibleCleanup.itemCount === 1 ? "item" : "items"}</small>
+                </span>
+                <small>Older than {visibleCleanup.retentionDays} days</small>
+              </div>
+              <div className="storage-cleanup-categories">
+                {visibleCleanup.categories.map((category) => (
+                  <span key={category.category}>
+                    <small>{category.label}</small>
+                    <strong>{category.itemCount} · {cleanupSizeLabel(category.sizeBytes)}</strong>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {junkCleanupMessage && <p className="ready-line" aria-live="polite">{junkCleanupMessage}</p>}
+          <div className="inline-actions">
+            <button disabled={junkCleanupBusy !== null} onClick={() => void previewCleanup()}>
+              {junkCleanupBusy === "preview" ? "Checking…" : "Preview cleanup"}
+            </button>
+            <button
+              className="gold-action"
+              disabled={junkCleanupBusy !== null || !junkCleanupPreview?.itemCount || junkCleanupResult !== null}
+              onClick={() => void cleanUpNow()}
+            >
+              <Trash2 size={14} />
+              {junkCleanupBusy === "cleanup" ? "Cleaning…" : "Clean up now"}
+            </button>
+          </div>
+          {settings?.junkCleanupLastRunAt && !junkCleanupResult && (
+            <p className="settings-helper-line">
+              Last cleanup: {new Date(settings.junkCleanupLastRunAt).toLocaleString()} · {cleanupSizeLabel(settings.junkCleanupLastFreedBytes)} freed
+            </p>
+          )}
         </div>
 
         <div className="settings-card" id="app-diagnostics">
@@ -29580,10 +32646,13 @@ function FeatureRouter({
   onRemoveAttachment,
   onClearAttachmentError,
   onSend,
+  onSteerMessage,
+  onQueueMessage,
   onStop,
   onVoiceInput,
   onLiveVoice,
   onTodayLiveVoice,
+  onClearLiveVoiceLog,
   onToggleLiveVoiceMuted,
   onOpenRealtimeSettings,
   onOpenKnowledgeSettings,
@@ -29631,6 +32700,7 @@ function FeatureRouter({
   onUpsertBacklogItem,
   onToggleBacklogItem,
   onDeleteBacklogItem,
+  onMoveDailyItemToDay,
   onMoveDailyItemToBacklog,
   onScheduleBacklogItem,
   onToggleAutomation,
@@ -29712,10 +32782,13 @@ function FeatureRouter({
   onRemoveAttachment: (id: string) => void;
   onClearAttachmentError: () => void;
   onSend: () => void;
+  onSteerMessage?: (text: string) => void;
+  onQueueMessage?: (text: string) => void;
   onStop: () => void;
   onVoiceInput: () => void;
   onLiveVoice: () => void;
   onTodayLiveVoice: () => void;
+  onClearLiveVoiceLog: () => void;
   onToggleLiveVoiceMuted: () => void;
   onOpenRealtimeSettings: () => void;
   onOpenKnowledgeSettings: () => void;
@@ -29763,6 +32836,7 @@ function FeatureRouter({
   onUpsertBacklogItem: (item: DailyItemInput) => Promise<void>;
   onToggleBacklogItem: (itemID: string, checked: boolean) => Promise<void>;
   onDeleteBacklogItem: (itemID: string) => Promise<void>;
+  onMoveDailyItemToDay: (dayID: string, itemID: string, targetDayID: string) => Promise<void>;
   onMoveDailyItemToBacklog: (dayID: string, itemID: string) => Promise<void>;
   onScheduleBacklogItem: (itemID: string, targetDayID: string) => Promise<void>;
   onToggleAutomation: (job: AutomationItem) => void;
@@ -29808,7 +32882,9 @@ function FeatureRouter({
       : true;
   const liveVoiceCloudKeyConfigured = liveVoiceCloudProvider === "geminiLive"
     ? Boolean(appState.settings.realtimeGeminiAPIKeyConfigured)
-    : Boolean(appState.settings.realtimeOpenAIAPIKeyConfigured);
+    : liveVoiceCloudProvider === "codexSubscription"
+      ? Boolean(appState.settings.codexSubscriptionVoiceAvailable)
+      : Boolean(appState.settings.realtimeOpenAIAPIKeyConfigured);
   const liveVoiceTranscriptionReady = appState.settings.transcriptionEngine === "whisper.cpp"
     ? Boolean(appState.settings.whisperModelInstalled)
     : appState.settings.transcriptionEngine === "Cloud Providers"
@@ -29835,6 +32911,7 @@ function FeatureRouter({
           plannerDays={appState.plannerDays}
           selectedDayID={selectedPlannerDayID}
           backlogOpen={plannerBacklogOpen}
+          backlogMigrationWarning={appState.plannerBacklog?.migrationWarning}
           backlogItems={backlogItems}
           projects={plannerLists}
           categories={appState.plannerCategories ?? []}
@@ -29864,6 +32941,7 @@ function FeatureRouter({
           onUpsertBacklogItem={onUpsertBacklogItem}
           onToggleBacklogItem={onToggleBacklogItem}
           onDeleteBacklogItem={onDeleteBacklogItem}
+          onMoveDailyItemToDay={onMoveDailyItemToDay}
           onMoveDailyItemToBacklog={onMoveDailyItemToBacklog}
           onScheduleBacklogItem={onScheduleBacklogItem}
           liveVoiceStatus={liveVoiceStatus}
@@ -30055,10 +33133,13 @@ function FeatureRouter({
           onRemoveAttachment={onRemoveAttachment}
           onClearAttachmentError={onClearAttachmentError}
           onSend={onSend}
+          onSteerMessage={onSteerMessage}
+          onQueueMessage={onQueueMessage}
           onStop={onStop}
           onVoiceInput={onVoiceInput}
           onLiveVoice={onLiveVoice}
           onTodayLiveVoice={onTodayLiveVoice}
+          onClearLiveVoiceLog={onClearLiveVoiceLog}
           onToggleLiveVoiceMuted={onToggleLiveVoiceMuted}
           onOpenRealtimeSettings={onOpenRealtimeSettings}
           onOpenKnowledgeSettings={onOpenKnowledgeSettings}
@@ -30355,6 +33436,11 @@ function AppInner() {
       realtimeOpenAIModel: defaultOpenAIRealtimeModel,
       realtimeOpenAIVoice: "marin",
       realtimeVoiceProvider: "openaiRealtime",
+      codexSubscriptionVoiceAvailable: false,
+      codexSubscriptionVoiceStatus: "not_available",
+      codexSubscriptionVoiceMessage: "Codex Voice compatibility has not been checked yet.",
+      codexSubscriptionPlanName: "Managed by Codex",
+      codexSubscriptionCodexVersion: "Checking",
       realtimeGeminiAPIKeyConfigured: false,
       realtimeMaskedGeminiAPIKey: "Not configured",
 	      realtimeGeminiModel: "gemini-3.1-flash-live-preview",
@@ -30374,6 +33460,7 @@ function AppInner() {
       assistantVoiceOutputEnabled: false,
       computerUseEnabled: false,
       memoryEnabled: true,
+      memoryDreamingEnabled: true,
       knowledgeAccessEnabled: true,
       knowledgeExternalAccessEnabled: false,
       knowledgeExternalAccessMode: "simple",
@@ -30386,6 +33473,10 @@ function AppInner() {
       knowledgePendingRequestCount: 0,
       assistantTrackCodeChangesInGitRepos: true,
       archiveAutoDeleteDays: null,
+      junkCleanupEnabled: false,
+      junkCleanupRetentionDays: 30,
+      junkCleanupLastRunAt: "",
+      junkCleanupLastFreedBytes: 0,
       automationAPIPort: "45831",
       browserProfile: "Default",
       holdToTalkShortcut: "Control Option Command Space",
@@ -30499,6 +33590,7 @@ function AppInner() {
   const [pendingMarkdownImport, setPendingMarkdownImport] = useState<PendingMarkdownImport | null>(null);
   const [noteLinksSnapshot, setNoteLinksSnapshot] = useState<NoteLinksSnapshot | null>(null);
   const [noteSaveStatus, setNoteSaveStatus] = useState<NoteSaveStatus>({ kind: "idle" });
+  const [plannerConflictReview, setPlannerConflictReview] = useState<PlannerConflictReview | null>(null);
   const [noteRenameTarget, setNoteRenameTarget] = useState<NoteRenameTarget | null>(null);
   const [noteNavigationBackStack, setNoteNavigationBackStack] = useState<SelectedNoteTarget[]>([]);
   const [noteNavigationForwardStack, setNoteNavigationForwardStack] = useState<SelectedNoteTarget[]>([]);
@@ -30539,6 +33631,30 @@ function AppInner() {
   const [composerAttachments, setComposerAttachments] = useState<ComposerImageAttachment[]>([]);
   const [composerAttachmentError, setComposerAttachmentError] = useState<string | null>(null);
   const [activeThreadRuns, setActiveThreadRuns] = useState<Record<string, ActiveThreadRun>>({});
+  // Side chat: an ephemeral forked conversation docked beside the main chat.
+  // Closing keeps it alive (reopenable); the bridge idle-sweeps it after 30
+  // minutes and purges it on quit/startup. Never shown in the sidebar.
+  type SideChatState = {
+    parentThreadID: string;
+    threadID: string;
+    title: string;
+    messages: ChatMessage[];
+    open: boolean;
+  };
+  const [sideChat, setSideChat] = useState<SideChatState | null>(null);
+  const sideChatRef = useRef<SideChatState | null>(null);
+  sideChatRef.current = sideChat;
+  const sideChatThreadIDsRef = useRef<Set<string>>(new Set());
+  const [sideChatComposerText, setSideChatComposerText] = useState("");
+  // Text selected in the main chat, attached as context to the next side-chat
+  // question (the "1 selection" chip on the side-chat composer).
+  const [sideChatSelection, setSideChatSelection] = useState<string | null>(null);
+  // Context-sync hint: how many main-chat messages the side chat hasn't seen,
+  // plus a short note after the user clicks Sync.
+  const [sideChatNewCount, setSideChatNewCount] = useState(0);
+  const [sideChatSyncNote, setSideChatSyncNote] = useState<string | null>(null);
+  // Floating "Ask in side chat" popover shown over a text selection in the chat.
+  const [chatSelectionPopover, setChatSelectionPopover] = useState<{ text: string; x: number; y: number } | null>(null);
   const [realtimeWorkTasks, setRealtimeWorkTasks] = useState<Record<string, RealtimeWorkTask>>({});
   const realtimeWorkTasksRef = useRef<Record<string, RealtimeWorkTask>>({});
   const [realtimeWorkDrawerOpen, setRealtimeWorkDrawerOpen] = useState(false);
@@ -30639,6 +33755,7 @@ function AppInner() {
   const voiceBaseTextRef = useRef("");
   const voiceFinalTextRef = useRef("");
   const liveVoiceStreamRef = useRef<MediaStream | null>(null);
+  const codexSubscriptionWebRTCRef = useRef<CodexSubscriptionWebRTC | null>(null);
   const liveVoiceInputContextRef = useRef<AudioContext | null>(null);
   const liveVoiceOutputContextRef = useRef<AudioContext | null>(null);
   const liveVoiceProcessorRef = useRef<ScriptProcessorNode | null>(null);
@@ -30659,12 +33776,20 @@ function AppInner() {
   const liveVoiceModelRef = useRef("");
   const notifiedRealtimeTaskIDsRef = useRef(new Set<string>());
   const liveVoiceExpectedStopRef = useRef(false);
+  const liveVoiceProviderThreadIDRef = useRef("");
+  const liveVoiceStoppedProviderThreadIDsRef = useRef(new Set<string>());
   const liveVoiceStartTokenRef = useRef(0);
+  // Timestamp until which Codex Voice is treated as still speaking, so late
+  // "listening" events right after an answer cannot flicker the HUD.
+  const liveVoiceCodexSpeakingUntilRef = useRef(0);
   const startTodayLiveVoiceFromWakeWordRef = useRef<() => void>(() => {});
   const todayWakeWordDetectionRef = useRef(0);
   const wakeWordStartingTodayLiveRef = useRef(false);
   const liveVoiceOutputSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const liveVoicePlaybackTimeRef = useRef(0);
+  const liveVoicePlaybackSourcesByDeliveryRef = useRef(new Map<string, number>());
+  const liveVoicePlaybackServerDoneRef = useRef(new Set<string>());
+  const liveVoicePlaybackStartedRef = useRef(new Set<string>());
   const liveVoiceScopeRef = useRef("");
   const localVoiceModeActiveRef = useRef(false);
   const localVoiceBusyRef = useRef(false);
@@ -30840,6 +33965,20 @@ function AppInner() {
   const activeRealtimeWorkTasks = useMemo(
     () => realtimeWorkTaskList.filter((task) => task.state === "queued" || task.state === "running"),
     [realtimeWorkTaskList]
+  );
+  // Grouped per thread so each Live Voice sidebar row (today's log, and any
+  // rotated day logs sitting in Archived Voice) shows only ITS OWN task
+  // count. realtimeWorkTasks is one shared in-memory dict across every
+  // thread the app has loaded history for this session, so without this
+  // grouping every row would show the same combined total.
+  const liveVoiceWorkTasksByThreadID = useMemo(() => {
+    const grouped: Record<string, RealtimeWorkTask[]> = {};
+    for (const task of realtimeWorkTaskList) {
+      (grouped[task.threadID] ??= []).push(task);
+    }
+    return grouped;
+  }, [realtimeWorkTaskList]
+
   );
   const hasActiveRealtimeDelegationRun = () => Object.values(realtimeWorkTasksRef.current).some(
     (task) => task.state === "queued" || task.state === "running"
@@ -31194,7 +34333,13 @@ function AppInner() {
     });
   };
 
+  // Messages typed while a task runs can be queued (Cmd+Enter, or Enter on a
+  // provider without mid-turn steering); they send when the task finishes.
+  const queuedComposerMessagesRef = useRef<Record<string, string[]>>({});
+
   const clearActiveThreadRun = (threadID: string, runID: string) => {
+    const clearedRun = Object.values(activeThreadRunsRef.current)
+      .find((run) => sameID(run.threadID, threadID) && run.runID === runID);
     setActiveThreadRuns((current) => {
       const entry = Object.entries(current).find(([, run]) => sameID(run.threadID, threadID) && run.runID === runID);
       if (!entry) return current;
@@ -31203,6 +34348,21 @@ function AppInner() {
       activeThreadRunsRef.current = next;
       return next;
     });
+    const queued = queuedComposerMessagesRef.current[threadID] ?? [];
+    if (!queued.length || clearedRun?.kind === "realtimeDelegation") return;
+    if (clearedRun?.stopRequested) {
+      // The user stopped the task on purpose — hand the text back instead of
+      // firing it into a task they just cancelled.
+      delete queuedComposerMessagesRef.current[threadID];
+      setComposerText(queued.join("\n"));
+      setProviderStatus("Task stopped — your queued message is back in the composer.");
+      return;
+    }
+    const [nextPrompt, ...rest] = queued;
+    if (rest.length) queuedComposerMessagesRef.current[threadID] = rest;
+    else delete queuedComposerMessagesRef.current[threadID];
+    setProviderStatus(rest.length ? `Sending queued message (${rest.length} more waiting)...` : "Sending your queued message...");
+    void sendMessage({ prompt: nextPrompt, threadID, keepCurrentSurface: true });
   };
 
   const markApprovalInActiveRuns = (message: ChatMessage, resolved: boolean) => {
@@ -31437,13 +34597,55 @@ function AppInner() {
     if (isCurrentTarget()) {
       setNoteSaveStatus({ kind: "saving", message: reason === "manual" ? "Saving..." : "Autosaving..." });
     }
+    let persistedMarkdown = draft;
     try {
       if (target.scope === "planner") {
-        const savedDetail = await window.openAssistElectron?.savePlannerDay(target.dayID, draft);
-        if (!savedDetail) throw new Error("Planner day did not save.");
+        const plannerDetail = detail as NoteDetail & Partial<PlannerDayDetail>;
+        if (!plannerDetail.revision) {
+          throw new Error("This planner day needs to be reloaded before it can be saved safely.");
+        }
+        const mutation: PlannerEditorMutation = {
+          mutationID: crypto.randomUUID(),
+          containerID: target.dayID,
+          baseRevision: plannerDetail.revision,
+          baseMarkdown: plannerDetail.markdown,
+          markdown: draft
+        };
+        const result = await window.openAssistElectron?.applyPlannerEditorMutation(mutation);
+        if (!result) throw new Error("Planner day did not save.");
+        if (result.status === "conflict") {
+          setPlannerConflictReview({
+            mutation,
+            newerRevision: result.document.revision,
+            conflicts: result.conflicts,
+            choices: {}
+          });
+          throw new Error("Planner changes need your review before saving.");
+        }
+        if (result.status === "invalid") {
+          throw new Error(result.issues.map((issue) => (
+            `${issue.line ? `Line ${issue.line}: ` : ""}${issue.message}`
+          )).join(" "));
+        }
+        if (result.status === "failed") throw new Error(result.error);
+        const savedDetail: PlannerDayDetail = {
+          id: target.dayID,
+          title: detail.title,
+          subtitle: plannerDetail.subtitle ?? target.dayID,
+          path: detail.path ?? "",
+          markdown: result.document.markdown,
+          revision: result.document.revision,
+          schemaVersion: result.document.schemaVersion
+        };
+        persistedMarkdown = savedDetail.markdown;
         const savedDailyItems = await window.openAssistElectron?.listDailyItems?.(savedDetail.id);
         if (isCurrentTarget()) {
+          setPlannerConflictReview(null);
           setNoteDetail(savedDetail);
+          if (noteDraftRef.current.replace(/\r\n/g, "\n") === draft) {
+            noteDraftRef.current = savedDetail.markdown;
+            setNoteDraft(savedDetail.markdown);
+          }
           setSelectedPlannerDayID(savedDetail.id);
           setDailyItems(savedDailyItems ?? []);
           setAppState((current) => ({
@@ -31508,10 +34710,10 @@ function AppInner() {
 
       if (isCurrentTarget()) {
         lastSavedNoteKeyRef.current = key;
-        lastSavedNoteDraftRef.current = draft;
+        lastSavedNoteDraftRef.current = persistedMarkdown;
       }
       if (requestID === noteSaveRequestRef.current && isCurrentTarget()) {
-        if (noteDraftRef.current.replace(/\r\n/g, "\n") === draft) {
+        if (noteDraftRef.current.replace(/\r\n/g, "\n") === persistedMarkdown) {
           setNoteSaveStatus({ kind: "saved", at: Date.now() });
         } else {
           setNoteSaveStatus({ kind: "dirty", message: "Unsaved changes" });
@@ -31531,6 +34733,68 @@ function AppInner() {
         });
       }
       return false;
+    }
+  }
+
+  async function applyPlannerConflictChoices() {
+    const review = plannerConflictReview;
+    const target = selectedNoteTargetRef.current;
+    const detail = noteDetailRef.current;
+    if (!review || target?.scope !== "planner" || !detail) return;
+    if (review.conflicts.some((conflict) => !review.choices[conflict.path])) {
+      setNoteSaveStatus({ kind: "error", message: "Choose which version to keep for every conflict." });
+      return;
+    }
+    setNoteSaveStatus({ kind: "saving", message: "Applying reviewed changes..." });
+    const input: PlannerConflictResolution = {
+      ...review.mutation,
+      mutationID: crypto.randomUUID(),
+      newerRevision: review.newerRevision,
+      choices: review.choices
+    };
+    try {
+      const result = await window.openAssistElectron?.resolvePlannerEditorConflicts(input);
+      if (!result) throw new Error("Planner changes could not be applied.");
+      if (result.status === "conflict") {
+        setPlannerConflictReview({
+          mutation: review.mutation,
+          newerRevision: result.document.revision,
+          conflicts: result.conflicts,
+          choices: {}
+        });
+        throw new Error("The planner changed again. Review the newest conflicts.");
+      }
+      if (result.status === "invalid") {
+        throw new Error(result.issues.map((issue) => (
+          `${issue.line ? `Line ${issue.line}: ` : ""}${issue.message}`
+        )).join(" "));
+      }
+      if (result.status === "failed") throw new Error(result.error);
+      const currentPlannerDetail = detail as NoteDetail & Partial<PlannerDayDetail>;
+      const savedDetail: PlannerDayDetail = {
+        id: target.dayID,
+        title: detail.title,
+        subtitle: currentPlannerDetail.subtitle ?? target.dayID,
+        path: detail.path ?? "",
+        markdown: result.document.markdown,
+        revision: result.document.revision,
+        schemaVersion: result.document.schemaVersion
+      };
+      const savedItems = await window.openAssistElectron?.listDailyItems?.(savedDetail.id);
+      noteDetailRef.current = savedDetail;
+      noteDraftRef.current = savedDetail.markdown;
+      lastSavedNoteKeyRef.current = noteTargetKey(target);
+      lastSavedNoteDraftRef.current = savedDetail.markdown;
+      setNoteDetail(savedDetail);
+      setNoteDraft(savedDetail.markdown);
+      setDailyItems(savedItems ?? []);
+      setPlannerConflictReview(null);
+      setNoteSaveStatus({ kind: "saved", at: Date.now() });
+    } catch (error) {
+      setNoteSaveStatus({
+        kind: "error",
+        message: error instanceof Error ? error.message : "Planner changes could not be applied."
+      });
     }
   }
 
@@ -31588,7 +34852,9 @@ function AppInner() {
   }, []);
 
   const refreshMicrophoneList = async () => {
-    const microphones = await window.openAssistElectron?.listMicrophones?.();
+    // A slow or failed device probe must not reject into an unhandled promise;
+    // the picker just keeps whatever list it already had.
+    const microphones = await window.openAssistElectron?.listMicrophones?.().catch(() => undefined);
     if (!microphones) return;
     setAppState((current) => ({
       ...current,
@@ -32127,6 +35393,28 @@ function AppInner() {
     await openMemoryForThread(currentThreadID());
   };
 
+  const setCurrentThreadMemoryPolicy = async (patch: { useMemory?: boolean; learnFromChat?: boolean }) => {
+    const threadID = currentThreadID();
+    if (!threadID) return;
+    try {
+      const memory = await window.openAssistElectron?.setThreadMemoryPolicy?.(threadID, patch);
+      if (memory) setThreadMemory(memory);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not update this chat's memory settings.");
+    }
+  };
+
+  const retryCurrentThreadMemory = async () => {
+    const threadID = currentThreadID();
+    if (!threadID) return;
+    try {
+      const result = await window.openAssistElectron?.retryThreadMemory?.(threadID);
+      if (result?.memory) setThreadMemory(result.memory);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not retry memory learning.");
+    }
+  };
+
   const openAgentFilesForThread = async (threadID?: string) => {
     if (!threadID) return;
     const result = await window.openAssistElectron?.threadAgentFilesPath?.(threadID);
@@ -32152,11 +35440,26 @@ function AppInner() {
   };
 
   const cycleReasoning = () => {
+    const loadedModels = providerModelOptionsByBackend[activeProviderKey];
+    const activeModelID = displayModelForProvider(
+      activeProviderKey,
+      selectedThread,
+      appState.settings,
+      loadedModels
+    ).trim().toLowerCase();
+    const selectedModel = loadedModels?.find((model) =>
+      model.id.trim().toLowerCase() === activeModelID
+      || model.resolvedModel?.trim().toLowerCase() === activeModelID
+    );
+    const reportedEfforts = selectedModel?.supportedReasoningEfforts ?? [];
+    if (activeProviderKey === "claudeCode" && !reportedEfforts.length) return;
+    const efforts = reportedEfforts.length
+      ? reportedEfforts.map(reasoningEffortLabel)
+      : ["Low", "Medium", "High", "Extra High"];
     setReasoningEffort((current) => {
-      if (current === "High") return "Extra High";
-      if (current === "Extra High") return "Medium";
-      if (current === "Medium") return "Low";
-      return "High";
+      const currentID = reasoningEffortID(current);
+      const currentIndex = efforts.findIndex((effort) => reasoningEffortID(effort) === currentID);
+      return efforts[(currentIndex + 1 + efforts.length) % efforts.length] ?? "High";
     });
   };
 
@@ -32539,7 +35842,35 @@ function AppInner() {
     liveVoiceModelRef.current
   ].filter(Boolean).join(" · ");
 
+  // Codex Voice reports its phase through TWO independent channels — protocol
+  // events (response.audio.delta / response.done) and WebRTC audio-playing
+  // callbacks — which disagree for a moment around the end of every answer.
+  // Writing both straight to state produced a visible speaking/listening
+  // flicker in the HUD with nobody talking. This funnels them through one
+  // idempotent setter and holds a short grace window before dropping out of
+  // "speaking", so trailing events cannot bounce the caption.
+  const setLiveVoiceCodexPhase = (phase: "listening" | "speaking", text: string) => {
+    if (liveVoiceMutedRef.current) return;
+    if (phase === "listening") {
+      if (liveVoiceCodexSpeakingUntilRef.current > Date.now()) return;
+    } else {
+      liveVoiceCodexSpeakingUntilRef.current = Date.now() + 400;
+    }
+    if (liveVoiceStatusRef.current !== phase) setLiveVoiceStatus(phase);
+    setLiveVoiceStatusText((current) => (current === text ? current : text));
+  };
+
   const setLiveVoiceListeningStatus = (text = `${liveVoiceRuntimeLabel()} listening`, preserveHeard = true) => {
+    // While muted the session is still live and connected — the user simply
+    // turned their microphone off. Realtime events keep arriving (playback
+    // done, speech clear, benign cancels) and used to drive this status back
+    // to "connecting"/"listening", which flip-flopped the HUD between
+    // "Muted" and "Preparing" every few seconds. Mute is a stable state:
+    // hold it until the user unmutes.
+    if (liveVoiceMutedRef.current) {
+      setLiveVoiceStatusText("Microphone muted");
+      return;
+    }
     if (!liveVoiceMicrophoneReadyRef.current) {
       if (liveVoiceStatusRef.current !== "idle") setLiveVoiceStatus("connecting");
       setLiveVoiceStatusText((current) => current || "Opening microphone...");
@@ -32547,6 +35878,24 @@ function AppInner() {
     }
     setLiveVoiceStatus("listening");
     setLiveVoiceStatusText((current) => preserveHeard && current && /^heard:/i.test(current) ? current : text);
+  };
+
+  const reportLiveVoicePlayback = (state: "started" | "finished", deliveryID: string, itemID?: string) => {
+    if (!deliveryID) return;
+    void openAssistRealtimeAPI()?.playback?.({ state, deliveryID, itemID }).catch(() => {
+      // Playback acknowledgement is coordination metadata. Audio should keep
+      // playing even if the session closed between the event and this call.
+    });
+  };
+
+  const finishLiveVoicePlaybackIfDrained = (deliveryID: string, itemID?: string) => {
+    if (!deliveryID) return;
+    if ((liveVoicePlaybackSourcesByDeliveryRef.current.get(deliveryID) ?? 0) > 0) return;
+    if (!liveVoicePlaybackServerDoneRef.current.has(deliveryID)) return;
+    liveVoicePlaybackSourcesByDeliveryRef.current.delete(deliveryID);
+    liveVoicePlaybackServerDoneRef.current.delete(deliveryID);
+    liveVoicePlaybackStartedRef.current.delete(deliveryID);
+    reportLiveVoicePlayback("finished", deliveryID, itemID);
   };
 
   const playRealtimeAudio = async (payload: any) => {
@@ -32569,9 +35918,23 @@ function AppInner() {
     source.buffer = buffer;
     source.connect(ensureLiveVoiceOutputAnalyser(context));
     liveVoiceOutputSourcesRef.current.add(source);
+    if (audio.deliveryID) {
+      const sourceCount = liveVoicePlaybackSourcesByDeliveryRef.current.get(audio.deliveryID) ?? 0;
+      liveVoicePlaybackSourcesByDeliveryRef.current.set(audio.deliveryID, sourceCount + 1);
+      if (!liveVoicePlaybackStartedRef.current.has(audio.deliveryID)) {
+        liveVoicePlaybackStartedRef.current.add(audio.deliveryID);
+        reportLiveVoicePlayback("started", audio.deliveryID, audio.itemID);
+      }
+    }
     syncLiveVoiceOutputPlaying();
     source.onended = () => {
       liveVoiceOutputSourcesRef.current.delete(source);
+      if (audio.deliveryID && liveVoicePlaybackSourcesByDeliveryRef.current.has(audio.deliveryID)) {
+        const remaining = Math.max(0, (liveVoicePlaybackSourcesByDeliveryRef.current.get(audio.deliveryID) ?? 1) - 1);
+        if (remaining > 0) liveVoicePlaybackSourcesByDeliveryRef.current.set(audio.deliveryID, remaining);
+        else liveVoicePlaybackSourcesByDeliveryRef.current.delete(audio.deliveryID);
+        finishLiveVoicePlaybackIfDrained(audio.deliveryID, audio.itemID);
+      }
       syncLiveVoiceOutputPlaying();
       if (
         liveVoiceOutputSourcesRef.current.size === 0
@@ -32587,6 +35950,9 @@ function AppInner() {
 
   const interruptLiveVoicePlayback = () => {
     const context = liveVoiceOutputContextRef.current;
+    liveVoicePlaybackSourcesByDeliveryRef.current.clear();
+    liveVoicePlaybackServerDoneRef.current.clear();
+    liveVoicePlaybackStartedRef.current.clear();
     stopRealtimeAudioSources(liveVoiceOutputSourcesRef.current);
     syncLiveVoiceOutputPlaying();
     liveVoicePlaybackTimeRef.current = context ? context.currentTime : 0;
@@ -32599,15 +35965,23 @@ function AppInner() {
   ) => {
     if (options.cancelPendingStart !== false) liveVoiceStartTokenRef.current += 1;
     liveVoiceExpectedStopRef.current = nextStatus !== "error";
-    const clearExpectedStop = () => {
-      window.setTimeout(() => {
-        liveVoiceExpectedStopRef.current = false;
-      }, 250);
-    };
+    const providerThreadID = liveVoiceProviderThreadIDRef.current;
+    if (nextStatus !== "error" && providerThreadID) {
+      const stoppedProviderThreadIDs = liveVoiceStoppedProviderThreadIDsRef.current;
+      stoppedProviderThreadIDs.add(providerThreadID);
+      while (stoppedProviderThreadIDs.size > 8) {
+        const oldest = stoppedProviderThreadIDs.values().next().value;
+        if (typeof oldest !== "string") break;
+        stoppedProviderThreadIDs.delete(oldest);
+      }
+    }
+    liveVoiceProviderThreadIDRef.current = "";
     liveVoiceActiveRef.current = false;
     liveVoiceMutedRef.current = false;
+    liveVoiceCodexSpeakingUntilRef.current = 0;
     setLiveVoiceMuted(false);
     // Reflect the user's stop immediately while backend cleanup finishes.
+    liveVoiceStatusRef.current = nextStatus;
     setLiveVoiceStatus(nextStatus);
     setLiveVoiceStatusText(nextText);
     liveVoiceMicrophoneReadyRef.current = false;
@@ -32632,6 +36006,8 @@ function AppInner() {
     liveVoiceSourceRef.current?.disconnect();
     liveVoiceProcessorRef.current = null;
     liveVoiceSourceRef.current = null;
+    codexSubscriptionWebRTCRef.current?.close();
+    codexSubscriptionWebRTCRef.current = null;
     liveVoiceStreamRef.current?.getTracks().forEach((track) => track.stop());
     liveVoiceStreamRef.current = null;
     const inputContext = liveVoiceInputContextRef.current;
@@ -32653,36 +36029,35 @@ function AppInner() {
       }
       setLiveVoiceStatus(nextStatus);
       setLiveVoiceStatusText(nextText);
-      clearExpectedStop();
+      liveVoiceExpectedStopRef.current = false;
       return;
     }
     try {
       const api = openAssistRealtimeAPI();
       const result = await api?.stop();
       if (result && !result.ok && nextStatus !== "error" && !isRealtimeNotRunningError(result.error || "")) {
+        liveVoiceExpectedStopRef.current = false;
         setLiveVoiceStatus("error");
         setLiveVoiceStatusText(result.error || "Realtime conversation stopped with an error.");
-        clearExpectedStop();
         return;
       }
     } catch (error) {
       if (nextStatus !== "error") {
         const message = error instanceof Error ? error.message : "Could not stop Realtime conversation.";
         if (isRealtimeNotRunningError(message)) {
+          liveVoiceExpectedStopRef.current = false;
           setLiveVoiceStatus(nextStatus);
           setLiveVoiceStatusText(nextText);
-          clearExpectedStop();
           return;
         }
+        liveVoiceExpectedStopRef.current = false;
         setLiveVoiceStatus("error");
         setLiveVoiceStatusText(message);
-        clearExpectedStop();
         return;
       }
     }
     setLiveVoiceStatus(nextStatus);
     setLiveVoiceStatusText(nextText);
-    clearExpectedStop();
   };
 
   const toggleLiveVoiceMuted = () => {
@@ -32690,6 +36065,7 @@ function AppInner() {
     setLiveVoiceMuted((current) => {
       const next = !current;
       liveVoiceMutedRef.current = next;
+      codexSubscriptionWebRTCRef.current?.setMuted(next);
       liveVoiceInputChunksRef.current = [];
       liveVoiceMeterBus.inputLevel = 0;
       if (next) {
@@ -32701,6 +36077,11 @@ function AppInner() {
           lastSpeechAt: 0,
           inputSampleRate: localVoiceCaptureRef.current.inputSampleRate || localVoiceSampleRate
         };
+        // Settle on a stable phase so the HUD reads "Muted" instead of
+        // inheriting a mid-flight "connecting"/"transcribing" phase.
+        if (liveVoiceStatusRef.current === "connecting" || liveVoiceStatusRef.current === "transcribing") {
+          setLiveVoiceStatus("listening");
+        }
         setLiveVoiceStatusText("Microphone muted");
       } else if (liveVoiceStatusRef.current === "listening" || liveVoiceStatusRef.current === "transcribing") {
         setLiveVoiceStatus("listening");
@@ -33167,27 +36548,40 @@ function AppInner() {
       void window.openAssistElectron?.openSettingsWindow?.("voice");
       return;
     }
-    const realtimeProvider = appState.settings.realtimeVoiceProvider === "geminiLive" ? "geminiLive" : "openaiRealtime";
-    const realtimeProviderName = realtimeProvider === "geminiLive" ? "Gemini Live" : "OpenAI Realtime";
+    const realtimeProvider = appState.settings.realtimeVoiceProvider === "geminiLive"
+      ? "geminiLive"
+      : appState.settings.realtimeVoiceProvider === "codexSubscription"
+        ? "codexSubscription"
+        : "openaiRealtime";
+    const realtimeProviderName = liveVoiceProviderLabel(realtimeProvider);
     liveVoiceProviderLabelRef.current = realtimeProviderName;
     const realtimeVoiceModel = realtimeProvider === "geminiLive"
       ? (appState.settings.realtimeGeminiModel || "gemini-3.1-flash-live-preview")
-      : (appState.settings.realtimeOpenAIModel || defaultOpenAIRealtimeModel);
+      : realtimeProvider === "codexSubscription"
+        ? "Managed by Codex"
+        : (appState.settings.realtimeOpenAIModel || defaultOpenAIRealtimeModel);
     liveVoiceModelRef.current = realtimeVoiceModel;
     const realtimeKeyConfigured = realtimeProvider === "geminiLive"
       ? Boolean(appState.settings.realtimeGeminiAPIKeyConfigured)
-      : Boolean(appState.settings.realtimeOpenAIAPIKeyConfigured);
+      : realtimeProvider === "codexSubscription"
+        ? Boolean(appState.settings.codexSubscriptionVoiceAvailable)
+        : Boolean(appState.settings.realtimeOpenAIAPIKeyConfigured);
     if (!realtimeKeyConfigured) {
       setLiveVoiceStatus("error");
       setLiveVoiceStatusText(realtimeProvider === "geminiLive"
         ? "Add a Google Gemini API key in Settings, then press Live again."
-        : "Add an OpenAI API key in Settings, then press Live again.");
+        : realtimeProvider === "codexSubscription"
+          ? appState.settings.codexSubscriptionVoiceMessage
+          : "Add an OpenAI API key in Settings, then press Live again.");
       void window.openAssistElectron?.openSettingsWindow?.("voice");
       return;
     }
     if (nativeVoiceActiveRef.current) await stopVoiceInput();
     recognitionRef.current?.abort();
     await stopLiveVoice("connecting", "Connecting Live Voice...", { cancelPendingStart: false });
+    // The previous transport is now an expected close. New events belong to a
+    // fresh session unless their provider thread ID matches the bounded stopped set.
+    liveVoiceExpectedStopRef.current = false;
     const startToken = ++liveVoiceStartTokenRef.current;
     const startStillCurrent = () => liveVoiceStartTokenRef.current === startToken;
     liveVoiceSharedImageKeysRef.current.clear();
@@ -33233,6 +36627,83 @@ function AppInner() {
       const contextProjectName = options.contextProjectName
         || (requestedContextProject?.kind === "folder" ? undefined : requestedContextProject?.title);
       const contextThreadID = options.contextThreadID || selectedThreadForFallback?.id || targetThreadID;
+      let subscriptionStream: MediaStream | null = null;
+      let subscriptionOfferSdp: string | undefined;
+      if (realtimeProvider === "codexSubscription") {
+        const selectedMicrophoneUID = appState.settings.autoDetectMicrophone === false
+          ? appState.settings.selectedMicrophoneUID?.trim()
+          : "";
+        const supportedAudioConstraints = navigator.mediaDevices.getSupportedConstraints?.() as
+          | (MediaTrackSupportedConstraints & { voiceIsolation?: boolean })
+          | undefined;
+        const audioProcessing: MediaTrackConstraints & { voiceIsolation?: boolean } = {
+          echoCancellation: liveVoiceEchoGuardEnabledRef.current,
+          noiseSuppression: true,
+          autoGainControl: false,
+          channelCount: 1,
+          ...(supportedAudioConstraints?.voiceIsolation ? { voiceIsolation: true } : {})
+        };
+        setLiveVoiceStatusText("Opening microphone for Codex Voice...");
+        try {
+          subscriptionStream = await navigator.mediaDevices.getUserMedia({
+            audio: selectedMicrophoneUID
+              ? { deviceId: { exact: selectedMicrophoneUID }, ...audioProcessing }
+              : { ...audioProcessing }
+          });
+        } catch (microphoneError) {
+          if (!selectedMicrophoneUID || (mediaErrorName(microphoneError) !== "OverconstrainedError" && mediaErrorName(microphoneError) !== "NotFoundError")) {
+            throw new Error(mediaErrorMessage(microphoneError));
+          }
+          subscriptionStream = await navigator.mediaDevices.getUserMedia({ audio: { ...audioProcessing } }).catch((fallbackError) => {
+            throw new Error(mediaErrorMessage(fallbackError));
+          });
+        }
+        if (!startStillCurrent()) {
+          subscriptionStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        const subscriptionWebRTC = new CodexSubscriptionWebRTC({
+          onConnectionState: (state) => {
+            if (state === "connected") {
+              setLiveVoiceStatus("listening");
+              setLiveVoiceStatusText("Codex Voice listening");
+            } else if (state === "disconnected") {
+              setLiveVoiceStatusText("Codex Voice is reconnecting...");
+            }
+          },
+          onProtocolEvent: (protocolEvent) => {
+            const protocolType = String(protocolEvent.type || "").toLowerCase();
+            if (protocolType.includes("speech_started")) {
+              // Only a real user turn clears the spoken caption. Codex emits
+              // speech_started for its own barge-in detection too, and wiping
+              // the caption on those made the just-spoken answer blink away.
+              if (!liveVoiceMeterBus.outputPlaying) {
+                liveVoiceCaptionBus.setAssistant("");
+                setLiveVoiceCodexPhase("listening", "Listening...");
+              }
+            } else if (protocolType.includes("response.audio.delta") || protocolType.includes("output_audio")) {
+              setLiveVoiceCodexPhase("speaking", "Codex Voice speaking");
+            } else if ((protocolType.includes("response.done") || protocolType.includes("audio.done")) && !liveVoiceMeterBus.outputPlaying) {
+              setLiveVoiceCodexPhase("listening", "Codex Voice listening");
+            }
+          },
+          onAudioPlaying: (playing) => {
+            liveVoiceMeterBus.outputPlaying = playing;
+            if (playing) {
+              setLiveVoiceCodexPhase("speaking", "Codex Voice speaking");
+            } else if (liveVoiceActiveRef.current) {
+              setLiveVoiceCodexPhase("listening", "Codex Voice listening");
+            }
+          },
+          onError: (message) => {
+            if (liveVoiceActiveRef.current || liveVoiceStatusRef.current === "connecting") {
+              void stopLiveVoice("error", message);
+            }
+          }
+        });
+        codexSubscriptionWebRTCRef.current = subscriptionWebRTC;
+        subscriptionOfferSdp = await subscriptionWebRTC.prepare(subscriptionStream);
+      }
       console.debug("[OpenAssist Realtime conversation] start requested", {
         threadId: targetThreadID,
         provider: startProvider,
@@ -33251,7 +36722,8 @@ function AppInner() {
           contextResources,
           contextProjectID,
           contextProjectName,
-          contextThreadID
+          contextThreadID,
+          webrtcOfferSdp: subscriptionOfferSdp
         }),
         liveVoiceConnectTimeoutMs,
         `Realtime conversation did not connect. Check the ${realtimeProviderName} API key and realtime model in Settings.`
@@ -33263,6 +36735,9 @@ function AppInner() {
       console.debug("[OpenAssist Realtime conversation] start result", result);
       if (!result) throw new Error("Realtime conversation is not ready in this build.");
       if (!result.ok) throw new Error(result.error || "Could not start Realtime conversation.");
+      liveVoiceProviderThreadIDRef.current = typeof result.providerThreadId === "string"
+        ? result.providerThreadId.trim()
+        : "";
       const liveThreadID = usableOpenAssistThreadID(result.threadId || targetThreadID);
       if (liveThreadID) {
         // The bridge may have rotated to a fresh day-log thread; persist its ID so
@@ -33311,6 +36786,39 @@ function AppInner() {
         [...recentThreadImageAttachments(), ...composerAttachments],
         "The current OpenAssist thread already has image context. Use it if the user says this, image, screenshot, diagram, photo, or attachment."
       );
+      if (realtimeProvider === "codexSubscription") {
+        if (!subscriptionStream || !codexSubscriptionWebRTCRef.current) {
+          throw new Error("Codex Voice audio was not prepared.");
+        }
+        if (!startStillCurrent()) {
+          subscriptionStream.getTracks().forEach((track) => track.stop());
+          codexSubscriptionWebRTCRef.current.close();
+          codexSubscriptionWebRTCRef.current = null;
+          await api.stop().catch(() => undefined);
+          return;
+        }
+        const context = new AudioContext();
+        const source = context.createMediaStreamSource(subscriptionStream);
+        const processor = context.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (event) => {
+          if (!liveVoiceActiveRef.current || liveVoiceMutedRef.current) {
+            liveVoiceMeterBus.inputLevel = 0;
+            return;
+          }
+          liveVoiceMeterBus.inputLevel = rmsForFloatChunk(event.inputBuffer.getChannelData(0));
+        };
+        source.connect(processor);
+        processor.connect(context.destination);
+        liveVoiceStreamRef.current = subscriptionStream;
+        liveVoiceInputContextRef.current = context;
+        liveVoiceSourceRef.current = source;
+        liveVoiceProcessorRef.current = processor;
+        liveVoiceMicrophoneReadyRef.current = true;
+        liveVoiceActiveRef.current = true;
+        setLiveVoiceStatus("listening");
+        setLiveVoiceStatusText("Codex Voice listening");
+        return;
+      }
       const selectedMicrophoneUID = appState.settings.autoDetectMicrophone === false
         ? appState.settings.selectedMicrophoneUID?.trim()
         : "";
@@ -33425,6 +36933,13 @@ function AppInner() {
       }
       if (action === "toggleMute") {
         toggleLiveVoiceMuted();
+        return;
+      }
+      // Deterministic mute/unmute for dictation: the main process auto-mutes
+      // the live mic while a dictation capture runs and restores it after.
+      if (action === "muteMic" || action === "unmuteMic") {
+        const shouldMute = action === "muteMic";
+        if (liveVoiceMutedRef.current !== shouldMute) toggleLiveVoiceMuted();
         return;
       }
       if (action === "stop") {
@@ -33616,11 +37131,60 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
-    return openAssistRealtimeAPI()?.onEvent((event) => {
+	    return openAssistRealtimeAPI()?.onEvent((event) => {
 	      const type = event.type || "";
 	      const eventNames = realtimeEventNames(event);
 	      const lowerType = eventNames.join(" ").toLowerCase();
-	      if (type === "thread/realtime/conversation/committed") {
+	      if (type === "thread/realtime/sdp") {
+	        const payload = event.payload && typeof event.payload === "object"
+	          ? event.payload as Record<string, unknown>
+	          : {};
+	        // SDP is line-oriented. Preserve Codex's answer exactly; trimming the
+	        // final CRLF makes Chromium reject an otherwise valid ICE line.
+	        const sdp = typeof payload.sdp === "string" ? payload.sdp : "";
+	        if (sdp && codexSubscriptionWebRTCRef.current) {
+	          void codexSubscriptionWebRTCRef.current.acceptAnswer(sdp).catch((error) => {
+	            const message = error instanceof Error ? error.message : "Codex Voice could not finish its secure audio connection.";
+	            void stopLiveVoice("error", message);
+	          });
+	        }
+		        return;
+		      }
+	      if (type === "thread/realtime/started") {
+	        const payload = event.payload && typeof event.payload === "object"
+	          ? event.payload as Record<string, unknown>
+	          : {};
+	        const providerThreadID = typeof payload.providerThreadId === "string"
+	          ? payload.providerThreadId.trim()
+	          : "";
+	        if (providerThreadID) liveVoiceProviderThreadIDRef.current = providerThreadID;
+	        liveVoiceExpectedStopRef.current = false;
+	        return;
+	      }
+		      if (type === "thread/realtime/navigation/requested") {
+		        const payload = event.payload && typeof event.payload === "object"
+		          ? event.payload as Record<string, unknown>
+		          : {};
+		        const destination = typeof payload.destination === "string" ? payload.destination : "";
+		        if (destination === "today") {
+		          void openPlannerDay(plannerDayID());
+		        } else if (destination === "notes") {
+		          setActiveView("notes");
+		        } else if (destination === "threads") {
+		          setActiveView("threads");
+		        } else if (destination === "voice_log") {
+		          const voiceThreadID = typeof payload.threadId === "string" ? payload.threadId : "";
+		          setActiveView("threads");
+		          setAssistantPanel(null);
+		          if (voiceThreadID) void selectThread(voiceThreadID, { syncProjectFilter: false });
+		        } else if (destination === "review_inbox") {
+		          setActiveView("reviewInbox");
+		        } else if (destination === "settings") {
+		          openSettings();
+		        }
+		        return;
+		      }
+		      if (type === "thread/realtime/conversation/committed") {
 	        const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
 	        const threadID = typeof payload.threadId === "string" ? payload.threadId : selectedThreadIDRef.current;
 	        if (threadID) refreshDelegatedThreadAfterRun(threadID);
@@ -33643,6 +37207,13 @@ function AppInner() {
 	            body: responseText.slice(0, 200) || "The result is ready in Today Live Voice."
 	          });
 	        }
+	        return;
+	      }
+	      if (type === "thread/realtime/subscription/output-gate") {
+	        const payload = event.payload && typeof event.payload === "object"
+	          ? event.payload as Record<string, unknown>
+	          : {};
+	        codexSubscriptionWebRTCRef.current?.setOutputSuppressed(payload.state === "hold");
 	        return;
 	      }
 	      if (type === "thread/realtime/continuity/status") {
@@ -33731,6 +37302,20 @@ function AppInner() {
           }
           if (hasPendingApproval(activity)) {
             void refreshKnowledgeApprovals();
+          }
+          // Direct tool work (knowledge lookups, Apple bridge calls…) feeds the
+          // HUD's work chip so the user can SEE the assistant is doing
+          // something — "Checking…" with no visible progress read as stuck.
+          // The activity source never clobbers spoken captions.
+          if (activity.activityKind === "realtimeDirectWork") {
+            if (activity.activityStatus === "running") {
+              liveVoiceCaptionBus.setAssistant(
+                (activity.activityDetail || activity.text || "Working on it").trim(),
+                "activity"
+              );
+            } else if (liveVoiceCaptionBus.assistantSource === "activity") {
+              liveVoiceCaptionBus.setAssistant("", "activity");
+            }
           }
           // Agent progress belongs to its work card. It must not overwrite the
           // live voice phase, captions, or visible Voice Log conversation.
@@ -33827,6 +37412,16 @@ function AppInner() {
         setLiveVoiceListeningStatus();
         return;
       }
+      if (isRealtimeOutputAudioDoneEvent(type, lowerType)) {
+        const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+        const deliveryID = String(payload.deliveryID ?? payload.delivery_id ?? "").trim();
+        const itemID = String(payload.itemID ?? payload.item_id ?? "").trim() || undefined;
+        if (deliveryID) {
+          liveVoicePlaybackServerDoneRef.current.add(deliveryID);
+          finishLiveVoicePlaybackIfDrained(deliveryID, itemID);
+        }
+        return;
+      }
       if (isRealtimeOutputAudioDeltaEvent(type, lowerType)) {
         setLiveVoiceStatus("speaking");
         setLiveVoiceStatusText((current) => current && /^heard:/i.test(current) ? current : `${liveVoiceRuntimeLabel()} speaking`);
@@ -33838,7 +37433,10 @@ function AppInner() {
       }
       if (lowerType.includes("transcript")) {
         const role = realtimePayloadRole(event.payload);
-        const text = realtimePayloadText(event.payload).trim();
+        // Keep the provider's own spacing on streaming deltas — trimming them
+        // here glued adjacent words together in the caption.
+        const rawText = realtimePayloadText(event.payload);
+        const text = rawText.trim();
         const transcriptDone = lowerType.includes("done") || lowerType.includes("completed");
         // OpenAI/Gemini name the streams "input_audio_transcription" (user) and
         // "output_audio_transcript" (assistant). Fall back to the payload role
@@ -33849,7 +37447,7 @@ function AppInner() {
         if (isAssistantTranscript) {
           if (text) {
             liveVoiceCaptionBus.setAssistant(
-              transcriptDone ? text : joinCaptionDelta(liveVoiceCaptionBus.assistant, text)
+              transcriptDone ? text : joinCaptionDelta(liveVoiceCaptionBus.assistant, rawText)
             );
           }
           if (
@@ -33866,7 +37464,7 @@ function AppInner() {
             // A finished utterance is the start of a new turn; clear the old reply.
             liveVoiceCaptionBus.setAssistant("");
           } else {
-            liveVoiceCaptionBus.setUser(joinCaptionDelta(liveVoiceCaptionBus.user, text));
+            liveVoiceCaptionBus.setUser(joinCaptionDelta(liveVoiceCaptionBus.user, rawText));
           }
           setLiveVoiceStatusText(transcriptDone ? `Heard: ${text}` : text);
         }
@@ -33878,12 +37476,41 @@ function AppInner() {
       if (lowerType.includes("closed")) {
         const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
         const reason = typeof payload.reason === "string" ? payload.reason : "";
+        const providerThreadID = typeof payload.providerThreadId === "string"
+          ? payload.providerThreadId.trim()
+          : "";
+        const stoppedProviderThread = Boolean(
+          providerThreadID
+          && liveVoiceStoppedProviderThreadIDsRef.current.has(providerThreadID)
+        );
+        const currentProviderThreadID = liveVoiceProviderThreadIDRef.current;
+        if (
+          providerThreadID
+          && currentProviderThreadID
+          && providerThreadID !== currentProviderThreadID
+          && !stoppedProviderThread
+        ) {
+          return;
+        }
         liveVoiceActiveRef.current = false;
-        if (liveVoiceExpectedStopRef.current || reason === "stopped" || reason === "replaced") {
+        if (
+          liveVoiceExpectedStopRef.current
+          || stoppedProviderThread
+          || isIntentionalLiveVoiceCloseReason(reason)
+        ) {
+          liveVoiceExpectedStopRef.current = false;
+          if (!providerThreadID || providerThreadID === currentProviderThreadID) {
+            liveVoiceProviderThreadIDRef.current = "";
+          }
+          liveVoiceStatusRef.current = "idle";
           setLiveVoiceStatus("idle");
           setLiveVoiceStatusText(undefined);
           return;
         }
+        if (!providerThreadID || providerThreadID === currentProviderThreadID) {
+          liveVoiceProviderThreadIDRef.current = "";
+        }
+        liveVoiceStatusRef.current = "error";
         setLiveVoiceStatus("error");
         setLiveVoiceStatusText(reason ? `Realtime conversation disconnected: ${reason}` : "Realtime conversation disconnected before it was ready.");
         return;
@@ -34048,10 +37675,12 @@ function AppInner() {
           ? { requestID: pendingApproval.id, summary: pendingApproval.goal || pendingApproval.action }
           : null,
         links: hudLinks,
-        // The main window already shows the Live Voice state; the floating orb
-        // only belongs on screen when the window itself is not visible
-        // (minimized or hidden) — not merely unfocused.
-        suppressForAppFocus: appWindowVisible
+        // The main window already shows the Live Voice state; the floating
+        // pill only leaves the screen while the user is actually IN the app
+        // (visible AND focused). Occlusion alone used to count — macOS flips
+        // visibilityState as other windows cover/uncover the app, which
+        // flapped the pill in and out during delegated work.
+        suppressForAppFocus: appWindowVisible && appWindowFocused
       };
       const hudContentKey = JSON.stringify({ ...hudPayload, level: 0 });
       if (hudContentKey === lastHUDContentKey) {
@@ -34062,7 +37691,7 @@ function AppInner() {
       void window.openAssistElectron?.updateVoiceHUD?.(hudPayload);
     };
     updateLiveVoiceHUD();
-    if (!liveVoiceHUDVisible || liveVoiceStatus === "error" || appWindowVisible) return;
+    if (!liveVoiceHUDVisible || liveVoiceStatus === "error" || (appWindowVisible && appWindowFocused)) return;
     const timer = window.setInterval(updateLiveVoiceHUD, 120);
     return () => window.clearInterval(timer);
   }, [
@@ -34074,6 +37703,7 @@ function AppInner() {
     appState.settings.waveformTheme,
     activeRealtimeWorkTasks,
     appWindowVisible,
+    appWindowFocused,
     knowledgeApprovalRequests,
     liveVoiceStatus,
     liveVoiceStatusText,
@@ -34443,6 +38073,9 @@ function AppInner() {
 
   const cleanupTemporaryThread = async (threadID?: string) => {
     if (!threadID) return;
+    // Side chats never reach this path: they are filtered out of
+    // appState.threads by the bridge, and promoteTemporarySession rejects
+    // kind === "sideChat" as a backstop.
     const thread = appState.threads.find((item) => item.id === threadID);
     if (!thread?.isTemporary) return;
     // Do NOT discard a temporary thread that actually ran a turn — the backend
@@ -34481,6 +38114,7 @@ function AppInner() {
     const requestID = selectThreadRequestRef.current + 1;
     selectThreadRequestRef.current = requestID;
     if (selectedThreadID && selectedThreadID !== threadID) {
+      void window.openAssistElectron?.flushThreadMemory?.(selectedThreadID);
       await cleanupTemporaryThread(selectedThreadID);
     }
     clearThreadUnread(threadID);
@@ -34516,10 +38150,53 @@ function AppInner() {
       if (usableOpenAssistThreadID(threadID)) void selectThreadRef.current(threadID);
     };
     window.addEventListener(OPEN_THREAD_LINK_EVENT, onThreadLink);
+    const unsubscribeSideChatDestroyed = window.openAssistElectron?.onSideChatDestroyed?.((event) => {
+      if (sideChatRef.current && sideChatRef.current.threadID.toLowerCase() === String(event.threadID ?? "").toLowerCase()) {
+        setSideChat(null);
+        setAssistantPanel((current) => (current === "side-chat" ? null : current));
+        if (event.reason === "idle") setProviderStatus("Side chat expired after 30 minutes of inactivity.");
+      }
+    });
+    // Selecting text inside the main chat surfaces a floating "Ask in side
+    // chat" button above the selection (screenshot-style selection toolbar).
+    const readChatSelection = () => {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim() ?? "";
+      if (!selection || selection.isCollapsed || text.length < 4 || selection.rangeCount === 0) {
+        setChatSelectionPopover(null);
+        return;
+      }
+      const anchor = selection.anchorNode;
+      const anchorElement = anchor instanceof Element ? anchor : anchor?.parentElement;
+      if (!anchorElement?.closest(".chat-scroll") || anchorElement.closest(".side-chat-panel")) {
+        setChatSelectionPopover(null);
+        return;
+      }
+      const rect = selection.getRangeAt(0).getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        setChatSelectionPopover(null);
+        return;
+      }
+      setChatSelectionPopover({
+        text,
+        x: Math.min(Math.max(rect.left + rect.width / 2, 120), window.innerWidth - 120),
+        y: Math.max(rect.top, 56)
+      });
+    };
+    const onChatPointerUp = () => window.setTimeout(readChatSelection, 0);
+    const onChatSelectionCollapse = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) setChatSelectionPopover(null);
+    };
+    document.addEventListener("pointerup", onChatPointerUp);
+    document.addEventListener("selectionchange", onChatSelectionCollapse);
     return () => {
       window.removeEventListener("focus", onFocus);
       window.removeEventListener(OPEN_THREAD_LINK_EVENT, onThreadLink);
       unsubscribeOpenThread?.();
+      unsubscribeSideChatDestroyed?.();
+      document.removeEventListener("pointerup", onChatPointerUp);
+      document.removeEventListener("selectionchange", onChatSelectionCollapse);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -34574,13 +38251,22 @@ function AppInner() {
   const createThreadWithMode = async (isTemporary: boolean) => {
     await cleanupTemporaryThread(selectedThreadID);
     const selectedProject = appState.projects.find((project) => sameID(project.id, selectedProjectID));
-    const targetProjectID = selectedProject?.kind === "folder" ? undefined : selectedProjectID;
-    if (targetProjectID && selectedProject && !selectedProject.linkedFolderPath?.trim()) {
-      const peerFolder = (selectedProject.peerLinkedFolders ?? []).find((hint) => hint?.path?.trim());
+    // A folder is just a grouping container, not a chattable project. Picking
+    // "new thread" while a folder is selected used to drop straight to
+    // ungrouped, which looked like the thread "left" the folder the user was
+    // in. Prefer the folder's first real child project instead, so the
+    // thread still lands somewhere inside what the user was looking at.
+    const folderDefaultChild = selectedProject?.kind === "folder"
+      ? appState.projects.find((project) => project.kind !== "folder" && sameID(project.parentID, selectedProject.id))
+      : undefined;
+    const effectiveSelectedProject = selectedProject?.kind === "folder" ? folderDefaultChild : selectedProject;
+    const targetProjectID = selectedProject?.kind === "folder" ? folderDefaultChild?.id : selectedProjectID;
+    if (targetProjectID && effectiveSelectedProject && !effectiveSelectedProject.linkedFolderPath?.trim()) {
+      const peerFolder = (effectiveSelectedProject.peerLinkedFolders ?? []).find((hint) => hint?.path?.trim());
       if (peerFolder?.path) {
-        const choice = await askThreadFolderWarning(selectedProject, peerFolder);
+        const choice = await askThreadFolderWarning(effectiveSelectedProject, peerFolder);
         if (choice === "link") {
-          await linkProjectFolderFromMenu(selectedProject);
+          await linkProjectFolderFromMenu(effectiveSelectedProject);
           return;
         }
         if (choice !== "start") return;
@@ -35040,6 +38726,29 @@ function AppInner() {
     if (result?.scheduledDay) applyDailyItemMutationResult({ day: result.scheduledDay, items: result.scheduledItems ?? [] });
   };
 
+  const moveDailyItemToDay = async (dayID: string, itemID: string, targetDayID: string) => {
+    if (sameID(dayID, targetDayID)) return;
+    await flushNoteDraftBeforeNavigation();
+    const result = await window.openAssistElectron?.moveDailyItemToDay?.(dayID, itemID, targetDayID);
+    if (!result) return;
+
+    const currentDayID = selectedNoteTargetRef.current?.scope === "planner"
+      ? selectedNoteTargetRef.current.dayID
+      : selectedPlannerDayID;
+    if (sameID(currentDayID, targetDayID)) {
+      applyDailyItemMutationResult(result);
+    } else if (sameID(currentDayID, dayID)) {
+      const [sourceDay, sourceItems] = await Promise.all([
+        window.openAssistElectron?.loadPlannerDay?.(dayID),
+        window.openAssistElectron?.listDailyItems?.(dayID)
+      ]);
+      if (sourceDay) applyDailyItemMutationResult({ day: sourceDay, items: sourceItems ?? [] });
+    }
+
+    const days = await window.openAssistElectron?.listPlannerDays?.(90, currentDayID);
+    if (days) setAppState((current) => ({ ...current, plannerDays: days }));
+  };
+
   const scheduleBacklogItem = async (itemID: string, targetDayID: string) => {
     await flushNoteDraftBeforeNavigation();
     const result = await window.openAssistElectron?.scheduleBacklogItem?.(itemID, targetDayID);
@@ -35055,7 +38764,7 @@ function AppInner() {
   const scheduleSelectionToPlanner = async (request: PlannerScheduleRequest) => {
     const result = await window.openAssistElectron?.scheduleSelectionToPlanner(request);
     if (!result) return;
-    const resultItems = await window.openAssistElectron?.listDailyItems?.(result.id);
+    let effectiveResult = result;
     const days = await window.openAssistElectron?.listPlannerDays?.(90, result.id);
     setAppState((current) => ({
       ...current,
@@ -35066,17 +38775,55 @@ function AppInner() {
     }));
     if (request.sourceTextAfterMove && selectedNoteTargetRef.current?.scope === "planner") {
       const sourceDayID = selectedNoteTargetRef.current.dayID;
-      await window.openAssistElectron?.savePlannerDay(sourceDayID, request.sourceTextAfterMove);
+      const sourceDetail = noteDetailRef.current as (NoteDetail & Partial<PlannerDayDetail>) | null;
+      if (!sourceDetail?.revision || !sameID(sourceDetail.id, sourceDayID)) {
+        throw new Error("Reload this planner day before moving selected text.");
+      }
+      const mutation: PlannerEditorMutation = {
+        mutationID: crypto.randomUUID(),
+        containerID: sourceDayID,
+        baseRevision: sourceDetail.revision,
+        baseMarkdown: sourceDetail.markdown,
+        markdown: request.sourceTextAfterMove
+      };
+      const saveResult = await window.openAssistElectron?.applyPlannerEditorMutation(mutation);
+      if (!saveResult) throw new Error("The source planner day did not save.");
+      if (saveResult.status === "conflict") {
+        setPlannerConflictReview({
+          mutation,
+          newerRevision: saveResult.document.revision,
+          conflicts: saveResult.conflicts,
+          choices: {}
+        });
+        throw new Error("The source planner changed while this move was being saved. Review the changes to finish it.");
+      }
+      if (saveResult.status === "invalid") {
+        throw new Error(saveResult.issues.map((issue) => (
+          `${issue.line ? `Line ${issue.line}: ` : ""}${issue.message}`
+        )).join(" "));
+      }
+      if (saveResult.status === "failed") throw new Error(saveResult.error);
+      const savedSourceDetail: PlannerDayDetail = {
+        id: sourceDayID,
+        title: sourceDetail.title,
+        subtitle: sourceDetail.subtitle ?? sourceDayID,
+        path: sourceDetail.path ?? "",
+        markdown: saveResult.document.markdown,
+        revision: saveResult.document.revision,
+        schemaVersion: saveResult.document.schemaVersion
+      };
+      if (sameID(sourceDayID, result.id)) effectiveResult = savedSourceDetail;
       lastSavedNoteKeyRef.current = noteTargetKey(selectedNoteTargetRef.current);
-      lastSavedNoteDraftRef.current = request.sourceTextAfterMove.replace(/\r\n/g, "\n");
+      lastSavedNoteDraftRef.current = savedSourceDetail.markdown;
       setNoteSaveStatus({ kind: "saved", at: Date.now() });
     }
-    if (activeViewRef.current === "today" && selectedNoteTargetRef.current?.scope === "planner" && selectedNoteTargetRef.current.dayID === result.id) {
-      setNoteDetail(result);
-      setNoteDraft(result.markdown);
+    const resultItems = await window.openAssistElectron?.listDailyItems?.(effectiveResult.id);
+    if (activeViewRef.current === "today" && selectedNoteTargetRef.current?.scope === "planner" && selectedNoteTargetRef.current.dayID === effectiveResult.id) {
+      setNoteDetail(effectiveResult);
+      setNoteDraft(effectiveResult.markdown);
       setDailyItems(resultItems ?? []);
       lastSavedNoteKeyRef.current = noteTargetKey(selectedNoteTargetRef.current);
-      lastSavedNoteDraftRef.current = result.markdown;
+      lastSavedNoteDraftRef.current = effectiveResult.markdown;
     }
   };
 
@@ -35967,6 +39714,17 @@ function AppInner() {
     await refreshAppState();
   };
 
+  const reorderProjectFromSidebar = async (projectID: string, targetProjectID: string, position: "before" | "after") => {
+    try {
+      await window.openAssistElectron?.reorderProject?.(projectID, targetProjectID, position);
+    } catch (error) {
+      // Expected for invalid drops (a group into its own subtree); anything
+      // else (e.g. a stale main process without the IPC handler) must be loud.
+      console.warn("Project reorder failed:", error instanceof Error ? error.message : error);
+    }
+    await refreshAppState();
+  };
+
   const hideProjectFromMenu = async (project: ProjectItem) => {
     if (!window.confirm(`Hide "${project.title}" from the sidebar?`)) return;
     await window.openAssistElectron?.hideProject(project.id);
@@ -36042,6 +39800,40 @@ function AppInner() {
       ...current,
       threads: current.threads.map((item) => sameID(item.id, updated.id) ? { ...item, ...updated } : item)
     }));
+  };
+
+  const clearSelectedLiveVoiceLog = async () => {
+    const threadID = selectedThreadIDRef.current ?? selectedThreadID ?? threadDetail?.threadID;
+    const selectedThread = appState.threads.find((item) => threadID && sameID(item.id, threadID));
+    if (!threadID || !isTodayLiveVoiceThread(selectedThread ?? { id: threadID, title: threadDetail?.title }, readTodayLiveVoiceThreadID())) {
+      return;
+    }
+    if (!window.confirm("Clear this day’s Voice Log? Its conversation and Agent Work history will be removed. Notes, planner data, and saved memories will stay.")) {
+      return;
+    }
+    try {
+      const result = await window.openAssistElectron?.clearLiveVoiceLog(threadID);
+      if (!result?.ok) return;
+      patchThreadInAppState(result.thread);
+      setThreadDetail(result.detail);
+      setRealtimeWorkTasks((current) => {
+        const next = Object.fromEntries(
+          Object.entries(current).filter(([, task]) => !sameID(task.threadID, threadID))
+        );
+        realtimeWorkTasksRef.current = next;
+        return next;
+      });
+      if (sameID(realtimeWorkHistoryLoadedThreadRef.current, threadID)) {
+        realtimeWorkHistoryLoadedThreadRef.current = "";
+      }
+      const message = "Voice Log cleared.";
+      setProviderStatus(message);
+      window.setTimeout(() => setProviderStatus((current) => current === message ? null : current), 2200);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "This Voice Log could not be cleared.";
+      setProviderStatus(message);
+      window.setTimeout(() => setProviderStatus((current) => current === message ? null : current), 3200);
+    }
   };
 
   const archiveThreadFromMenu = async (thread: ThreadItem) => {
@@ -36512,6 +40304,17 @@ function AppInner() {
   const selectModel = (model: string) => {
     const threadID = currentThreadID();
     const targetProvider = activeProviderKey;
+    if (targetProvider === "claudeCode") {
+      const selectedOption = providerModelOptionsByBackend.claudeCode?.find((option) =>
+        option.id.trim().toLowerCase() === model.trim().toLowerCase()
+      );
+      const supportedEfforts = selectedOption?.supportedReasoningEfforts ?? [];
+      if (supportedEfforts.length && !supportedEfforts.includes(reasoningEffortID(reasoningEffort))) {
+        setReasoningEffort(reasoningEffortLabel(
+          selectedOption?.defaultReasoningEffort || supportedEfforts[0] || "high"
+        ));
+      }
+    }
     setAppState((current) => ({
       ...current,
       settings: { ...current.settings, model },
@@ -37016,7 +40819,17 @@ function AppInner() {
           usableThreadTitle(result.title) ??
           optimisticTitle;
         const completedAt = Date.now();
-        if (isThreadVisibleToUser(result.threadID)) {
+        // Side-chat runs never mark unread, never notify, and never surface in
+        // the sidebar — the docked panel is their only UI.
+        const isSideChatRun = sideChatThreadIDsRef.current.has(result.threadID);
+        // A finished main-chat turn means the side chat's copy is out of date —
+        // refresh the "N new messages" hint.
+        if (!isSideChatRun && sideChatRef.current && sameID(sideChatRef.current.parentThreadID, result.threadID)) {
+          void refreshSideChatContextStatus(sideChatRef.current.threadID);
+        }
+        if (isSideChatRun) {
+          // no unread/notification handling for side chats
+        } else if (isThreadVisibleToUser(result.threadID)) {
           clearThreadUnread(result.threadID);
         } else {
           // The user is in another thread, another app, or the window is
@@ -37048,6 +40861,8 @@ function AppInner() {
           });
         }
         setAppState((current) => {
+          // Side chats must never be inserted into the sidebar thread list.
+          if (isSideChatRun) return current;
           const fallbackThread: ThreadItem = {
             id: result.threadID,
             title: completedTitle,
@@ -37091,7 +40906,7 @@ function AppInner() {
       updateActiveThreadRun(liveRunThreadID, providerRunID, {
         statusText: wasStopped ? `${provider} stopped` : `${provider} failed`
       });
-      if (targetThreadID && !wasStopped && !isThreadVisibleToUser(targetThreadID)) {
+      if (targetThreadID && !wasStopped && !isThreadVisibleToUser(targetThreadID) && !sideChatThreadIDsRef.current.has(targetThreadID)) {
         markThreadUnread(targetThreadID);
         void window.openAssistElectron?.notifyThreadComplete?.({
           threadID: targetThreadID,
@@ -37127,6 +40942,92 @@ function AppInner() {
       clearActiveThreadRun(liveRunThreadID, providerRunID);
     }
     return undefined;
+  };
+
+  const refreshSideChatContextStatus = async (threadID?: string) => {
+    const target = threadID ?? sideChatRef.current?.threadID;
+    if (!target) return;
+    const status = await window.openAssistElectron?.sideChatContextStatus?.(target).catch(() => null);
+    if (status && sideChatRef.current?.threadID === target) setSideChatNewCount(status.newMessages ?? 0);
+  };
+  const syncSideChatContextNow = async () => {
+    const current = sideChatRef.current;
+    if (!current) return;
+    const result = await window.openAssistElectron?.syncSideChatContext?.(current.threadID).catch(() => null);
+    if (!result) return;
+    setSideChatNewCount(0);
+    setSideChatSyncNote(result.count > 0
+      ? `Synced ${result.count} new message${result.count === 1 ? "" : "s"} — included with your next question.`
+      : "Already up to date.");
+    window.setTimeout(() => setSideChatSyncNote(null), 6000);
+  };
+  const openSideChatPanel = async () => {
+    const parentThreadID = currentThreadID();
+    if (!parentThreadID) return;
+    const existing = sideChatRef.current;
+    if (existing && existing.parentThreadID.toLowerCase() === parentThreadID.toLowerCase()) {
+      setSideChat({ ...existing, open: true });
+      setAssistantPanel("side-chat");
+      void window.openAssistElectron?.touchSideChat?.(existing.threadID);
+      void refreshSideChatContextStatus(existing.threadID);
+      return;
+    }
+    // Switch the tab immediately; the panel shows its placeholder until the
+    // side chat arrives. Waiting on the IPC before switching felt laggy.
+    setAssistantPanel("side-chat");
+    try {
+      const result = await window.openAssistElectron?.openSideChat?.(parentThreadID);
+      if (!result) return;
+      sideChatThreadIDsRef.current.add(result.thread.id);
+      setSideChat({
+        parentThreadID,
+        threadID: result.thread.id,
+        title: result.detail.title || "Side chat",
+        messages: result.detail.messages ?? [],
+        open: true
+      });
+    } catch (error) {
+      setAssistantPanel((current) => (current === "side-chat" ? null : current));
+      setProviderStatus(`Could not open the side chat: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const closeSideChatPanel = () => {
+    setSideChat((current) => (current ? { ...current, open: false } : null));
+    setAssistantPanel((current) => (current === "side-chat" ? null : current));
+  };
+  const destroySideChatNow = async () => {
+    const current = sideChatRef.current;
+    if (!current) return;
+    setSideChat(null);
+    setSideChatSelection(null);
+    setAssistantPanel((currentPanel) => (currentPanel === "side-chat" ? null : currentPanel));
+    await window.openAssistElectron?.destroySideChat?.(current.threadID);
+  };
+  const askSelectionInSideChat = async () => {
+    const selectionText = chatSelectionPopover?.text;
+    setChatSelectionPopover(null);
+    window.getSelection()?.removeAllRanges();
+    if (!selectionText) return;
+    setSideChatSelection(selectionText);
+    await openSideChatPanel();
+  };
+  const sendSideChatMessage = async () => {
+    const current = sideChatRef.current;
+    const question = sideChatComposerText.trim();
+    if (!current || !question) return;
+    const selection = sideChatSelection?.trim();
+    const prompt = selection
+      ? `About this selected part of the main chat:\n"""\n${selection}\n"""\n\n${question}`
+      : question;
+    setSideChatComposerText("");
+    setSideChatSelection(null);
+    setSideChatSyncNote(null);
+    await sendMessage({ prompt, threadID: current.threadID, keepCurrentSurface: true });
+    const detail = await window.openAssistElectron?.loadThread(current.threadID).catch(() => null);
+    if (detail && sideChatRef.current?.threadID === current.threadID) {
+      setSideChat((state) => (state ? { ...state, messages: detail.messages ?? state.messages, title: detail.title || state.title } : state));
+    }
+    void refreshSideChatContextStatus(current.threadID);
   };
 
   const stopRealtimeDelegationRun = async (run: ActiveThreadRun) => {
@@ -37206,6 +41107,58 @@ function AppInner() {
       const message = error instanceof Error ? error.message : "Could not stop the current turn.";
       setProviderStatus(message);
     }
+  };
+
+  const queueComposerMessage = (threadID: string, text: string) => {
+    const queue = queuedComposerMessagesRef.current[threadID] ?? [];
+    queuedComposerMessagesRef.current[threadID] = [...queue, text];
+    const count = queue.length + 1;
+    setProviderStatus(count > 1
+      ? `${count} messages queued — they will send after the current task finishes.`
+      : "Message queued — it will send after the current task finishes.");
+  };
+
+  const queueComposerMessageForSelected = (text: string) => {
+    const threadID = selectedThreadIDRef.current ?? selectedThreadID;
+    if (!threadID) return;
+    queueComposerMessage(threadID, text);
+  };
+
+  // Enter while a task runs: steer it in place (Codex supports turn/steer).
+  // Providers without mid-turn steering fall back to the queue.
+  const steerComposerMessage = (text: string) => {
+    const threadID = selectedThreadIDRef.current ?? selectedThreadID;
+    if (!threadID) return;
+    void (async () => {
+      try {
+        const result = await window.openAssistElectron?.steerActiveTurn?.(threadID, text);
+        if (result?.ok) {
+          const runs = activeRunsForThread(activeThreadRunsRef.current, threadID);
+          const run = runs.find((candidate) => candidate.kind !== "realtimeDelegation") ?? runs[0];
+          if (run) {
+            updateActiveThreadRun(threadID, run.runID, {
+              messages: [...(run.messages ?? []), {
+                id: `local-steer-${Date.now()}`,
+                role: "user" as const,
+                text,
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+              }],
+              statusText: "Steering with your new message..."
+            });
+          }
+          setProviderStatus("Steered the running task.");
+          return;
+        }
+        queueComposerMessage(threadID, text);
+        if (result?.reason === "unsupported") {
+          setProviderStatus(`${result.provider ?? "This provider"} can't take mid-task steering — your message is queued and sends when the task finishes.`);
+        }
+      } catch (error) {
+        queueComposerMessage(threadID, text);
+        setProviderStatus(error instanceof Error ? `Could not steer (${error.message}) — message queued instead.` : "Could not steer — message queued instead.");
+      }
+    })();
   };
 
 	  if (activeView === "settings") {
@@ -37387,8 +41340,7 @@ function AppInner() {
         hiddenProjects={appState.hiddenProjects ?? []}
         liveVoiceThreads={liveVoiceThreads}
         liveVoiceActive={liveVoiceStatus !== "idle" && liveVoiceStatus !== "error"}
-        liveVoiceWorkCount={realtimeWorkTaskList.length}
-        liveVoiceWorkActive={activeRealtimeWorkTasks.length > 0}
+        liveVoiceWorkTasksByThreadID={liveVoiceWorkTasksByThreadID}
         threads={sidebarThreads}
         notes={appState.notes}
         threadNotes={appState.threadNotes}
@@ -37465,6 +41417,7 @@ function AppInner() {
         onLinkProjectFolder={(project) => { void linkProjectFolderFromMenu(project); }}
         onRemoveProjectFolderLink={(project) => { void removeProjectFolderLinkFromMenu(project); }}
         onMoveProjectToFolder={(project, folderID) => { void moveProjectToFolderFromMenu(project, folderID); }}
+        onReorderProject={(projectID, targetProjectID, position) => { void reorderProjectFromSidebar(projectID, targetProjectID, position); }}
         onHideProject={(project) => { void hideProjectFromMenu(project); }}
         onUnhideProject={(project) => { void unhideProjectFromMenu(project); }}
         onDeleteProject={(project) => { void deleteProjectFromMenu(project); }}
@@ -37648,10 +41601,13 @@ function AppInner() {
 	        onRemoveAttachment={removeComposerAttachment}
         onClearAttachmentError={() => setComposerAttachmentError(null)}
         onSend={sendMessage}
+        onSteerMessage={steerComposerMessage}
+        onQueueMessage={queueComposerMessageForSelected}
         onStop={stopMessage}
         onVoiceInput={toggleVoiceInput}
         onLiveVoice={toggleSurfaceLiveVoice}
         onTodayLiveVoice={toggleTodayLiveVoice}
+        onClearLiveVoiceLog={() => { void clearSelectedLiveVoiceLog(); }}
         onToggleLiveVoiceMuted={toggleLiveVoiceMuted}
         onOpenRealtimeSettings={openRealtimeSettings}
         onOpenKnowledgeSettings={openSettings}
@@ -37699,6 +41655,7 @@ function AppInner() {
         onUpsertBacklogItem={upsertBacklogItem}
         onToggleBacklogItem={toggleBacklogItem}
         onDeleteBacklogItem={deleteBacklogItem}
+        onMoveDailyItemToDay={moveDailyItemToDay}
         onMoveDailyItemToBacklog={moveDailyItemToBacklog}
         onScheduleBacklogItem={scheduleBacklogItem}
         onToggleAutomation={toggleAutomation}
@@ -37721,6 +41678,66 @@ function AppInner() {
         />
       </ScreenErrorBoundary>
       )}
+	      {plannerConflictReview && (
+	        <div className="planner-conflict-backdrop" role="presentation">
+	          <section className="planner-conflict-panel" role="dialog" aria-modal="true" aria-labelledby="planner-conflict-title">
+	            <header>
+	              <div>
+	                <strong id="planner-conflict-title">Review Changes</strong>
+	                <p>The same planner fields changed in two places. Choose what to keep.</p>
+	              </div>
+	              <IconButton label="Close review" onClick={() => setPlannerConflictReview(null)}>
+	                <X size={16} />
+	              </IconButton>
+	            </header>
+	            <div className="planner-conflict-list">
+	              {plannerConflictReview.conflicts.map((conflict) => (
+	                <article key={conflict.id} className="planner-conflict-row">
+	                  <div className="planner-conflict-name">
+	                    <strong>{conflict.path}</strong>
+	                    <span>{conflict.message}</span>
+	                  </div>
+	                  <div className="planner-conflict-options">
+	                    <button
+	                      type="button"
+	                      className={cx(plannerConflictReview.choices[conflict.path] === "mine" && "active")}
+	                      onClick={() => setPlannerConflictReview((current) => current ? {
+	                        ...current,
+	                        choices: { ...current.choices, [conflict.path]: "mine" }
+	                      } : current)}
+	                    >
+	                      <span>Keep mine</span>
+	                      <small>{plannerConflictValueLabel(conflict.mineValue)}</small>
+	                    </button>
+	                    <button
+	                      type="button"
+	                      className={cx(plannerConflictReview.choices[conflict.path] === "newer" && "active")}
+	                      onClick={() => setPlannerConflictReview((current) => current ? {
+	                        ...current,
+	                        choices: { ...current.choices, [conflict.path]: "newer" }
+	                      } : current)}
+	                    >
+	                      <span>Use newer</span>
+	                      <small>{plannerConflictValueLabel(conflict.newerValue)}</small>
+	                    </button>
+	                  </div>
+	                </article>
+	              ))}
+	            </div>
+	            <footer>
+	              <button type="button" className="soft-button" onClick={() => setPlannerConflictReview(null)}>Keep editing</button>
+	              <button
+	                type="button"
+	                className="primary-button"
+	                disabled={plannerConflictReview.conflicts.some((conflict) => !plannerConflictReview.choices[conflict.path])}
+	                onClick={() => { void applyPlannerConflictChoices(); }}
+	              >
+	                Apply choices
+	              </button>
+	            </footer>
+	          </section>
+	        </div>
+	      )}
 		      {!showNotchMiniTray && activeView !== "threads" && (
 		        <RealtimeTranscript
 	          active={liveVoiceStatus !== "idle" && liveVoiceStatus !== "error"}
@@ -37768,6 +41785,20 @@ function AppInner() {
 		          </motion.div>
 		        )}
 		      </AnimatePresence>
+		      {chatSelectionPopover && activeView === "threads" && currentThreadID() && (
+		        <div
+		          className="chat-selection-popover"
+		          style={{ left: chatSelectionPopover.x, top: chatSelectionPopover.y }}
+		        >
+		          <button
+		            onMouseDown={(event) => event.preventDefault()}
+		            onClick={() => { void askSelectionInSideChat(); }}
+		          >
+		            <GitBranch size={12} aria-hidden="true" />
+		            Ask in side chat
+		          </button>
+		        </div>
+		      )}
 	      {!showNotchMiniTray && shouldShowKnowledgeApprovalInbox && (
 	        <KnowledgeApprovalInbox
 	          requests={knowledgeApprovalRequests}
@@ -37795,6 +41826,32 @@ function AppInner() {
         threadNoteDraft={threadNoteDraft}
         threadMemory={threadMemory}
         filePreviewState={filePreviewState}
+        sideChatContent={sideChat && sideChat.parentThreadID.toLowerCase() === (selectedThreadID ?? "").toLowerCase() ? (
+          <SideChatDock
+            title={usableThreadTitle(threadDetail?.title) ?? usableThreadTitle(selectedThread?.title) ?? "this chat"}
+            messages={mergeActiveRunMessages(sideChat.messages, primaryMessageRun(activeThreadRuns, sideChat.threadID))}
+            running={Boolean(primaryMessageRun(activeThreadRuns, sideChat.threadID))}
+            statusText={primaryMessageRun(activeThreadRuns, sideChat.threadID)?.statusText}
+            composerText={sideChatComposerText}
+            selection={sideChatSelection}
+            newMainMessages={sideChatNewCount}
+            syncNote={sideChatSyncNote}
+            onSyncContext={() => { void syncSideChatContextNow(); }}
+            onClearSelection={() => setSideChatSelection(null)}
+            onComposerTextChange={setSideChatComposerText}
+            onSend={() => { void sendSideChatMessage(); }}
+            onClose={closeSideChatPanel}
+            onDestroy={() => { void destroySideChatNow(); }}
+            onOpenArtifact={openArtifactInApp}
+          />
+        ) : undefined}
+        onSwitchPanel={(nextPanel) => {
+          if (nextPanel === "side-chat") {
+            void openSideChatPanel();
+          } else {
+            void openThreadNote();
+          }
+        }}
         onClose={closeThreadNotePanel}
         onSessionInstructions={setSessionInstructions}
         onClearSessionInstructions={() => setSessionInstructions("")}
@@ -37803,6 +41860,8 @@ function AppInner() {
         onCreateThreadNote={createCurrentThreadNote}
         onSelectThreadNote={selectCurrentThreadNote}
         onRefreshMemory={() => void openMemory()}
+        onRetryMemory={() => { void retryCurrentThreadMemory(); }}
+        onSetMemoryPolicy={(patch) => { void setCurrentThreadMemoryPolicy(patch); }}
         onOpenFilePreviewExternal={openFilePreviewExternal}
         onRevealFilePreview={revealFilePreview}
         onCopyFilePreviewPath={copyFilePreviewPath}

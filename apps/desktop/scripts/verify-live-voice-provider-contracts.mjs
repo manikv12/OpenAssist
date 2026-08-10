@@ -6,7 +6,8 @@ const expectedNames = [
   "assistant_capability",
   "assistant_delegate_work",
   "assistant_task_status",
-  "assistant_cancel_task"
+  "assistant_cancel_task",
+  "assistant_open_view"
 ];
 
 assert.deepEqual(liveVoicePublicToolSpecs.map((tool) => tool.name), expectedNames);
@@ -37,6 +38,9 @@ const delegateTool = openAITools.find((tool) => tool.name === "assistant_delegat
 const geminiDelegateTool = geminiTools.find((tool) => tool.name === "assistant_delegate_work");
 assert.ok(delegateTool.parameters.properties.executionProfile);
 assert.ok(geminiDelegateTool.parameters.properties.executionProfile);
+assert.deepEqual(delegateTool.parameters.properties.mode.enum, ["new", "follow_up", "rerun"]);
+assert.ok(delegateTool.parameters.properties.taskID);
+assert.ok(geminiDelegateTool.parameters.properties.taskID);
 assert.deepEqual(
   Object.keys(delegateTool.parameters.properties.executionProfile.properties),
   ["depth", "complexity", "impact", "stakes", "modelPreference"]
@@ -50,12 +54,16 @@ assert.equal(
 );
 assert.equal(gemini.realtimeInputConfig.turnCoverage, "TURN_INCLUDES_ONLY_ACTIVITY");
 
-assert.match(openAI.instructions, /exactly four OpenAssist tools/i);
-assert.match(gemini.systemInstruction, /exactly four OpenAssist tools/i);
+assert.match(openAI.instructions, /exactly five OpenAssist tools/i);
+assert.match(gemini.systemInstruction, /exactly five OpenAssist tools/i);
 assert.match(openAI.instructions, /candidate counts or candidate lists are private working context/i);
 assert.match(gemini.systemInstruction, /do not switch source, provider, worker, or tool after a failure/i);
 assert.match(openAI.instructions, /current web research/i);
 assert.match(gemini.systemInstruction, /modelPreference to spark or sol only when the user explicitly names that model/i);
+assert.match(openAI.instructions, /mode=follow_up/i);
+assert.match(gemini.systemInstruction, /must not create another agent/i);
+assert.match(openAI.instructions, /mode=rerun/i);
+assert.match(gemini.systemInstruction, /backend reuses the original work goal/i);
 
 const descriptors = __realtimeProtocolTestHooks.liveVoiceCapabilityDescriptors(() => ({
   knowledge: { enabled: true },

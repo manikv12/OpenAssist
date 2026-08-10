@@ -80,6 +80,11 @@ assert.match(
   "The armed helper must block on a kqueue watch, not poll."
 );
 assert.match(
+  speechHelper,
+  /if selectedMicrophoneUID == nil && !shouldPreferExternalMicrophone[\s\S]*?try capture\.prepare\(\)/,
+  "The armed default-microphone helper must prepare AVAudioRecorder before the shortcut press."
+);
+assert.match(
   main,
   /adoptArmedVoiceHelper\(configuration\)/,
   "Voice starts must adopt the armed helper when available."
@@ -98,4 +103,60 @@ assert.match(
   main,
   /disarmVoiceHelper\("app quitting"\)/,
   "The armed helper must be torn down on quit (no orphan processes)."
+);
+assert.match(
+  main,
+  /const shouldStartHoldCapture = target === "holdToTalk"[\s\S]*startConfiguredVoiceInput\(warmConfiguration\)/,
+  "Hold-to-talk must start capture in the main process without waiting for the renderer."
+);
+assert.match(
+  main,
+  /if \(voiceStartInFlight\) return voiceStartInFlight;/,
+  "Renderer and main-process starts must join one in-flight capture operation."
+);
+assert.doesNotMatch(
+  main,
+  /armedVoiceHelperMaxAgeMs|armed helper expired/,
+  "A healthy parked helper must not be discarded only because it has been idle."
+);
+assert.match(
+  main,
+  /hold shortcut HUD visible elapsedMs=/,
+  "The shortcut-to-HUD timing must be logged."
+);
+assert.match(
+  main,
+  /hold shortcut microphone ready elapsedMs=/,
+  "The shortcut-to-microphone timing must be logged."
+);
+assert.match(
+  main,
+  /if \(armed\) \{\s*void cleanupStaleVoiceHelpers\("after warm cloud voice start", armed\.helperPid\);/,
+  "A warm cloud capture must not wait for the stale-process scan."
+);
+assert.match(
+  main,
+  /function shouldPreferExternalMicrophone[\s\S]*?return false;/,
+  "Automatic microphone selection must use the macOS default instead of an arbitrary external or virtual device."
+);
+assert.match(
+  main,
+  /title: "Open Assist Voice HUD"[\s\S]*?backgroundThrottling: false/,
+  "The preloaded HUD must not wait on Chromium's hidden-window timer throttling."
+);
+assert.match(
+  main,
+  /function prepaintVoiceHUDListeningState[\s\S]*?window\.updateOpenAssistVoiceHUD/,
+  "The hidden HUD must paint its listening UI before the first shortcut press."
+);
+const holdShortcutHUD = main.indexOf("const hudPresentation = shouldShowStandaloneHUD");
+const holdShortcutStart = main.indexOf("startConfiguredVoiceInput(warmConfiguration).then", holdShortcutHUD);
+assert.ok(
+  holdShortcutHUD >= 0 && holdShortcutStart > holdShortcutHUD,
+  "The prepainted HUD must be presented before capture work can block its first frame."
+);
+assert.match(
+  main,
+  /const voiceStart = hudPresentation\.then\([\s\S]*?setImmediate\(\(\) => \{[\s\S]*?startConfiguredVoiceInput\(warmConfiguration\)/,
+  "Capture must start on the next event-loop turn instead of blocking the HUD presentation."
 );

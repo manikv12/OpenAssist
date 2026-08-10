@@ -49,6 +49,17 @@ export class VoiceResultOutbox {
     return this.entries.get(deliveryID);
   }
 
+  removeTasks(taskIDs: ReadonlySet<string>) {
+    if (!taskIDs.size) return 0;
+    let removed = 0;
+    for (const [deliveryID, entry] of this.entries) {
+      if (!entry.taskID || !taskIDs.has(entry.taskID)) continue;
+      this.entries.delete(deliveryID);
+      removed += 1;
+    }
+    return removed;
+  }
+
   private prune() {
     if (this.entries.size <= 100) return;
     const removable = [...this.entries.values()]

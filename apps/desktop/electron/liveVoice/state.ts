@@ -1,4 +1,11 @@
-import type { VoiceBackgroundTask, VoicePhase, VoiceSnapshot, VoiceTurn, VoiceTurnPhase } from "./contracts.js";
+import type {
+  VoiceBackgroundTask,
+  VoicePhase,
+  VoiceSnapshot,
+  VoiceTurn,
+  VoiceTurnActionOwner,
+  VoiceTurnPhase
+} from "./contracts.js";
 
 export type VoiceStateEvent =
   | { type: "session_connecting"; at: number }
@@ -10,6 +17,8 @@ export type VoiceStateEvent =
   | { type: "turn_text_updated"; turnID: string; text: string; at: number }
   | { type: "turn_phase_changed"; turnID: string; phase: VoiceTurnPhase; at: number; error?: string }
   | { type: "turn_step_recorded"; turnID: string; callID: string; at: number }
+  | { type: "turn_action_owned"; turnID: string; actionOwner: VoiceTurnActionOwner; operationID?: string; taskID?: string; at: number }
+  | { type: "turn_ungrounded_action_claimed"; turnID: string; at: number }
   | { type: "turn_delivery_claimed"; turnID: string; deliveryID: string; at: number }
   | { type: "turn_interrupted"; turnID: string; at: number }
   | { type: "task_changed"; task: VoiceBackgroundTask; at: number }
@@ -68,6 +77,21 @@ export function reduceVoiceSnapshot(snapshot: VoiceSnapshot, event: VoiceStateEv
         ...turn,
         toolSteps: turn.toolSteps + 1,
         ownerCallID: turn.ownerCallID || event.callID,
+        updatedAt: event.at
+      }), event.at);
+    case "turn_action_owned":
+      return updateTurn(snapshot, event.turnID, (turn) => ({
+        ...turn,
+        actionOwner: event.actionOwner,
+        operationID: event.operationID || turn.operationID,
+        taskID: event.taskID || turn.taskID,
+        ungroundedActionClaim: false,
+        updatedAt: event.at
+      }), event.at);
+    case "turn_ungrounded_action_claimed":
+      return updateTurn(snapshot, event.turnID, (turn) => ({
+        ...turn,
+        ungroundedActionClaim: true,
         updatedAt: event.at
       }), event.at);
     case "turn_delivery_claimed":

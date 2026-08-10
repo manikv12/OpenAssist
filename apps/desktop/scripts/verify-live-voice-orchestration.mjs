@@ -68,6 +68,17 @@ const directAnswer = await Promise.resolve("You have one reminder today.");
 assert.equal(directAnswer, "You have one reminder today.");
 assert.equal(coordinator.get("task-1")?.state, "running");
 
+// A follow-up belongs to the existing running task and cannot create another
+// Agent Work item. Keep only compact, bounded follow-up history.
+coordinator.addFollowUp("task-1", "Use the other signed-in account instead.");
+assert.equal(coordinator.activeCount(), 1);
+assert.equal(coordinator.get("task-1")?.followUps.length, 1);
+assert.match(coordinator.get("task-1")?.progress ?? "", /Follow-up queued/i);
+for (let index = 0; index < 12; index += 1) {
+  coordinator.addFollowUp("task-1", `Refinement ${index}`);
+}
+assert.equal(coordinator.get("task-1")?.followUps.length, 10, "Follow-up history must stay bounded.");
+
 // Duplicate protection is scoped to one Voice Log, not the whole app.
 const duplicate = coordinator.start({
   taskID: "task-duplicate",
@@ -157,5 +168,18 @@ now += 11 * 60_000;
 const stale = staleCoordinator.evictStale(10 * 60_000);
 assert.equal(stale.length, 1);
 assert.equal(stale[0].state, "cancelled");
+
+// Clearing one day's Voice Log removes only that scope's finished Agent Work.
+// Running work blocks the clear so a late result cannot be lost.
+const clearCoordinator = new RealtimeTaskCoordinator(6, () => now);
+clearCoordinator.start({ taskID: "clear-active", scopeKey: "voice-log-clear", prompt: "Finish this first" });
+assert.deepEqual(clearCoordinator.clearScope("voice-log-clear"), { ok: false, reason: "active", removed: 0 });
+clearCoordinator.complete("clear-active", "Finished.");
+clearCoordinator.start({ taskID: "keep-other-day", scopeKey: "voice-log-keep", prompt: "Keep this result" });
+clearCoordinator.complete("keep-other-day", "Kept.");
+assert.deepEqual(clearCoordinator.clearScope("voice-log-clear"), { ok: true, removed: 1 });
+assert.equal(clearCoordinator.get("clear-active"), undefined);
+assert.equal(clearCoordinator.get("keep-other-day")?.result, "Kept.");
+assert.deepEqual(clearCoordinator.pendingDelivery().map((task) => task.taskID), ["keep-other-day"]);
 
 console.log("Live Voice orchestration checks passed.");
