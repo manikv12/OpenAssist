@@ -25,16 +25,10 @@ export class VoiceContainer extends Container<Env> {
   defaultPort = 8080;
   requiredPorts = [8080];
   sleepAfter = '15m';
-  enableInternet = false;
-  allowedHosts = [
-    'auth.openai.com',
-    'openai.com',
-    '*.openai.com',
-    'chatgpt.com',
-    '*.chatgpt.com',
-    'oaistatic.com',
-    '*.oaistatic.com',
-  ];
+  // Codex subscription sign-in and realtime both require outbound HTTPS.
+  // Cloudflare Containers currently exposes this as an all-or-nothing switch;
+  // the runtime itself still exposes no shell, files, computer, or API-key tools.
+  enableInternet = true;
   pingEndpoint = '/health';
   envVars: Record<string, string> = {
     CONTAINER_INTERNAL_TOKEN: this.env.CONTAINER_INTERNAL_TOKEN,
@@ -91,9 +85,23 @@ async function containerJson(
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const result: Record<string, unknown> = await response.json<Record<string, unknown>>().catch(() => ({}));
+  const responseText = await response.text();
+  let result: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(responseText || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) result = parsed as Record<string, unknown>;
+  } catch {
+    // Platform startup failures may not return JSON. Never echo their raw body.
+  }
   if (!response.ok) {
-    const message = typeof result.message === 'string' ? result.message : 'The subscription voice container could not complete this request.';
+    const safePlatformMessage = /^(Failed to start container:|Error proxying request to container:|Container suddenly disconnected)/.test(responseText)
+      ? responseText.slice(0, 500)
+      : '';
+    const message = typeof result.message === 'string'
+      ? result.message
+      : typeof result.error === 'string'
+        ? result.error
+        : safePlatformMessage || `The subscription voice container returned HTTP ${response.status}.`;
     throw new Response(message, { status: response.status });
   }
   return result;
@@ -158,7 +166,13 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (saved) return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
     const result = await containerJson(container, env, '/auth/status');
     if (result.status !== 'ready' || typeof result.authJson !== 'string') {
-      return json({ status: result.status === 'failed' ? 'failed' : 'pending', message: result.message });
+      return json({
+        status: result.status === 'failed' ? 'failed' : result.status === 'disconnected' ? 'disconnected' : 'pending',
+        message: result.message,
+        verificationUrl: result.verificationUrl,
+        userCode: result.userCode,
+        expiresInSeconds: result.expiresInSeconds,
+      });
     }
     await saveEncryptedAuth(env, objectKey, result.authJson);
     return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });

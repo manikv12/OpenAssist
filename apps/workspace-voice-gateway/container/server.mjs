@@ -147,7 +147,7 @@ class AppServer {
   }
 
   async start() {
-    const child = spawn('codex', ['--strict-config', 'app-server'], {
+    const child = spawn('codex', ['--strict-config', '--enable', 'realtime_conversation', 'app-server'], {
       cwd: emptyWorkspace,
       env: cleanEnvironment(),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -448,7 +448,13 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && url.pathname === '/auth/status') {
       const authJson = await savedAuthJson();
       if (authJson) sendJson(response, 200, { status: 'ready', authJson });
-      else sendJson(response, 200, { status: loginState?.status || 'disconnected', message: loginState?.message || undefined });
+      else sendJson(response, 200, {
+        status: loginState?.status || 'disconnected',
+        message: loginState?.message || undefined,
+        verificationUrl: loginState?.userCode ? loginState.verificationUrl : undefined,
+        userCode: loginState?.userCode || undefined,
+        expiresInSeconds: loginState?.userCode ? loginState.expiresInSeconds : undefined,
+      });
       return;
     }
     if (request.method === 'GET' && url.pathname === '/auth/snapshot') {

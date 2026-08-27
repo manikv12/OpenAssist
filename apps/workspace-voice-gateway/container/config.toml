@@ -14,6 +14,7 @@ enabled = false
 enabled = false
 
 [features]
+realtime_conversation = true
 plugins = false
 shell_tool = false
 unified_exec = false

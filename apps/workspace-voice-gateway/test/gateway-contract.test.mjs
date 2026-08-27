@@ -21,7 +21,8 @@ test('voice removes API-key variables and forces ChatGPT sign-in', async () => {
   assert.match(server, /API-key authentication is not allowed/);
   assert.doesNotMatch(server, /process\.env\.OPENAI_API_KEY/);
   assert.match(config, /cli_auth_credentials_store = "file"/);
-  assert.match(server, /'--strict-config', 'app-server'/);
+  assert.match(config, /realtime_conversation = true/);
+  assert.match(server, /'--strict-config', '--enable', 'realtime_conversation', 'app-server'/);
 });
 
 test('voice is isolated and only exposes the visible Site bridge', async () => {
@@ -36,8 +37,8 @@ test('voice is isolated and only exposes the visible Site bridge', async () => {
   assert.match(config, /shell_tool = false/);
   assert.match(config, /unified_exec = false/);
   assert.match(config, /persistence = "none"/);
-  assert.match(worker, /enableInternet = false/);
-  assert.match(worker, /allowedHosts = \[/);
+  assert.match(worker, /enableInternet = true/);
+  assert.doesNotMatch(worker, /OPENAI_API_KEY\s*:/);
 });
 
 test('refreshed ChatGPT subscription auth is re-encrypted by the Worker', async () => {
@@ -46,6 +47,14 @@ test('refreshed ChatGPT subscription auth is re-encrypted by the Worker', async 
   assert.match(server, /url\.pathname === '\/auth\/snapshot'/);
   assert.match(worker, /containerJson\(container, env, '\/auth\/snapshot'\)/);
   assert.match(worker, /saveEncryptedAuth\(env, objectKey, refreshedAuth\.authJson\)/);
+});
+
+test('pending device sign-in keeps its code available across status checks', async () => {
+  const worker = await read('src/index.ts');
+  const server = await read('container/server.mjs');
+  assert.match(server, /verificationUrl: loginState\?\.userCode \? loginState\.verificationUrl : undefined/);
+  assert.match(worker, /verificationUrl: result\.verificationUrl/);
+  assert.match(worker, /userCode: result\.userCode/);
 });
 
 test('voice has strict owner, time, and instance limits', async () => {

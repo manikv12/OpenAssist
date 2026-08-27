@@ -49,7 +49,7 @@ try {
   run('docker', [
     'run', '--rm', '--platform', 'linux/amd64', '-i',
     '-v', `${path.join(root, 'container/config.toml')}:/runtime/codex/config.toml:ro`,
-    '--entrypoint', 'codex', image, '--strict-config', 'app-server',
+    '--entrypoint', 'codex', image, '--strict-config', '--enable', 'realtime_conversation', 'app-server',
   ], { input: '' });
 
   run('docker', [
