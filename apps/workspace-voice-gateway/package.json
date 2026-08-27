@@ -1,0 +1,29 @@
+{
+  "name": "@openassist/workspace-voice-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "verify:compatibility": "node scripts/verify-codex-compatibility.mjs",
+    "verify": "npm run typecheck && npm test && npm run verify:compatibility",
+    "verify:release": "REQUIRE_AUTH_CANARY=1 node scripts/verify-codex-compatibility.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7",
+    "ws": "8.21.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260827.1",
+    "@types/node": "22.19.19",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3",
+    "wrangler": "4.127.0"
+  }
+}

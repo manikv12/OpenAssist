@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openassist-workspace-voice",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VOICE_CONTAINER",
+        "class_name": "VoiceContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["VoiceContainer"]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "VoiceContainer",
+      "image": "./Dockerfile",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "VOICE_AUTH",
+      "bucket_name": "openassist-workspace-voice-auth"
+    }
+  ],
+  "vars": {
+    "CODEX_RUNTIME_VERSION": "0.150.1",
+    "SITE_ORIGIN": "https://openassist-daily-workspace.developingadventures.chatgpt.site"
+  }
+}

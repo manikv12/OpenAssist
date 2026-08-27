@@ -13,6 +13,9 @@
     "start": "npm --prefix apps/desktop run start",
     "package:mac": "npm --prefix apps/desktop run package:mac",
     "release:mac": "npm --prefix apps/desktop run release:mac",
+    "dev:workspace-site": "npm --prefix apps/workspace-site run dev",
+    "verify:workspace-site": "npm --prefix apps/workspace-site run verify",
+    "verify:workspace-voice": "npm --prefix apps/workspace-voice-gateway run verify",
     "verify:live-voice": "npm --prefix apps/desktop run verify:live-voice-architecture && npm --prefix apps/desktop run verify:live-voice-provider-contracts && npm --prefix apps/desktop run verify:live-voice-worker-models && npm --prefix apps/desktop run verify:native-permissions && npm --prefix apps/desktop run verify:apple-eventkit && npm --prefix apps/desktop run verify:realtime-protocol && npm --prefix apps/desktop run verify:codex-subscription-realtime && npm --prefix apps/desktop run verify:codex-subscription-coordinator && npm --prefix apps/desktop run verify:live-voice-planner-actions && npm --prefix apps/desktop run verify:openai-realtime-models && npm --prefix apps/desktop run verify:realtime-interruption && npm --prefix apps/desktop run verify:live-voice-echo-guard && npm --prefix apps/desktop run verify:live-voice-continuity && npm --prefix apps/desktop run verify:live-voice-orchestration && npm --prefix apps/desktop run verify:live-voice-retrieval && npm --prefix apps/desktop run verify:single-speaker && npm --prefix apps/desktop run verify:live-voice-history && npm --prefix apps/desktop run verify:memory-dream && npm --prefix apps/desktop run verify:memory-pipeline && npm --prefix apps/desktop run verify:memory-scope",
     "verify": "npm run build && npm run verify:live-voice"
   }
