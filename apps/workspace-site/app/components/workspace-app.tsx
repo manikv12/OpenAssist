@@ -123,6 +123,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [demoLoading, setDemoLoading] = useState(true);
   const [demoExpiresAt, setDemoExpiresAt] = useState<number | null>(null);
   const [editor, setEditor] = useState<EditorKind>(null);
+  const [ownerSetupCode, setOwnerSetupCode] = useState('');
   const [accounts, setAccounts] = useState<DemoAccount[]>([]);
   const [tasks, setTasks] = useState(DEMO_TASKS);
   const [events, setEvents] = useState(DEMO_EVENTS);
@@ -525,6 +526,29 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setToast(nextMode === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.');
   }, [router, user]);
 
+  const completeOwnerSetup = useCallback(async () => {
+    const code = ownerSetupCode.trim();
+    if (!code) {
+      setToast('Enter the one-time owner code.');
+      return;
+    }
+    const response = await fetch('/api/owner/bootstrap', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    const text = await response.text();
+    let body: { status?: string; error?: string } = {};
+    try { body = JSON.parse(text) as typeof body; } catch { body = { error: text }; }
+    if (!response.ok || body.status !== 'owner_bound') {
+      setToast(body.error ?? 'Owner setup could not be completed.');
+      return;
+    }
+    setOwnerSetupCode('');
+    setToast('Owner setup complete. Reloading private mode…');
+    window.location.reload();
+  }, [ownerSetupCode]);
+
   const copy = mode === 'demo' && view === 'notes'
     ? { eyebrow: 'Temporary demo notes', title: 'Notes', subtitle: 'Judge-created notes stay isolated from Google and expire automatically.' }
     : mode === 'demo' && view === 'memory'
@@ -558,7 +582,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             {mode === 'live' ? (
               view === 'activity'
                 ? <ActivityView mode={mode} activity={activity} />
-                : <LiveWorkspaceView view={view} live={live} onReconnect={() => router.push('/api/workspace/connect')} />
+                : <LiveWorkspaceView view={view} live={live} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} />
             ) : demoLoading ? <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#D8B45A]/50 bg-[#D8B45A]/10" /><p className="mt-4 text-sm text-[#74828e]">Preparing your private demo workspace…</p></div></div> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
               {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
@@ -668,11 +692,14 @@ function displayText(item: Record<string, unknown>, keys: string[], fallback: st
   return fallback;
 }
 
-function LiveWorkspaceView({ view, live, onReconnect }: { view: WorkspaceView; live: LiveState; onReconnect: () => void }) {
+function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, onReconnect }: { view: WorkspaceView; live: LiveState; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void }) {
   if (live.loading && !live.data[view]) {
     return <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#D8B45A]/50 bg-[#D8B45A]/10" /><p className="mt-4 text-sm text-[#74828e]">Loading your private Workspace…</p></div></div>;
   }
   if (live.error) {
+    if (live.error.startsWith('Owner access')) {
+      return <div className="mx-auto max-w-xl rounded-[26px] border border-[#D8B45A]/20 bg-[#D8B45A]/[0.045] p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#D8B45A]">One-time setup</p><h2 className="mt-2 text-xl font-semibold">Bind this private owner account</h2><p className="mt-3 text-sm leading-6 text-[#8d9aa6]">Enter the one-time owner code. It is used only to bind this signed-in ChatGPT account, then it can be removed.</p><label className="mt-5 block"><span className="sr-only">One-time owner code</span><input type="password" autoComplete="one-time-code" value={ownerCode} onChange={(event) => onOwnerCode(event.target.value)} placeholder="One-time owner code" className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none transition placeholder:text-[#56636e] focus:border-[#D8B45A]/50 focus:ring-2 focus:ring-[#D8B45A]/10" /></label><button onClick={onBootstrap} disabled={!ownerCode.trim()} className="mt-4 rounded-xl bg-[#D8B45A] px-5 py-2.5 text-sm font-semibold text-[#120f08] disabled:cursor-not-allowed disabled:opacity-40">Finish owner setup</button></div>;
+    }
     return <div className="mx-auto max-w-xl rounded-[26px] border border-[#ff806d]/20 bg-[#ff806d]/[0.045] p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#ff9b8c]">Live Workspace unavailable</p><h2 className="mt-2 text-xl font-semibold">Reconnect securely</h2><p className="mt-3 text-sm leading-6 text-[#8d9aa6]">{live.error}</p><button onClick={onReconnect} className="mt-6 rounded-xl bg-[#D8B45A] px-5 py-2.5 text-sm font-semibold text-[#120f08]">Connect Workspace</button></div>;
   }
   const source = view === 'accounts' || view === 'activity' ? live.accounts : live.data[view];
