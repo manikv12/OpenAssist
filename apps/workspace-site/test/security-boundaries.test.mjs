@@ -105,3 +105,9 @@ test('server code does not log private Workspace content', async () => {
   ];
   for (const file of files) assert.doesNotMatch(await read(file), /console\.(log|info|debug)\s*\(/, file);
 });
+
+test('API errors stay JSON so the owner UI can show a useful reconnect message', async () => {
+  const http = await read('lib/http.ts');
+  assert.match(http, /error instanceof Response[\s\S]*error\.clone\(\)\.text/);
+  assert.match(http, /return json\(\{ error: safe \}, \{ status \}\)/);
+});

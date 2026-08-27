@@ -37,12 +37,14 @@ export async function safeRoute<T>(work: () => Promise<T | Response>): Promise<R
     const result = await work();
     return result instanceof Response ? result : json(result);
   } catch (error) {
-    if (error instanceof Response) return error;
-    const message = error instanceof Error ? error.message : 'Request failed.';
+    const status = error instanceof Response ? error.status : 400;
+    const message = error instanceof Response
+      ? await error.clone().text().catch(() => 'Request failed.')
+      : error instanceof Error ? error.message : 'Request failed.';
     const safe = /^(Invalid tool input:|Workspace is not connected|Workspace must be reconnected|Workspace authorization expired|No connected Google account|Owner access|ChatGPT sign-in|An owner is already bound|Approval preview|Demo session|The demo|This demo|At least one demo|This tool|Google Tasks list|Voice is)/.test(message)
       ? message
       : 'The request could not be completed.';
-    return json({ error: safe }, { status: 400 });
+    return json({ error: safe }, { status });
   }
 }
 
