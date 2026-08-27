@@ -516,6 +516,15 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     });
   }, [invokeTool]);
 
+  const selectMode = useCallback((nextMode: Mode) => {
+    if (nextMode === 'live' && !user) {
+      router.push('/signin-with-chatgpt?return_to=%2F');
+      return;
+    }
+    setMode(nextMode);
+    setToast(nextMode === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.');
+  }, [router, user]);
+
   const copy = mode === 'demo' && view === 'notes'
     ? { eyebrow: 'Temporary demo notes', title: 'Notes', subtitle: 'Judge-created notes stay isolated from Google and expire automatically.' }
     : mode === 'demo' && view === 'memory'
@@ -538,6 +547,9 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             <div className="flex items-center gap-3">
               {mode === 'demo' && <button onClick={() => void resetDemo()} className="rounded-xl border border-white/10 px-3 py-2 text-xs text-[#9aa6b0] transition hover:border-[#D8B45A]/35 hover:text-white">Reset demo</button>}
               <label className="relative max-sm:hidden"><span className="sr-only">Search current view</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search workspace" className="w-48 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm outline-none transition placeholder:text-[#56636e] focus:border-[#D8B45A]/50 focus:ring-2 focus:ring-[#D8B45A]/10" /></label>
+              <div aria-label="Workspace mode" className="grid grid-cols-2 rounded-xl border border-white/[0.08] bg-white/[0.04] p-1 xl:hidden">
+                {(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => selectMode(item)} aria-pressed={mode === item} className={`rounded-lg px-3 py-1.5 text-xs font-semibold capitalize transition ${mode === item ? 'bg-[#D8B45A] text-[#120f08] shadow-[0_4px_16px_rgba(216,180,90,0.12)]' : 'text-[#80909d] hover:bg-white/[0.05] hover:text-white'}`}>{item}</button>)}
+              </div>
               <button onClick={connectVoice} aria-label={voiceConnected ? 'Stop owner voice' : 'Start owner voice'} className={`grid h-10 w-10 place-items-center rounded-full text-sm font-bold shadow-[0_0_0_5px_rgba(216,180,90,0.08)] ${voiceConnected ? 'bg-[#ff806d] text-[#230704]' : 'bg-[#D8B45A] text-[#120f08]'}`}>{voiceConnected ? '■' : '●'}</button>
             </div>
           </header>

@@ -12,7 +12,9 @@ const codexHome = process.env.CODEX_HOME || '/runtime/codex';
 const emptyWorkspace = process.env.OPENASSIST_EMPTY_WORKSPACE || '/runtime/empty';
 const authPath = path.join(codexHome, 'auth.json');
 const configPath = path.join(codexHome, 'config.toml');
-const toolNames = JSON.parse(await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), 'tool-names.json'), 'utf8'));
+const containerDir = path.dirname(fileURLToPath(import.meta.url));
+const configTemplate = await readFile(path.join(containerDir, 'config.toml'), 'utf8');
+const toolNames = JSON.parse(await readFile(path.join(containerDir, 'tool-names.json'), 'utf8'));
 const toolNameSet = new Set(toolNames);
 const sessions = new Map();
 let activeSessionId = null;
@@ -65,14 +67,7 @@ function cleanEnvironment() {
 async function prepareCodexHome() {
   await mkdir(codexHome, { recursive: true, mode: 0o700 });
   await mkdir(emptyWorkspace, { recursive: true, mode: 0o700 });
-  await writeFile(configPath, [
-    'forced_login_method = "chatgpt"',
-    'sandbox_mode = "read-only"',
-    '',
-    '[features]',
-    'plugins = false',
-    '',
-  ].join('\n'), { mode: 0o600 });
+  await writeFile(configPath, configTemplate, { mode: 0o600 });
 }
 
 function stripAnsi(value) {
@@ -152,7 +147,7 @@ class AppServer {
   }
 
   async start() {
-    const child = spawn('codex', ['app-server'], {
+    const child = spawn('codex', ['--strict-config', 'app-server'], {
       cwd: emptyWorkspace,
       env: cleanEnvironment(),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -454,6 +449,12 @@ const server = createServer(async (request, response) => {
       const authJson = await savedAuthJson();
       if (authJson) sendJson(response, 200, { status: 'ready', authJson });
       else sendJson(response, 200, { status: loginState?.status || 'disconnected', message: loginState?.message || undefined });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/auth/snapshot') {
+      const authJson = await savedAuthJson();
+      if (!authJson) throw Object.assign(new Error('ChatGPT subscription sign-in is unavailable.'), { status: 409 });
+      sendJson(response, 200, { status: 'ready', authJson });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/disconnect') {

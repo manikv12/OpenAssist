@@ -1,0 +1,23 @@
+cli_auth_credentials_store = "file"
+forced_login_method = "chatgpt"
+check_for_update_on_startup = false
+sandbox_mode = "read-only"
+web_search = "disabled"
+
+[history]
+persistence = "none"
+
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false
+
+[features]
+plugins = false
+shell_tool = false
+unified_exec = false
+shell_snapshot = false
+skill_mcp_dependency_install = false
+view_image = false
+image_generation = false

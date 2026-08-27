@@ -1,7 +1,6 @@
-import { Container, getContainer } from '@cloudflare/containers';
+import { Container } from '@cloudflare/containers';
 import {
   decryptAuth,
-  digestUserId,
   encryptAuth,
   randomToken,
   signGatewayToken,
@@ -26,9 +25,18 @@ export class VoiceContainer extends Container<Env> {
   defaultPort = 8080;
   requiredPorts = [8080];
   sleepAfter = '15m';
-  enableInternet = true;
+  enableInternet = false;
+  allowedHosts = [
+    'auth.openai.com',
+    'openai.com',
+    '*.openai.com',
+    'chatgpt.com',
+    '*.chatgpt.com',
+    'oaistatic.com',
+    '*.oaistatic.com',
+  ];
   pingEndpoint = '/health';
-  envVars = {
+  envVars: Record<string, string> = {
     CONTAINER_INTERNAL_TOKEN: this.env.CONTAINER_INTERNAL_TOKEN,
     CODEX_RUNTIME_VERSION: this.env.CODEX_RUNTIME_VERSION,
   };
@@ -66,7 +74,7 @@ function bearer(request: Request): string {
 }
 
 function ownerContainer(env: Env) {
-  return getContainer(env.VOICE_CONTAINER, 'openassist-owner-voice');
+  return env.VOICE_CONTAINER.get(env.VOICE_CONTAINER.idFromName('openassist-owner-voice'));
 }
 
 async function containerJson(
@@ -93,6 +101,18 @@ async function containerJson(
 
 function authObjectKey(userHash: string): string {
   return `chatgpt-auth/${userHash}.enc`;
+}
+
+async function saveEncryptedAuth(env: Env, objectKey: string, authJson: unknown): Promise<void> {
+  if (typeof authJson !== 'string' || authJson.length > AUTH_LIMIT) {
+    throw new Response('ChatGPT sign-in data is unexpectedly large.', { status: 400 });
+  }
+  JSON.parse(authJson);
+  const encrypted = await encryptAuth(authJson, env.VOICE_AUTH_ENCRYPTION_KEY);
+  await env.VOICE_AUTH.put(objectKey, encrypted, {
+    httpMetadata: { contentType: 'application/octet-stream' },
+    customMetadata: { version: '1' },
+  });
 }
 
 async function requireSiteToken(request: Request, env: Env): Promise<GatewayToken> {
@@ -135,13 +155,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (result.status !== 'ready' || typeof result.authJson !== 'string') {
       return json({ status: result.status === 'failed' ? 'failed' : 'pending', message: result.message });
     }
-    if (result.authJson.length > AUTH_LIMIT) throw new Response('ChatGPT sign-in data is unexpectedly large.', { status: 400 });
-    JSON.parse(result.authJson);
-    const encrypted = await encryptAuth(result.authJson, env.VOICE_AUTH_ENCRYPTION_KEY);
-    await env.VOICE_AUTH.put(objectKey, encrypted, {
-      httpMetadata: { contentType: 'application/octet-stream' },
-      customMetadata: { version: '1' },
-    });
+    await saveEncryptedAuth(env, objectKey, result.authJson);
     return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
   }
 
@@ -165,6 +179,8 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
     const answerSdp = typeof result.sdp === 'string' ? result.sdp : '';
     if (!sessionId || !answerSdp) throw new Response('The subscription realtime compatibility check did not return audio.', { status: 503 });
+    const refreshedAuth = await containerJson(container, env, '/auth/snapshot');
+    await saveEncryptedAuth(env, objectKey, refreshedAuth.authJson);
     const socketToken = await signGatewayToken({
       version: 1,
       purpose: 'voice_tool_socket',

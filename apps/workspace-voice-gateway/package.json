@@ -11,8 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.mjs",
     "verify:compatibility": "node scripts/verify-codex-compatibility.mjs",
+    "verify:linux": "node scripts/verify-linux-image.mjs",
     "verify": "npm run typecheck && npm test && npm run verify:compatibility",
-    "verify:release": "REQUIRE_AUTH_CANARY=1 node scripts/verify-codex-compatibility.mjs",
+    "verify:release": "npm run verify && npm run verify:linux && REQUIRE_AUTH_CANARY=1 node scripts/verify-codex-compatibility.mjs",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
@@ -20,7 +21,6 @@
     "ws": "8.21.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20260827.1",
     "@types/node": "22.19.19",
     "@types/ws": "8.18.1",
     "typescript": "5.9.3",

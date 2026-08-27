@@ -11,6 +11,12 @@ npm run verify
 
 The standard check validates types, security limits, the 23-tool contract, the pinned Codex protocol shape, WebRTC fields, and the absence of an API-key fallback.
 
+Build and test the exact Linux/amd64 image, strict Codex config, realtime protocol, health endpoint, and authorization boundary:
+
+```bash
+npm run verify:linux
+```
+
 The release check intentionally fails until the real authenticated voice canary has passed:
 
 ```bash
