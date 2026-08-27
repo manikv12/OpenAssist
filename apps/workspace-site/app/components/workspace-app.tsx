@@ -397,8 +397,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       setVoiceStatus('Switch to owner Live mode first.');
       return;
     }
-    setVoiceStatus('Checking your ChatGPT subscription sign-in…');
+    setVoiceStatus('Checking your private Workspace connection…');
     try {
+      await invokeTool('workspace_list_accounts', {});
+      setVoiceStatus('Checking your ChatGPT subscription sign-in…');
       let authResponse = await fetch('/api/voice/auth/status', { cache: 'no-store' });
       let auth = (await authResponse.json()) as { status?: string; message?: string; error?: string; verificationUrl?: string; userCode?: string };
       if (!authResponse.ok && auth.status !== 'pending') {

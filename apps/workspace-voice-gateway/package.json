@@ -8,11 +8,12 @@
   },
   "scripts": {
     "dev": "wrangler dev",
+    "sync:tool-contract": "node scripts/sync-tool-contract.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.mjs",
     "verify:compatibility": "node scripts/verify-codex-compatibility.mjs",
     "verify:linux": "node scripts/verify-linux-image.mjs",
-    "verify": "npm run typecheck && npm test && npm run verify:compatibility",
+    "verify": "npm run sync:tool-contract && npm run typecheck && npm test && npm run verify:compatibility",
     "verify:release": "npm run verify && npm run verify:linux && REQUIRE_AUTH_CANARY=1 node scripts/verify-codex-compatibility.mjs",
     "deploy": "wrangler deploy"
   },

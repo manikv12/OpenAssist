@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
+import ts from 'typescript';
 
 const root = process.cwd();
 const read = (relativePath) => readFile(path.join(root, relativePath), 'utf8');
@@ -9,7 +10,26 @@ const read = (relativePath) => readFile(path.join(root, relativePath), 'utf8');
 test('voice has the same Workspace tool contract as the Site', async () => {
   const voice = JSON.parse(await read('container/tool-names.json'));
   const shared = JSON.parse(await read('../../packages/workspace-tool-contract/tool-names.json'));
+  const voiceManifest = JSON.parse(await read('container/tool-manifest.json'));
+  const sharedManifest = JSON.parse(await read('../../packages/workspace-tool-contract/tool-manifest.json'));
+  const registrySource = await read('../../apps/workspace-site/lib/tool-registry.ts');
+  const registryCompiled = ts.transpileModule(registrySource, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const registry = await import(`data:text/javascript;base64,${Buffer.from(registryCompiled).toString('base64')}`);
+  const siteManifest = registry.WORKSPACE_TOOLS.map((tool) => ({
+    name: tool.name,
+    title: tool.title,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    readOnly: Boolean(tool.readOnly),
+    untrustedContent: Boolean(tool.untrustedContent),
+    destructive: Boolean(tool.destructive),
+  }));
   assert.deepEqual(voice, shared);
+  assert.deepEqual(voiceManifest, sharedManifest);
+  assert.deepEqual(voiceManifest, siteManifest);
+  assert.deepEqual(voiceManifest.map((tool) => tool.name), voice);
   assert.equal(voice.length, 23);
 });
 
@@ -25,14 +45,17 @@ test('voice removes API-key variables and forces ChatGPT sign-in', async () => {
   assert.match(server, /'--strict-config', '--enable', 'realtime_conversation', 'app-server'/);
 });
 
-test('voice is isolated and only exposes the visible Site bridge', async () => {
+test('voice is isolated and directly exposes only visible Site tools', async () => {
   const worker = await read('src/index.ts');
   const server = await read('container/server.mjs');
   const config = await read('container/config.toml');
   assert.match(server, /sandbox: 'read-only'/);
   assert.match(server, /selectedCapabilityRoots: \[\]/);
-  assert.match(server, /name: 'assistant_use_site_tool'/);
-  assert.match(server, /Only the visible Workspace site tool is allowed/);
+  assert.match(server, /\.\.\.toolManifest\.map/);
+  assert.match(server, /name: 'assistant_confirm_site_preview'/);
+  assert.match(server, /Only the registered visible Workspace tools are allowed/);
+  assert.match(server, /includeStartupContext: true/);
+  assert.doesNotMatch(server, /assistant_use_site_tool/);
   assert.match(server, /Delete, trash, and forget always require a screen tap/);
   assert.match(config, /shell_tool = false/);
   assert.match(config, /unified_exec = false/);
