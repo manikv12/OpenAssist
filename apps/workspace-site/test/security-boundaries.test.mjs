@@ -111,3 +111,9 @@ test('API errors stay JSON so the owner UI can show a useful reconnect message',
   assert.match(http, /error instanceof Response[\s\S]*error\.clone\(\)\.text/);
   assert.match(http, /return json\(\{ error: safe \}, \{ status \}\)/);
 });
+
+test('owner bootstrap is restricted to the exact temporary Sites account ID', async () => {
+  const auth = await read('lib/server-auth.ts');
+  assert.match(auth, /env\.OWNER_ACCOUNT_USER_ID && user\.userId === env\.OWNER_ACCOUNT_USER_ID/);
+  assert.match(auth, /await bootstrapOwner\(user\)/);
+});

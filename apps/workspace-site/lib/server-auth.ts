@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { getChatGPTUser, type ChatGPTUser } from '../app/chatgpt-auth';
-import { siteRole, upsertSiteUser } from './site-db';
+import { bootstrapOwner, siteRole, upsertSiteUser } from './site-db';
 
 export async function requireSignedInUser(): Promise<ChatGPTUser> {
   const user = await getChatGPTUser();
@@ -11,8 +11,17 @@ export async function requireSignedInUser(): Promise<ChatGPTUser> {
 
 export async function requireOwner(): Promise<ChatGPTUser> {
   const user = await requireSignedInUser();
-  if ((await siteRole(user.userId)) !== 'owner') throw new Response('Owner access is required.', { status: 403 });
-  return user;
+  if ((await siteRole(user.userId)) === 'owner') return user;
+
+  // A newly deployed private Site can bind its exact Sites owner once without
+  // exposing the bootstrap secret to browser JavaScript. Remove this temporary
+  // environment value immediately after the first successful owner request.
+  if (env.OWNER_ACCOUNT_USER_ID && user.userId === env.OWNER_ACCOUNT_USER_ID) {
+    await bootstrapOwner(user);
+    return user;
+  }
+
+  throw new Response('Owner access is required.', { status: 403 });
 }
 
 export function requiredSecret(name: 'TOKEN_ENCRYPTION_KEY' | 'ACTION_SIGNING_KEY' | 'VOICE_GATEWAY_SHARED_SECRET'): string {
