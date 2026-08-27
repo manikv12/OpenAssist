@@ -400,7 +400,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setVoiceStatus('Checking your ChatGPT subscription sign-in…');
     try {
       let authResponse = await fetch('/api/voice/auth/status', { cache: 'no-store' });
-      let auth = (await authResponse.json()) as { status?: string; message?: string; verificationUrl?: string; userCode?: string };
+      let auth = (await authResponse.json()) as { status?: string; message?: string; error?: string; verificationUrl?: string; userCode?: string };
       if (!authResponse.ok && auth.status !== 'pending') {
         authResponse = await fetch('/api/voice/auth/start', { method: 'POST' });
         auth = (await authResponse.json()) as typeof auth;
@@ -408,6 +408,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         authResponse = await fetch('/api/voice/auth/start', { method: 'POST' });
         auth = (await authResponse.json()) as typeof auth;
       }
+      if (!authResponse.ok) throw new Error(auth.error ?? auth.message ?? 'The voice gateway could not start ChatGPT sign-in.');
       if (auth.status !== 'ready') {
         if (auth.verificationUrl && auth.userCode) setVoicePrompt({ verificationUrl: auth.verificationUrl, userCode: auth.userCode });
         setVoiceStatus(auth.message ?? (auth.userCode ? 'Finish ChatGPT sign-in, then press voice again.' : 'Voice sign-in is pending.'));

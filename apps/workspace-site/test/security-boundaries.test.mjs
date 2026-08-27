@@ -117,3 +117,8 @@ test('owner bootstrap is restricted to the exact temporary Sites account ID', as
   assert.match(auth, /env\.OWNER_ACCOUNT_USER_ID && user\.userId === env\.OWNER_ACCOUNT_USER_ID/);
   assert.match(auth, /await bootstrapOwner\(user\)/);
 });
+
+test('voice errors are shown instead of being mislabeled as pending', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  assert.match(app, /if \(!authResponse\.ok\) throw new Error\(auth\.error \?\? auth\.message/);
+});
