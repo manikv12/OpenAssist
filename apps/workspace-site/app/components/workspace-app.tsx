@@ -115,7 +115,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>('mail-security-review');
   const [pending, setPending] = useState<PendingAction | null>(null);
-  const [toast, setToast] = useState('23 WebMCP tools are available in demo mode.');
+  const [toast, setToast] = useState('Private demo ready · 23 WebMCP tools available.');
   const [voiceStatus, setVoiceStatus] = useState('Ready to check compatibility');
   const [voicePrompt, setVoicePrompt] = useState<VoicePrompt>(null);
   const [voiceConnected, setVoiceConnected] = useState(false);
