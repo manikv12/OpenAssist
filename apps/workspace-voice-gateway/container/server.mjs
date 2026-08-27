@@ -87,7 +87,7 @@ async function startDeviceLogin() {
   const consume = (chunk) => {
     output = `${output}${stripAnsi(String(chunk))}`.slice(-8_000);
     const url = output.match(/https:\/\/auth\.openai\.com\/codex\/device/)?.[0];
-    const code = output.match(/\b[A-Z0-9]{4}-[A-Z0-9]{5}\b/)?.[0];
+    const code = output.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4,8}\b/)?.[0];
     if (url) loginState.verificationUrl = url;
     if (code) loginState.userCode = code;
   };
@@ -102,7 +102,7 @@ async function startDeviceLogin() {
       loginState.message = 'ChatGPT device sign-in did not finish.';
     }
   });
-  const deadline = Date.now() + 8_000;
+  const deadline = Date.now() + 15_000;
   while (!loginState.userCode && loginState.status === 'pending' && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }

@@ -127,11 +127,16 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (origin !== new URL(env.SITE_ORIGIN).origin || request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       throw new Response('Voice tool connection is not allowed.', { status: 403 });
     }
-    const token = url.searchParams.get('token') ?? '';
+    const protocols = (request.headers.get('sec-websocket-protocol') ?? '')
+      .split(',')
+      .map((protocol) => protocol.trim());
+    const tokenProtocol = protocols.find((protocol) => protocol.startsWith('openassist-token.')) ?? '';
+    const token = tokenProtocol.slice('openassist-token.'.length);
     const payload = await verifyGatewayToken(token, env.VOICE_GATEWAY_SHARED_SECRET, 'voice_tool_socket', origin);
     if (payload.sessionId !== sessionMatch[1]) throw new Response('Voice tool session is invalid.', { status: 401 });
     const headers = new Headers(request.headers);
     headers.set('x-openassist-container-token', env.CONTAINER_INTERNAL_TOKEN);
+    headers.set('sec-websocket-protocol', 'openassist-tools');
     const internal = new Request(`http://container/session/${encodeURIComponent(sessionMatch[1])}/tools`, {
       method: 'GET',
       headers,
@@ -194,8 +199,8 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     const socketUrl = new URL(request.url);
     socketUrl.protocol = socketUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     socketUrl.pathname = `/tools/${sessionId}`;
-    socketUrl.search = new URLSearchParams({ token: socketToken }).toString();
-    return json({ status: 'ready', sessionId, sdp: answerSdp, toolSocketUrl: socketUrl.toString(), warningAfterSeconds: 1_500, expiresAfterSeconds: 1_800 });
+    socketUrl.search = '';
+    return json({ status: 'ready', sessionId, sdp: answerSdp, toolSocketUrl: socketUrl.toString(), toolSocketToken: socketToken, warningAfterSeconds: 1_500, expiresAfterSeconds: 1_800 });
   }
 
   throw new Response('Not found.', { status: 404 });

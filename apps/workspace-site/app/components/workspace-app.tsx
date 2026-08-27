@@ -439,10 +439,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sdp: offerSdp }),
       });
-      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string };
-      if (!response.ok || body.status !== 'ready' || !body.sdp || !body.toolSocketUrl) throw new Error(body.message ?? body.error ?? 'Subscription voice is not compatible yet.');
+      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string };
+      if (!response.ok || body.status !== 'ready' || !body.sdp || !body.toolSocketUrl || !body.toolSocketToken) throw new Error(body.message ?? body.error ?? 'Subscription voice is not compatible yet.');
       await peer.setRemoteDescription({ type: 'answer', sdp: body.sdp });
-      const socket = new WebSocket(body.toolSocketUrl);
+      const socket = new WebSocket(body.toolSocketUrl, ['openassist-tools', `openassist-token.${body.toolSocketToken}`]);
       voiceSocketRef.current = socket;
       socket.addEventListener('message', (event) => {
         let message: { type?: string; callId?: string; operation?: string; tool?: string; args?: Record<string, unknown>; previewId?: string; message?: string };

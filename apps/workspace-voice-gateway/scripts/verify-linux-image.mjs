@@ -79,6 +79,30 @@ try {
   const unauthorized = await fetch(`${origin}/auth/status`, { headers: { accept: 'application/json' } });
   assert.equal(unauthorized.status, 401);
 
+  const authorizedHeaders = {
+    accept: 'application/json',
+    'content-type': 'application/json',
+    'x-openassist-container-token': internalToken,
+  };
+  const deviceAuth = await fetch(`${origin}/auth/start`, {
+    method: 'POST',
+    headers: authorizedHeaders,
+    body: '{}',
+    signal: AbortSignal.timeout(30_000),
+  });
+  const deviceAuthBody = await deviceAuth.json();
+  assert.equal(deviceAuth.status, 200, deviceAuthBody.message || 'The Linux image could not start ChatGPT device sign-in.');
+  assert.equal(deviceAuthBody.status, 'pending');
+  assert.match(deviceAuthBody.verificationUrl, /^https:\/\/auth\.openai\.com\/codex\/device$/);
+  assert.match(deviceAuthBody.userCode, /^[A-Z0-9]{4}-[A-Z0-9]{4,8}$/);
+  const disconnect = await fetch(`${origin}/disconnect`, {
+    method: 'POST',
+    headers: authorizedHeaders,
+    body: '{}',
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(disconnect.status, 200);
+
   process.stdout.write(`${JSON.stringify({
     image,
     platform,
@@ -87,6 +111,7 @@ try {
     realtimeProtocol: 'pass',
     containerHealth: 'pass',
     unauthenticatedAccessDenied: 'pass',
+    subscriptionDeviceSignIn: 'pass',
   }, null, 2)}\n`);
 } finally {
   spawnSync('docker', ['stop', containerName], { cwd: root, encoding: 'utf8', timeout: 20_000 });

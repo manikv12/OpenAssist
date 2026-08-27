@@ -58,3 +58,13 @@ test('voice has strict owner, time, and instance limits', async () => {
   assert.match(server, /30 \* 60_000/);
   assert.match(config, /"max_instances": 1/);
 });
+
+test('voice socket authorization stays out of URLs and logs', async () => {
+  const worker = await read('src/index.ts');
+  const site = await read('../../apps/workspace-site/app/components/workspace-app.tsx');
+  assert.match(worker, /sec-websocket-protocol/);
+  assert.match(worker, /toolSocketToken: socketToken/);
+  assert.doesNotMatch(worker, /searchParams\.set\(['"]token/);
+  assert.doesNotMatch(worker, /new URLSearchParams\(\{ token:/);
+  assert.match(site, /openassist-token\.\$\{body\.toolSocketToken\}/);
+});

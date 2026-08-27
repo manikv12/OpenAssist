@@ -2,7 +2,10 @@ FROM node:22.20.0-bookworm-slim
 
 ARG CODEX_VERSION=0.150.1
 
-RUN useradd --create-home --uid 10001 openassist \
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --create-home --uid 10001 openassist \
   && npm install --global "@openai/codex@${CODEX_VERSION}" \
   && mkdir -p /app /runtime/codex /runtime/empty \
   && chown -R openassist:openassist /app /runtime
