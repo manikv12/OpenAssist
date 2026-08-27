@@ -4,7 +4,7 @@ OpenAssist is a voice-first personal AI assistant for macOS and iPhone. It keeps
 
 ## Daily Workspace and WebMCP
 
-The new [`apps/workspace-site`](apps/workspace-site) is a professional browser workspace for Gmail, Tasks, Calendar, notes, memory, accounts, and activity. It has a public synthetic-data demo and an owner-only Live mode connected to the existing OpenAssist Workspace MCP.
+The new [`apps/workspace-site`](apps/workspace-site) is a professional browser workspace for Gmail, Tasks, Calendar, notes, memory, accounts, and activity. Its public demo gives each visitor a separate 24-hour synthetic Cloudflare workspace that judges can safely edit through the UI or WebMCP. Owner-only Live mode remains connected to the existing OpenAssist Workspace MCP and Composio; private Google data is never copied into Demo mode.
 
 It exposes 23 structured WebMCP tools that ChatGPT's in-app browser and the same-page subscription voice agent can use. Every write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database.
 

@@ -33,4 +33,10 @@ test('demo and owner Live mode remain separate', async () => {
   assert.match(component, /modeRef\.current === 'demo'/);
   assert.match(component, /Switch to owner Live mode first/);
   assert.match(component, /Public synthetic judge data\. No private content/);
+  assert.match(component, /\/api\/demo\/tool/);
+  assert.match(component, /\/api\/workspace\/tool/);
+  assert.match(component, /Reset demo/);
+  assert.match(component, /ItemEditor/);
+  assert.match(component, /workspace_create_task/);
+  assert.match(component, /workspace_save_note/);
 });

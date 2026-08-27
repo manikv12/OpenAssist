@@ -39,7 +39,7 @@ export async function safeRoute<T>(work: () => Promise<T | Response>): Promise<R
   } catch (error) {
     if (error instanceof Response) return error;
     const message = error instanceof Error ? error.message : 'Request failed.';
-    const safe = /^(Invalid tool input:|Workspace is not connected|Workspace must be reconnected|Workspace authorization expired|No connected Google account|Owner access|ChatGPT sign-in|An owner is already bound|Approval preview|This tool|Google Tasks list|Voice is)/.test(message)
+    const safe = /^(Invalid tool input:|Workspace is not connected|Workspace must be reconnected|Workspace authorization expired|No connected Google account|Owner access|ChatGPT sign-in|An owner is already bound|Approval preview|Demo session|The demo|This demo|At least one demo|This tool|Google Tasks list|Voice is)/.test(message)
       ? message
       : 'The request could not be completed.';
     return json({ error: safe }, { status: 400 });
@@ -55,7 +55,7 @@ export function parseCookie(request: Request, name: string): string | null {
   return null;
 }
 
-export function cookieHeader(name: string, value: string, request: Request, maxAge: number): string {
+export function cookieHeader(name: string, value: string, request: Request, maxAge: number, path = '/api/workspace'): string {
   const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
-  return `${name}=${encodeURIComponent(value)}; HttpOnly; SameSite=Lax; Path=/api/workspace; Max-Age=${maxAge}${secure}`;
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; SameSite=Lax; Path=${path}; Max-Age=${maxAge}${secure}`;
 }

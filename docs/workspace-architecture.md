@@ -13,15 +13,16 @@ flowchart LR
   R --> P[Locked write preview]
   R --> M[Existing Workspace MCP]
   M --> O[Composio-managed Google connections]
-  S --> D[(D1 pointers and encrypted tokens only)]
+  S --> D[(D1 live pointers plus isolated demo workspaces)]
   G --> E[(R2 encrypted ChatGPT auth only)]
 ```
 
 ## Two separate modes
 
-- **Demo mode** is public and uses synthetic mail, tasks, events, notes, memory, and accounts.
+- **Demo mode** is public. Each visitor receives a separate synthetic workspace in D1 that expires after 24 hours and can be reset at any time.
 - **Live mode** is owner-only. It reads and writes through the existing Workspace MCP.
 - Demo executors never call the live MCP. Live routes require the owner role.
+- Demo edits and WebMCP actions operate on the same stored workspace, so judges can see and manipulate their own data without connecting Google.
 
 ## Shared WebMCP tools
 
@@ -41,7 +42,9 @@ Email, attachment, Drive, website, and tool-result text can never approve or tri
 
 ## Storage boundaries
 
-D1 contains only:
+D1 contains two deliberately separate kinds of records.
+
+Live records contain only:
 
 - Stable Site user ID and role.
 - Encrypted Workspace access and refresh tokens, expiration, scope, and revision.
@@ -49,7 +52,9 @@ D1 contains only:
 - Voice authentication pointer, status, and revision.
 - One-way idempotency hashes with short expiration.
 
-D1 and server logs do not contain Google messages, Gmail IDs, attachments, task text, calendar text, notes, memory text, audio, or voice transcripts.
+Demo records contain only clearly labelled synthetic accounts, mail, tasks, events, notes, memory, and activity for that visitor's temporary workspace. They have no Google identifiers or credentials, expire after 24 hours, and are deleted on reset.
+
+D1 and server logs do not contain any real Google messages, Gmail IDs, attachments, task text, calendar text, notes, memory text, audio, or voice transcripts.
 
 R2 contains only the AES-GCM encrypted ChatGPT subscription authentication file for the owner. The key stays in the Worker. Disconnect deletes the object, runs Codex logout, and stops the Container.
 

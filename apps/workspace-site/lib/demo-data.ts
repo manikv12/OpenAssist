@@ -8,13 +8,83 @@ export type WorkspaceView =
   | 'accounts'
   | 'activity';
 
-export const DEMO_ACCOUNTS = [
+export type DemoAccount = {
+  id: string;
+  label: string;
+  email: string;
+  type: string;
+};
+
+export type DemoMessage = {
+  id: string;
+  account: string;
+  sender: string;
+  subject: string;
+  snippet: string;
+  time: string;
+  unread: boolean;
+  urgent: boolean;
+  hasAttachment: boolean;
+};
+
+export type DemoTask = {
+  id: string;
+  title: string;
+  list: string;
+  due: string;
+  tags: string[];
+  completed: boolean;
+};
+
+export type DemoEvent = {
+  id: string;
+  title: string;
+  account: string;
+  start: string;
+  end: string;
+  day: string;
+  reminder: string;
+};
+
+export type DemoNote = {
+  id: string;
+  title: string;
+  updated: string;
+  preview: string;
+  content: string;
+};
+
+export type DemoMemoryFact = {
+  id: string;
+  category: string;
+  fact: string;
+};
+
+export type DemoActivityItem = {
+  id: string;
+  actor: string;
+  action: string;
+  time: string;
+  type: 'read' | 'write';
+};
+
+export type DemoWorkspaceState = {
+  accounts: DemoAccount[];
+  messages: DemoMessage[];
+  tasks: DemoTask[];
+  events: DemoEvent[];
+  notes: DemoNote[];
+  memory: DemoMemoryFact[];
+  activity: DemoActivityItem[];
+};
+
+export const DEMO_ACCOUNTS: DemoAccount[] = [
   { id: 'demo-main', label: 'Main', email: 'alex@example.test', type: 'main' },
   { id: 'demo-work', label: 'Northstar Work', email: 'alex@northstar.test', type: 'work' },
   { id: 'demo-studio', label: 'Studio', email: 'hello@studio.test', type: 'business' },
 ];
 
-export const DEMO_MAIL = [
+export const DEMO_MAIL: DemoMessage[] = [
   {
     id: 'mail-security-review',
     account: 'Northstar Work',
@@ -61,7 +131,7 @@ export const DEMO_MAIL = [
   },
 ];
 
-export const DEMO_TASKS = [
+export const DEMO_TASKS: DemoTask[] = [
   {
     id: 'task-security',
     title: 'Answer security review questions',
@@ -96,7 +166,7 @@ export const DEMO_TASKS = [
   },
 ];
 
-export const DEMO_EVENTS = [
+export const DEMO_EVENTS: DemoEvent[] = [
   {
     id: 'event-review',
     title: 'Product review',
@@ -126,18 +196,30 @@ export const DEMO_EVENTS = [
   },
 ];
 
-export const DEMO_NOTES = [
-  { id: 'note-launch', title: 'Launch notes', updated: 'Today', preview: 'What worked, what to improve, and final links.' },
-  { id: 'note-travel', title: 'Travel plan', updated: 'Yesterday', preview: 'Flights, hotel, local transport, and confirmations.' },
+export const DEMO_NOTES: DemoNote[] = [
+  {
+    id: 'note-launch',
+    title: 'Launch notes',
+    updated: 'Today',
+    preview: 'What worked, what to improve, and final links.',
+    content: 'What worked\n\nThe visible approval flow was clear.\n\nNext\n\nVerify the final public demo link and add it to the submission.',
+  },
+  {
+    id: 'note-travel',
+    title: 'Travel plan',
+    updated: 'Yesterday',
+    preview: 'Flights, hotel, local transport, and confirmations.',
+    content: 'Flights, hotel, local transport, and confirmation details for the synthetic demo trip.',
+  },
 ];
 
-export const DEMO_MEMORY = [
+export const DEMO_MEMORY: DemoMemoryFact[] = [
   { id: 'memory-account', category: 'Accounts', fact: 'Northstar Work is the default account for work tasks and calendar events.' },
   { id: 'memory-reminders', category: 'Preferences', fact: 'Ask for a reminder time when creating important calendar events.' },
   { id: 'memory-notes', category: 'Preferences', fact: 'Keep task notes short; create a Drive note only for genuinely long reference material.' },
 ];
 
-export const DEMO_ACTIVITY = [
+export const DEMO_ACTIVITY: DemoActivityItem[] = [
   { id: 'activity-brief', actor: 'ChatGPT', action: 'Opened the daily brief', time: 'Just now', type: 'read' },
   { id: 'activity-scan', actor: 'Workspace', action: 'Scanned unread mail across 3 demo accounts', time: '2 minutes ago', type: 'read' },
   { id: 'activity-task', actor: 'You', action: 'Approved “Publish the workspace demo video”', time: 'Yesterday', type: 'write' },

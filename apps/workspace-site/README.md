@@ -2,6 +2,13 @@
 
 This ChatGPT Site provides a polished WebMCP dashboard for the existing OpenAssist Workspace MCP.
 
+## Demo and Live data
+
+- **Demo mode** gives every visitor a separate synthetic workspace in Cloudflare D1. Judges can create and update demo tasks, calendar events, notes, and memory without touching Google.
+- The demo workspace expires after 24 hours. **Reset demo** immediately deletes it and creates a clean copy.
+- **Live mode** is owner-only and continues to use the existing Workspace MCP and Composio-managed Google connections.
+- Demo and Live routes are separate. Private Google content is never copied into the demo database.
+
 ## Local checks
 
 ```bash
@@ -40,4 +47,4 @@ https://YOUR_SITE_ORIGIN/api/workspace/callback
 
 After signing in with the intended ChatGPT account, send the one-time bootstrap code to `/api/owner/bootstrap`. The first successful bootstrap permanently binds the owner role. A second user cannot replace it.
 
-Do not publish a shared Site until synthetic demo isolation, authentication, and the owner binding have been checked in a private stage.
+Before sharing the Site, verify synthetic demo isolation and owner binding in a private stage. Public visitors should open in Demo mode and must never be able to enter owner Live mode.

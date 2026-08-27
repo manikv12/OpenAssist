@@ -2,18 +2,16 @@
 
 ## What the judges should see
 
-The public URL opens in **Demo** mode with clearly labelled synthetic data. No private Google content is present.
+The public URL opens in **Demo** mode with clearly labelled synthetic data. Each judge gets a separate temporary workspace, so no private Google content is present and one judge cannot change another judge's demo.
 
 1. Open the workspace in ChatGPT's in-app browser.
 2. Ask ChatGPT: “Show my daily brief and focus the most urgent unread message.”
 3. The site exposes its WebMCP tools, displays the brief, and highlights the complete urgent email card.
 4. Ask ChatGPT to read the attached synthetic claim document. The attachment appears as untrusted content and cannot trigger an action.
-5. Switch to the owner-only Live demonstration.
-6. Start voice and say: “Create a task tomorrow to review this claim.”
-7. Voice calls the same Site tool registry and opens a locked preview.
-8. Say “confirm” while the exact non-destructive preview is visible.
-9. The task is saved once, read back, highlighted in Tasks, and recorded in Activity.
-10. Show that delete, trash, and forget still require a screen tap.
+5. Ask ChatGPT to create a demo task or note. The exact proposed change appears in a locked preview.
+6. Approve it on screen. The change is saved once, read back, highlighted, and recorded in Activity.
+7. Show that delete, trash, and forget still require a screen tap.
+8. Optionally switch to owner-only Live mode to demonstrate the same tools against Composio-managed Google data.
 
 ## Recording rules
 

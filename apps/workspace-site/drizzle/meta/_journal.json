@@ -8,6 +8,13 @@
       "when": 1787850685521,
       "tag": "0000_spicy_rocket_raccoon",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1787859569834,
+      "tag": "0001_perpetual_typhoid_mary",
+      "breakpoints": true
     }
   ]
 }

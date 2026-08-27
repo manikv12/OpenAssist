@@ -9,6 +9,8 @@ function fail(message: string): never {
 function validateValue(value: unknown, schema: JsonSchema, path: string): void {
   if (schema.type === 'string') {
     if (typeof value !== 'string') fail(`${path} must be text.`);
+    if (typeof schema.minLength === 'number' && value.length < schema.minLength) fail(`${path} is too short.`);
+    if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) fail(`${path} is too long.`);
     if (Array.isArray(schema.enum) && !schema.enum.includes(value)) fail(`${path} is not an allowed value.`);
     return;
   }

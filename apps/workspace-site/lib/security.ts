@@ -120,6 +120,40 @@ export type ActionPreviewPayload = {
   destructive: boolean;
 };
 
+export type DemoSessionTokenPayload = {
+  version: 1;
+  purpose: 'demo_workspace';
+  workspaceId: string;
+  nonce: string;
+  issuedAt: number;
+  expiresAt: number;
+};
+
+export async function signDemoSessionToken(payload: DemoSessionTokenPayload, secret: string): Promise<string> {
+  const encodedPayload = bytesToBase64Url(encoder.encode(canonicalJson(payload)));
+  const signature = await hmac(encodedPayload, secret);
+  return `${encodedPayload}.${bytesToBase64Url(signature)}`;
+}
+
+export async function verifyDemoSessionToken(token: string, secret: string): Promise<DemoSessionTokenPayload> {
+  const [encodedPayload, encodedSignature] = token.split('.');
+  if (!encodedPayload || !encodedSignature) throw new Error('Demo session is invalid.');
+  const expected = await hmac(encodedPayload, secret);
+  if (!timingSafeEqual(expected, base64UrlToBytes(encodedSignature))) throw new Error('Demo session is invalid.');
+  const payload = JSON.parse(decoder.decode(base64UrlToBytes(encodedPayload))) as DemoSessionTokenPayload;
+  if (
+    payload.version !== 1 ||
+    payload.purpose !== 'demo_workspace' ||
+    !payload.workspaceId ||
+    !payload.nonce ||
+    !Number.isFinite(payload.issuedAt) ||
+    !Number.isFinite(payload.expiresAt)
+  ) {
+    throw new Error('Demo session is invalid.');
+  }
+  return payload;
+}
+
 export async function signActionPreview(payload: ActionPreviewPayload, secret: string): Promise<string> {
   const encodedPayload = bytesToBase64Url(encoder.encode(canonicalJson(payload)));
   const signature = await hmac(encodedPayload, secret);
