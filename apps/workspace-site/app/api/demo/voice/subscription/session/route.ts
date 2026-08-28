@@ -1,5 +1,6 @@
 import { attachDemoCookie, getOrCreateDemoSession } from '../../../../../../lib/demo-session';
-import { assertSameOrigin, readJsonObject, safeRoute } from '../../../../../../lib/http';
+import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../../../lib/http';
+import { activateJudgeVoiceSession, failJudgeVoiceEvent, reserveJudgeVoiceSession } from '../../../../../../lib/judge-voice-store';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
@@ -13,6 +14,8 @@ export async function POST(request: Request): Promise<Response> {
     if (threadId != null && (typeof threadId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(threadId))) {
       throw new Response('The selected voice conversation is invalid.', { status: 400 });
     }
+    const reservation = await reserveJudgeVoiceSession(session.workspaceId, 'subscription_session', 1_800);
+    if (!reservation) throw new Response('The judge voice session could not be reserved.', { status: 503 });
     const response = await callVoiceGateway(
       request,
       demoVoiceUserId(session.workspaceId),
@@ -20,9 +23,17 @@ export async function POST(request: Request): Promise<Response> {
       { method: 'POST', body: JSON.stringify({ sdp, threadId }) },
       'demo',
     );
-    return attachDemoCookie(new Response(response.body, {
-      status: response.status,
-      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-    }), session);
+    const result = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) {
+      await failJudgeVoiceEvent(reservation.eventId, response.status);
+      return attachDemoCookie(json(result, { status: response.status }), session);
+    }
+    const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
+    if (!sessionId) {
+      await failJudgeVoiceEvent(reservation.eventId, 502);
+      throw new Response('The judge subscription voice service did not return a session.', { status: 502 });
+    }
+    await activateJudgeVoiceSession(reservation.eventId, 'subscription_session', sessionId, 1_800);
+    return attachDemoCookie(json(result), session);
   });
 }

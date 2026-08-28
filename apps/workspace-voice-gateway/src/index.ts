@@ -24,6 +24,31 @@ interface Env {
 const AUTH_LIMIT = 256_000;
 const SDP_LIMIT = 300_000;
 const THREAD_STATE_LIMIT = 24_000_000;
+const DEMO_FUNDING_OBJECT_KEY = 'admin/judge-voice-funding.enc';
+const DEFAULT_DAILY_SESSION_LIMIT = 25;
+const DEFAULT_DEMO_SECONDS = 300;
+const DEFAULT_DEMO_TOOL_LIMIT = 12;
+
+type DemoFundingConfig = {
+  version: 1;
+  enabled: boolean;
+  apiKey?: string;
+  dailySessionLimit: number;
+  sessionSeconds: number;
+  maxToolCalls: number;
+  updatedAt: number;
+};
+
+type ResolvedDemoFunding = {
+  available: boolean;
+  apiKey: string | null;
+  source: 'owner_key' | 'worker_secret' | 'none';
+  enabled: boolean;
+  dailySessionLimit: number;
+  sessionSeconds: number;
+  maxToolCalls: number;
+  updatedAt: number | null;
+};
 
 export class VoiceContainer extends Container<Env> {
   defaultPort = 8080;
@@ -172,6 +197,150 @@ async function saveEncryptedThreadState(env: Env, userHash: string, snapshot: un
   });
 }
 
+function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, parsed));
+}
+
+function normalizedFundingConfig(value: unknown): DemoFundingConfig | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const apiKey = typeof item.apiKey === 'string' && item.apiKey.length >= 20 && item.apiKey.length <= 512 && !/\s/.test(item.apiKey)
+    ? item.apiKey
+    : undefined;
+  return {
+    version: 1,
+    enabled: item.enabled === true,
+    ...(apiKey ? { apiKey } : {}),
+    dailySessionLimit: boundedInteger(item.dailySessionLimit, DEFAULT_DAILY_SESSION_LIMIT, 1, 100),
+    sessionSeconds: boundedInteger(item.sessionSeconds, DEFAULT_DEMO_SECONDS, 60, 300),
+    maxToolCalls: boundedInteger(item.maxToolCalls, DEFAULT_DEMO_TOOL_LIMIT, 1, 25),
+    updatedAt: boundedInteger(item.updatedAt, Date.now(), 1, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+async function savedFundingConfig(env: Env): Promise<DemoFundingConfig | null> {
+  const object = await env.VOICE_AUTH.get(DEMO_FUNDING_OBJECT_KEY);
+  if (!object) return null;
+  const plaintext = await decryptAuth(await object.text(), env.VOICE_AUTH_ENCRYPTION_KEY);
+  if (plaintext.length > 4_096) throw new Error('Saved judge voice settings are invalid.');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(plaintext);
+  } catch {
+    throw new Error('Saved judge voice settings are invalid.');
+  }
+  const config = normalizedFundingConfig(parsed);
+  if (!config) throw new Error('Saved judge voice settings are invalid.');
+  return config;
+}
+
+async function resolveDemoFunding(env: Env): Promise<ResolvedDemoFunding> {
+  const saved = await savedFundingConfig(env);
+  if (saved) {
+    const configuredKey = saved.apiKey ?? env.OPENAI_API_KEY ?? null;
+    const apiKey = saved.enabled ? configuredKey : null;
+    return {
+      available: Boolean(apiKey),
+      apiKey,
+      source: configuredKey ? (saved.apiKey ? 'owner_key' : 'worker_secret') : 'none',
+      enabled: saved.enabled,
+      dailySessionLimit: saved.dailySessionLimit,
+      sessionSeconds: saved.sessionSeconds,
+      maxToolCalls: saved.maxToolCalls,
+      updatedAt: saved.updatedAt,
+    };
+  }
+  const apiKey = env.OPENAI_API_KEY ?? null;
+  return {
+    available: Boolean(apiKey),
+    apiKey,
+    source: apiKey ? 'worker_secret' : 'none',
+    enabled: Boolean(apiKey),
+    dailySessionLimit: DEFAULT_DAILY_SESSION_LIMIT,
+    sessionSeconds: DEFAULT_DEMO_SECONDS,
+    maxToolCalls: DEFAULT_DEMO_TOOL_LIMIT,
+    updatedAt: null,
+  };
+}
+
+async function validateRealtimeApiKey(apiKey: string, env: Env): Promise<void> {
+  if (apiKey.length < 20 || apiKey.length > 512 || /\s/.test(apiKey)) {
+    throw new Response('The OpenAI API key format is invalid.', { status: 400 });
+  }
+  const model = encodeURIComponent(env.DEMO_REALTIME_MODEL || 'gpt-realtime-2.1-mini');
+  const response = await fetch(`https://api.openai.com/v1/models/${model}`, {
+    method: 'GET',
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
+  await response.body?.cancel().catch(() => undefined);
+  if (!response.ok) {
+    throw new Response(
+      response.status === 401 || response.status === 403
+        ? 'The OpenAI API key could not be verified for this project.'
+        : 'OpenAI could not verify the demo voice key right now.',
+      { status: response.status === 401 || response.status === 403 ? 400 : 503 },
+    );
+  }
+}
+
+function publicFundingStatus(funding: ResolvedDemoFunding) {
+  return {
+    available: funding.available,
+    enabled: funding.enabled,
+    keyConfigured: funding.source !== 'none',
+    source: funding.source,
+    dailySessionLimit: funding.dailySessionLimit,
+    sessionSeconds: funding.sessionSeconds,
+    maxToolCalls: funding.maxToolCalls,
+    updatedAt: funding.updatedAt,
+  };
+}
+
+async function saveFundingConfig(env: Env, request: Request): Promise<Response> {
+  const body = await readJson(request, 8_192);
+  const current = await savedFundingConfig(env);
+  const suppliedKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+  if (suppliedKey) await validateRealtimeApiKey(suppliedKey, env);
+  const config: DemoFundingConfig = {
+    version: 1,
+    enabled: body.enabled !== false,
+    ...(suppliedKey ? { apiKey: suppliedKey } : current?.apiKey ? { apiKey: current.apiKey } : {}),
+    dailySessionLimit: boundedInteger(body.dailySessionLimit, current?.dailySessionLimit ?? DEFAULT_DAILY_SESSION_LIMIT, 1, 100),
+    sessionSeconds: boundedInteger(body.sessionSeconds, current?.sessionSeconds ?? DEFAULT_DEMO_SECONDS, 60, 300),
+    maxToolCalls: boundedInteger(body.maxToolCalls, current?.maxToolCalls ?? DEFAULT_DEMO_TOOL_LIMIT, 1, 25),
+    updatedAt: Date.now(),
+  };
+  if (config.enabled && !config.apiKey && !env.OPENAI_API_KEY) {
+    throw new Response('Add an OpenAI API key before enabling funded judge voice.', { status: 400 });
+  }
+  const encrypted = await encryptAuth(JSON.stringify(config), env.VOICE_AUTH_ENCRYPTION_KEY);
+  await env.VOICE_AUTH.put(DEMO_FUNDING_OBJECT_KEY, encrypted, {
+    httpMetadata: { contentType: 'application/octet-stream' },
+    customMetadata: { version: '1', kind: 'judge-voice-funding' },
+  });
+  return json(publicFundingStatus(await resolveDemoFunding(env)));
+}
+
+async function removeFundingKey(env: Env): Promise<Response> {
+  const current = await savedFundingConfig(env);
+  const config: DemoFundingConfig = {
+    version: 1,
+    enabled: false,
+    dailySessionLimit: current?.dailySessionLimit ?? DEFAULT_DAILY_SESSION_LIMIT,
+    sessionSeconds: current?.sessionSeconds ?? DEFAULT_DEMO_SECONDS,
+    maxToolCalls: current?.maxToolCalls ?? DEFAULT_DEMO_TOOL_LIMIT,
+    updatedAt: Date.now(),
+  };
+  const encrypted = await encryptAuth(JSON.stringify(config), env.VOICE_AUTH_ENCRYPTION_KEY);
+  await env.VOICE_AUTH.put(DEMO_FUNDING_OBJECT_KEY, encrypted, {
+    httpMetadata: { contentType: 'application/octet-stream' },
+    customMetadata: { version: '1', kind: 'judge-voice-funding' },
+  });
+  return json(publicFundingStatus(await resolveDemoFunding(env)));
+}
+
 async function restoreThreadState(container: ReturnType<typeof voiceContainer>, env: Env, userHash: string): Promise<void> {
   const saved = await env.VOICE_AUTH.get(threadStateObjectKey(userHash));
   const snapshot = saved ? await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY) : null;
@@ -215,7 +384,8 @@ function demoRealtimeTools() {
 
 async function createDemoRealtimeCall(request: Request, env: Env, payload: GatewayToken): Promise<Response> {
   if (payload.access !== 'demo') throw new Response('Capped demo voice is available only in Demo mode.', { status: 403 });
-  if (!env.OPENAI_API_KEY) throw new Response('Capped demo voice is not configured yet.', { status: 503 });
+  const funding = await resolveDemoFunding(env);
+  if (!funding.available || !funding.apiKey) throw new Response('Capped demo voice is not configured yet.', { status: 503 });
   const body = await readJson(request, SDP_LIMIT + 2_000);
   const sdp = typeof body.sdp === 'string' ? body.sdp : '';
   if (!sdp || sdp.length > SDP_LIMIT) throw new Response('A valid WebRTC offer is required.', { status: 400 });
@@ -240,7 +410,7 @@ async function createDemoRealtimeCall(request: Request, env: Env, payload: Gatew
   const response = await fetch('https://api.openai.com/v1/realtime/calls', {
     method: 'POST',
     headers: {
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      authorization: `Bearer ${funding.apiKey}`,
       'OpenAI-Safety-Identifier': `openassist_demo_${payload.userHash}`,
     },
     body: form,
@@ -258,9 +428,9 @@ async function createDemoRealtimeCall(request: Request, env: Env, payload: Gatew
     sdp: answerSdp,
     callId,
     model: session.model,
-    warningAfterSeconds: 240,
-    expiresAfterSeconds: 300,
-    maxToolCalls: 12,
+    warningAfterSeconds: Math.max(30, funding.sessionSeconds - 60),
+    expiresAfterSeconds: funding.sessionSeconds,
+    maxToolCalls: funding.maxToolCalls,
   });
 }
 
@@ -269,10 +439,12 @@ async function stopDemoRealtimeCall(request: Request, env: Env, payload: Gateway
   const body = await readJson(request);
   const callId = typeof body.callId === 'string' ? body.callId : '';
   if (!/^[A-Za-z0-9_-]{8,128}$/.test(callId)) throw new Response('The demo voice call is invalid.', { status: 400 });
-  if (env.OPENAI_API_KEY) {
+  const saved = await savedFundingConfig(env);
+  const apiKey = saved?.apiKey ?? env.OPENAI_API_KEY ?? null;
+  if (apiKey) {
     await fetch(`https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/hangup`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      headers: { authorization: `Bearer ${apiKey}` },
     }).catch(() => undefined);
   }
   return json({ status: 'stopped' });
@@ -304,6 +476,15 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   }
 
   const payload = await requireSiteToken(request, env);
+  if (payload.access === 'owner' && request.method === 'GET' && url.pathname === '/admin/demo-config') {
+    return json(publicFundingStatus(await resolveDemoFunding(env)));
+  }
+  if (payload.access === 'owner' && request.method === 'PUT' && url.pathname === '/admin/demo-config') {
+    return saveFundingConfig(env, request);
+  }
+  if (payload.access === 'owner' && request.method === 'DELETE' && url.pathname === '/admin/demo-config/key') {
+    return removeFundingKey(env);
+  }
   if (request.method === 'POST' && url.pathname === '/demo/realtime') {
     return createDemoRealtimeCall(request, env, payload);
   }
@@ -410,7 +591,8 @@ export default {
     try {
       const url = new URL(request.url);
       if (request.method === 'GET' && url.pathname === '/health') {
-        return json({ status: 'ok', containerRouting: 'isolated_per_user', cappedDemoConfigured: Boolean(env.OPENAI_API_KEY), runtimeVersion: env.CODEX_RUNTIME_VERSION });
+        const funding = await resolveDemoFunding(env);
+        return json({ status: 'ok', containerRouting: 'isolated_per_user', cappedDemoConfigured: funding.available, sessionSeconds: funding.sessionSeconds, maxToolCalls: funding.maxToolCalls, dailySessionLimit: funding.dailySessionLimit, runtimeVersion: env.CODEX_RUNTIME_VERSION });
       }
       return await handleAuthorized(request, env);
     } catch (error) {

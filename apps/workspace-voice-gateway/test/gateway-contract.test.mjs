@@ -90,9 +90,11 @@ test('voice has strict per-user, time, and instance limits', async () => {
   assert.match(worker, /sleepAfter = '15m'/);
   assert.match(server, /25 \* 60_000/);
   assert.match(server, /30 \* 60_000/);
-  assert.match(worker, /warningAfterSeconds: 240/);
-  assert.match(worker, /expiresAfterSeconds: 300/);
-  assert.match(worker, /maxToolCalls: 12/);
+  assert.match(worker, /DEFAULT_DEMO_SECONDS = 300/);
+  assert.match(worker, /DEFAULT_DEMO_TOOL_LIMIT = 12/);
+  assert.match(worker, /warningAfterSeconds: Math\.max\(30, funding\.sessionSeconds - 60\)/);
+  assert.match(worker, /expiresAfterSeconds: funding\.sessionSeconds/);
+  assert.match(worker, /maxToolCalls: funding\.maxToolCalls/);
   assert.match(config, /"max_instances": 10/);
 });
 
@@ -110,6 +112,17 @@ test('the funded demo fallback is server-side, synthetic-only, and uses the exac
   assert.match(worker, /\/hangup/);
   assert.match(worker, /synthetic workspace visible in the current browser tab/);
   assert.match(config, /"DEMO_REALTIME_MODEL": "gpt-realtime-2\.1-mini"/);
+});
+
+test('owner-funded judge voice settings are encrypted and never returned with the key', async () => {
+  const worker = await read('src/index.ts');
+  assert.match(worker, /DEMO_FUNDING_OBJECT_KEY = 'admin\/judge-voice-funding\.enc'/);
+  assert.match(worker, /encryptAuth\(JSON\.stringify\(config\), env\.VOICE_AUTH_ENCRYPTION_KEY\)/);
+  assert.match(worker, /payload\.access === 'owner'/);
+  assert.match(worker, /url\.pathname === '\/admin\/demo-config'/);
+  const publicStatus = worker.match(/function publicFundingStatus[\s\S]*?\n}/)?.[0] ?? '';
+  assert.doesNotMatch(publicStatus, /apiKey/);
+  assert.match(publicStatus, /keyConfigured/);
 });
 
 test('Linux Codex conversations are saved, encrypted, listed, and resumable', async () => {

@@ -167,11 +167,11 @@ test('demo judges can use an isolated ChatGPT subscription or the server-funded 
   const subscriptionAuth = await read('app/api/demo/voice/subscription/auth/start/route.ts');
   const demoStore = await read('lib/demo-store.ts');
 
-  assert.match(app, /Quick judge demo/);
+  assert.match(app, /Funded judge demo/);
   assert.match(app, /My ChatGPT/);
   assert.match(app, /response\.function_call_arguments\.done/);
-  assert.match(app, /cappedToolCountRef\.current > 12/);
-  assert.match(app, /Five-minute demo voice session ended/);
+  assert.match(app, /voiceToolCountRef\.current > toolLimit/);
+  assert.match(app, /Funded demo voice session ended/);
   assert.match(gatewayClient, /access: 'owner' \| 'demo'/);
   for (const source of [cappedSession, subscriptionSession, subscriptionAuth]) {
     assert.match(source, /getOrCreateDemoSession/);
@@ -183,4 +183,24 @@ test('demo judges can use an isolated ChatGPT subscription or the server-funded 
   assert.doesNotMatch(demoStore, /FUNDED_VOICE_(WORKSPACE|GLOBAL)_LIMIT/);
   const siteFiles = [app, gatewayClient, cappedSession, subscriptionSession, subscriptionAuth].join('\n');
   assert.doesNotMatch(siteFiles, /OPENAI_API_KEY/);
+});
+
+test('owner judge voice controls never expose the funded key or judge content', async () => {
+  const schema = await read('drizzle/0002_bright_omega_flight.sql');
+  const ownerConfig = await read('app/api/owner/judge-voice/config/route.ts');
+  const usage = await read('lib/judge-voice-store.ts');
+  const app = await read('app/components/workspace-app.tsx');
+
+  assert.match(ownerConfig, /requireOwner\(\)/);
+  assert.match(ownerConfig, /assertSameOrigin\(request\)/);
+  assert.match(app, /never returned to this page or shown to judges/);
+  assert.match(app, /No audio, transcript, prompt, tool arguments, or Workspace content is saved/);
+  assert.match(schema, /visitor_hash/);
+  assert.match(schema, /external_id_hash/);
+  for (const forbidden of ['api_key', 'transcript', 'audio', 'prompt', 'tool_arguments', 'message_content']) {
+    assert.doesNotMatch(schema.toLowerCase(), new RegExp(forbidden));
+  }
+  assert.match(usage, /judge_voice_visitor/);
+  assert.match(usage, /judge_voice_external_id/);
+  assert.doesNotMatch(usage, /console\.(log|info|debug)\s*\(/);
 });

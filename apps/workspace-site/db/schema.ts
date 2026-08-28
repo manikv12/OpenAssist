@@ -36,6 +36,27 @@ export const voiceAuth = sqliteTable('voice_auth', {
   updatedAt: integer('updated_at').notNull(),
 });
 
+// Anonymous operational metadata for the public judge voice demo. This table
+// intentionally has no transcript, audio, prompt, tool arguments, or Workspace
+// content columns. Visitor and gateway identifiers are stored only as one-way
+// hashes so the owner can monitor reliability without tracking judge identity.
+export const judgeVoiceEvents = sqliteTable('judge_voice_events', {
+  eventId: text('event_id').primaryKey(),
+  visitorHash: text('visitor_hash').notNull(),
+  externalIdHash: text('external_id_hash'),
+  kind: text('kind', { enum: ['funded_session', 'subscription_session', 'subscription_sign_in'] }).notNull(),
+  status: text('status', { enum: ['starting', 'active', 'stopped', 'failed', 'expired'] }).notNull(),
+  startedAt: integer('started_at').notNull(),
+  expiresAt: integer('expires_at'),
+  endedAt: integer('ended_at'),
+  toolCalls: integer('tool_calls').notNull().default(0),
+  errorCode: text('error_code'),
+}, (table) => [
+  index('judge_voice_events_started_idx').on(table.startedAt),
+  index('judge_voice_events_status_expires_idx').on(table.status, table.expiresAt),
+  index('judge_voice_events_visitor_idx').on(table.visitorHash, table.startedAt),
+]);
+
 // Only a one-way request hash is retained to prevent duplicate writes. The
 // original tool arguments and Google content are never placed in D1.
 export const actionReceipts = sqliteTable('action_receipts', {

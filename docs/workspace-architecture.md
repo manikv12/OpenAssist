@@ -52,10 +52,11 @@ Live records contain only:
 - Display preferences.
 - Voice authentication pointer, status, and revision.
 - One-way idempotency hashes with short expiration.
+- One-way judge-session hashes, session mode, status, timestamps, safe error class, and tool-call count for owner monitoring.
 
 Demo records contain only clearly labelled synthetic accounts, mail, tasks, events, notes, memory, and activity for that visitor's temporary workspace. They have no Google identifiers or credentials, expire after 24 hours, and are deleted on reset.
 
-D1 and server logs do not contain any real Google messages, Gmail IDs, attachments, task text, calendar text, notes, memory text, audio, or voice transcripts.
+D1 and server logs do not contain any real Google messages, Gmail IDs, attachments, task text, calendar text, notes, memory text, audio, voice transcripts, prompts, or voice tool arguments.
 
 R2 contains only AES-GCM encrypted ChatGPT subscription authentication and saved Codex thread files, separated by an opaque visitor hash. The key stays in the Worker. Disconnect deletes that visitor's objects, runs Codex logout, and stops only that visitor's Container.
 
@@ -65,7 +66,7 @@ R2 contains only AES-GCM encrypted ChatGPT subscription authentication and saved
 - It stops after 15 idle minutes.
 - The user is warned after 25 minutes and the voice session stops after 30 minutes.
 - ChatGPT device sign-in is forced inside Containers. API-key variables are removed from Containers.
-- The synthetic fallback key exists only in the Worker. Its sessions stop after five minutes or 12 tool calls and can execute only the visible synthetic tool registry.
+- The funded key is encrypted in private R2 and used only by the Worker. The owner can pause it and set bounded daily session, time, and tool-call limits. It can execute only the visible synthetic tool registry.
 - The Container has an empty workspace, read-only sandbox, no remote Mac, no computer control, no plugin tools, and one visible Site bridge.
 - Codex `0.150.1` is pinned.
 - The release check rejects `session.model` and any realtime request that sends `model`.

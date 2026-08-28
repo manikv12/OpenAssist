@@ -25,7 +25,7 @@ const MAX_NOTES = 25;
 const MAX_MEMORY_FACTS = 30;
 const MAX_ACTIVITY_ITEMS = 100;
 const FUNDED_VOICE_ACTOR = 'OpenAI demo voice';
-const FUNDED_VOICE_ACTION = 'Started a capped five-minute voice session';
+const FUNDED_VOICE_ACTION = 'Started a funded judge voice session';
 
 type Arguments = Record<string, unknown>;
 

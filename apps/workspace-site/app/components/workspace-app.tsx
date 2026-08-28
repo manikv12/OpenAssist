@@ -23,7 +23,7 @@ import {
   type WorkspaceToolName,
 } from '../../lib/tool-registry';
 
-type SiteUser = { id: string; email: string; name: string } | null;
+type SiteUser = { id: string; email: string; name: string; owner: boolean } | null;
 type Mode = 'demo' | 'live';
 type DemoVoiceAccess = 'capped' | 'subscription';
 type ActiveVoiceKind = 'live_subscription' | 'demo_subscription' | 'demo_capped';
@@ -65,6 +65,38 @@ type DemoApiResponse = {
   expiresAt?: number;
   result?: unknown;
   error?: string;
+};
+type JudgeVoicePolicy = {
+  available: boolean;
+  sessionSeconds: number;
+  maxToolCalls: number;
+  dailySessionLimit: number;
+};
+type JudgeVoiceConfig = JudgeVoicePolicy & {
+  enabled: boolean;
+  keyConfigured: boolean;
+  source: 'owner_key' | 'worker_secret' | 'none';
+  updatedAt: number | null;
+};
+type JudgeVoiceUsage = {
+  periodDays: number;
+  todaySessions: number;
+  fundedToday: number;
+  subscriptionToday: number;
+  activeSessions: number;
+  failures: number;
+  uniqueJudges: number;
+  totalMinutes: number;
+  recent: Array<{
+    eventId: string;
+    judgeLabel: string;
+    kind: 'funded_session' | 'subscription_session' | 'subscription_sign_in';
+    status: 'starting' | 'active' | 'stopped' | 'failed' | 'expired';
+    startedAt: number;
+    endedAt: number | null;
+    toolCalls: number;
+    errorCode: string | null;
+  }>;
 };
 
 const NAVIGATION: { view: WorkspaceView; label: string; key: string }[] = [
@@ -216,6 +248,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [voiceThreadsLoading, setVoiceThreadsLoading] = useState(false);
   const [demoVoiceAccess, setDemoVoiceAccess] = useState<DemoVoiceAccess>('capped');
   const [cappedVoiceAvailable, setCappedVoiceAvailable] = useState<boolean | null>(null);
+  const [judgeVoicePolicy, setJudgeVoicePolicy] = useState<JudgeVoicePolicy>({
+    available: false,
+    sessionSeconds: 300,
+    maxToolCalls: 12,
+    dailySessionLimit: 25,
+  });
   const [demoLoading, setDemoLoading] = useState(true);
   const [demoExpiresAt, setDemoExpiresAt] = useState<number | null>(null);
   const [editor, setEditor] = useState<EditorKind>(null);
@@ -238,9 +276,11 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const voiceDataChannelRef = useRef<RTCDataChannel | null>(null);
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const voiceCallIdRef = useRef<string | null>(null);
+  const voiceSessionIdRef = useRef<string | null>(null);
   const activeVoiceKindRef = useRef<ActiveVoiceKind | null>(null);
   const voiceTimeoutRef = useRef<number | null>(null);
-  const cappedToolCountRef = useRef(0);
+  const voiceToolCountRef = useRef(0);
+  const cappedToolLimitRef = useRef(12);
   const voiceMeterRef = useRef<VoiceLevelMeter | null>(null);
   const [voiceMeter, setVoiceMeter] = useState<VoiceLevelMeter | null>(null);
   const [voiceSpeaking, setVoiceSpeaking] = useState(false);
@@ -249,12 +289,20 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   useEffect(() => { demoVoiceAccessRef.current = demoVoiceAccess; }, [demoVoiceAccess]);
   useEffect(() => { pendingRef.current = pending; }, [pending]);
 
-  useEffect(() => {
+  const refreshJudgeVoicePolicy = useCallback(() => {
     const controller = new AbortController();
     void fetch('/api/demo/voice/status', { cache: 'no-store', signal: controller.signal })
       .then(async (response) => {
-        const body = await response.json() as { available?: boolean };
+        const body = await response.json() as Partial<JudgeVoicePolicy>;
         const available = response.ok && body.available === true;
+        const policy: JudgeVoicePolicy = {
+          available,
+          sessionSeconds: typeof body.sessionSeconds === 'number' ? body.sessionSeconds : 300,
+          maxToolCalls: typeof body.maxToolCalls === 'number' ? body.maxToolCalls : 12,
+          dailySessionLimit: typeof body.dailySessionLimit === 'number' ? body.dailySessionLimit : 25,
+        };
+        setJudgeVoicePolicy(policy);
+        cappedToolLimitRef.current = policy.maxToolCalls;
         setCappedVoiceAvailable(available);
         if (!available && demoVoiceAccessRef.current === 'capped') {
           demoVoiceAccessRef.current = 'subscription';
@@ -263,8 +311,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         }
       })
       .catch(() => setCappedVoiceAvailable(false));
-    return () => controller.abort();
+    return controller;
   }, []);
+
+  useEffect(() => {
+    const controller = refreshJudgeVoicePolicy();
+    return () => controller.abort();
+  }, [refreshJudgeVoicePolicy]);
 
   const hydrateDemoWorkspace = useCallback((workspace: DemoWorkspaceState, expiresAt?: number) => {
     setAccounts(workspace.accounts);
@@ -557,6 +610,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const stopVoice = useCallback((message = 'Voice stopped', persist = true) => {
     const kind = activeVoiceKindRef.current;
     const callId = voiceCallIdRef.current;
+    const sessionId = voiceSessionIdRef.current;
+    const toolCalls = voiceToolCountRef.current;
     const socket = voiceSocketRef.current;
     const channel = voiceDataChannelRef.current;
     const peer = voicePeerRef.current;
@@ -564,7 +619,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     const hadSession = Boolean(kind || socket || channel || peer || stream);
     activeVoiceKindRef.current = null;
     voiceCallIdRef.current = null;
-    cappedToolCountRef.current = 0;
+    voiceSessionIdRef.current = null;
+    voiceToolCountRef.current = 0;
     if (voiceTimeoutRef.current != null) window.clearTimeout(voiceTimeoutRef.current);
     voiceTimeoutRef.current = null;
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'control', action: 'stop' }));
@@ -591,13 +647,18 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
           method: 'POST',
           keepalive: true,
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ callId }),
+          body: JSON.stringify({ callId, toolCalls }),
         }).catch(() => undefined);
       } else {
         const endpoint = kind === 'demo_subscription'
           ? '/api/demo/voice/subscription/session/stop'
           : '/api/voice/session/stop';
-        void fetch(endpoint, { method: 'POST', keepalive: true })
+        void fetch(endpoint, {
+          method: 'POST',
+          keepalive: true,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(kind === 'demo_subscription' ? { sessionId, toolCalls } : {}),
+        })
           .then((response) => response.ok ? refreshVoiceThreads() : undefined)
           .catch(() => undefined);
       }
@@ -677,7 +738,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             return;
           }
           if (message.type !== 'response.function_call_arguments.done' || !message.call_id || !message.name) return;
-          cappedToolCountRef.current += 1;
+          voiceToolCountRef.current += 1;
           const sendResult = (output: unknown) => {
             if (dataChannel?.readyState !== 'open') return;
             dataChannel.send(JSON.stringify({
@@ -686,9 +747,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             }));
             dataChannel.send(JSON.stringify({ type: 'response.create' }));
           };
-          if (cappedToolCountRef.current > 12) {
-            sendResult({ error: 'This five-minute demo reached its 12-tool safety limit.' });
-            setVoiceStatus('This demo reached its 12-tool limit. Start a new session later or use your subscription.');
+          const toolLimit = cappedToolLimitRef.current;
+          if (voiceToolCountRef.current > toolLimit) {
+            sendResult({ error: `This funded demo reached its ${toolLimit}-tool safety limit.` });
+            setVoiceStatus(`This demo reached its ${toolLimit}-tool limit. Start a new session later or use your subscription.`);
             return;
           }
           if (!isWorkspaceToolName(message.name)) {
@@ -709,7 +771,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         });
         dataChannel.addEventListener('open', () => {
           setVoiceConnected(true);
-          setVoiceStatus('Listening · capped five-minute synthetic demo');
+          setVoiceStatus(`Listening · funded ${Math.ceil(judgeVoicePolicy.sessionSeconds / 60)}-minute synthetic demo`);
         });
       } else {
         activeVoiceKindRef.current = currentMode === 'demo' ? 'demo_subscription' : 'live_subscription';
@@ -726,10 +788,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(subscription ? { sdp: offerSdp, threadId: selectedVoiceThreadId } : { sdp: offerSdp }),
       });
-      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean; callId?: string; expiresAfterSeconds?: number; warningAfterSeconds?: number };
+      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean; callId?: string; sessionId?: string; expiresAfterSeconds?: number; warningAfterSeconds?: number; maxToolCalls?: number };
       if (!response.ok || body.status !== 'ready' || !body.sdp) throw new Error(body.message ?? body.error ?? 'Voice is not compatible yet.');
       if (body.threadId) setSelectedVoiceThreadId(body.threadId);
       if (body.callId) voiceCallIdRef.current = body.callId;
+      if (body.sessionId) voiceSessionIdRef.current = body.sessionId;
+      if (typeof body.maxToolCalls === 'number') cappedToolLimitRef.current = body.maxToolCalls;
       await peer.setRemoteDescription({ type: 'answer', sdp: body.sdp });
 
       if (!subscription) {
@@ -737,7 +801,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         const expirySeconds = Math.max(warningSeconds + 1, body.expiresAfterSeconds ?? 300);
         voiceTimeoutRef.current = window.setTimeout(() => {
           setVoiceStatus('One minute remains in this capped demo voice session.');
-          voiceTimeoutRef.current = window.setTimeout(() => stopVoice('Five-minute demo voice session ended.'), (expirySeconds - warningSeconds) * 1_000);
+          voiceTimeoutRef.current = window.setTimeout(() => stopVoice('Funded demo voice session ended.'), (expirySeconds - warningSeconds) * 1_000);
         }, warningSeconds * 1_000);
         return;
       }
@@ -748,6 +812,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       socket.addEventListener('message', (event) => {
         let message: { type?: string; callId?: string; operation?: string; tool?: string; args?: Record<string, unknown>; previewId?: string; message?: string };
         try { message = JSON.parse(String(event.data)) as typeof message; } catch { return; }
+        if (message.type === 'tool_call') voiceToolCountRef.current += 1;
         if (message.type === 'tool_call' && message.callId && message.operation === 'confirm_preview' && message.previewId) {
           void approve('voice', message.previewId).then((result) => {
             if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'tool_result', callId: message.callId, success: true, result }));
@@ -776,7 +841,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     } catch (error) {
       stopVoice(error instanceof Error ? error.message : 'Voice is temporarily unavailable.');
     }
-  }, [approve, invokeTool, selectedVoiceThreadId, stopVoice, user, voiceConnected]);
+  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, selectedVoiceThreadId, stopVoice, user, voiceConnected]);
 
   const toggleVoiceMute = useCallback(() => {
     const next = !voiceMuted;
@@ -797,10 +862,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setVoiceThreads([]);
     setSelectedVoiceThreadId(null);
     setVoiceStatus(access === 'capped'
-      ? 'Ready for a capped five-minute synthetic demo'
+      ? `Ready for a funded ${Math.ceil(judgeVoicePolicy.sessionSeconds / 60)}-minute synthetic demo`
       : 'Ready to connect your own ChatGPT subscription');
     if (access === 'subscription') void refreshVoiceThreads(true);
-  }, [cappedVoiceAvailable, refreshVoiceThreads, stopVoice, voiceConnected]);
+  }, [cappedVoiceAvailable, judgeVoicePolicy.sessionSeconds, refreshVoiceThreads, stopVoice, voiceConnected]);
 
   useEffect(() => () => stopVoice('Voice stopped'), [stopVoice]);
 
@@ -950,12 +1015,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} onChange={selectDemoVoiceAccess} /></div></div>}
+            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={selectDemoVoiceAccess} /></div></div>}
             {(mode === 'live' || (mode === 'demo' && demoVoiceAccess === 'subscription')) && <div className="mt-4 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
-                ? <ActivityView mode={mode} activity={activity} />
+                ? <ActivityView mode={mode} activity={activity} owner={Boolean(user?.owner)} onVoicePolicyChanged={refreshJudgeVoicePolicy} />
                 : <LiveWorkspaceView view={view} live={live} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onOpenNote={(item) => void openLiveNote(item)} />
             ) : demoLoading ? <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Preparing your private demo workspace…</p></div></div> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
@@ -970,7 +1035,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             </div>
           </div>
         </section>
-        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
+        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} judgeVoicePolicy={judgeVoicePolicy} activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
       </div>
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
@@ -1071,9 +1136,9 @@ function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, 
   );
 }
 
-function DemoVoiceChoice({ value, connected, cappedAvailable, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; onChange: (access: DemoVoiceAccess) => void }) {
+function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; policy: JudgeVoicePolicy; onChange: (access: DemoVoiceAccess) => void }) {
   const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
-    { id: 'capped', title: 'Quick judge demo', detail: 'Server-funded · 5 min · 12 tools' },
+    { id: 'capped', title: 'Funded judge demo', detail: `No sign-in · ${Math.ceil(policy.sessionSeconds / 60)} min · ${policy.maxToolCalls} tools` },
     { id: 'subscription', title: 'My ChatGPT', detail: 'Private isolated sign-in · saved chats' },
   ];
   return (
@@ -1088,11 +1153,11 @@ function DemoVoiceChoice({ value, connected, cappedAvailable, onChange }: { valu
   );
 }
 
-function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
+function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePolicy, activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; judgeVoicePolicy: JudgeVoicePolicy; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
   const voiceLabel = mode === 'live'
     ? 'Owner voice'
     : demoVoiceAccess === 'capped'
-      ? 'Quick demo voice'
+      ? 'Funded demo voice'
       : 'ChatGPT subscription voice';
   return (
     <aside className="min-w-0 border-l border-white/[0.08] bg-[#08090d] px-5 py-7 max-xl:hidden">
@@ -1113,7 +1178,7 @@ function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, activity, t
       </div>
       <div className="mt-8 border-t border-white/[0.08] pt-6">
         <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5b6879]">Voice</p>
-        {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} onChange={onDemoVoiceAccess} /></div>}
+        {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} /></div>}
         <button onClick={onVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl px-2 py-3 text-left transition hover:bg-white/[0.04]">
           <VoiceOrb phase={orbPhase} meter={voiceMeter} size={44} />
           <span className="min-w-0 flex-1">
@@ -1626,10 +1691,11 @@ function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, on
   );
 }
 
-function ActivityView({ mode, activity }: { mode: Mode; activity: typeof DEMO_ACTIVITY }) {
+function ActivityView({ mode, activity, owner = false, onVoicePolicyChanged }: { mode: Mode; activity: typeof DEMO_ACTIVITY; owner?: boolean; onVoicePolicyChanged?: () => void }) {
   const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(activity, PAGE_SIZE, activity.length);
   return (
     <section className="min-w-0">
+      {mode === 'live' && owner && <JudgeVoiceAdmin onChanged={onVoicePolicyChanged} />}
       {total ? (
         <>
           <div className="space-y-2">
@@ -1649,6 +1715,153 @@ function ActivityView({ mode, activity }: { mode: Mode; activity: typeof DEMO_AC
         </>
       ) : <EmptyState title="No activity yet." hint="Reads and approved writes will appear here as they happen." />}
       <p className="mt-7 max-w-2xl text-sm leading-6 text-[#7c8a9c]">{mode === 'demo' ? 'This temporary activity belongs only to the isolated judge workspace and expires with it.' : 'Activity stores safe metadata only. It does not copy message bodies, attachments, task text, calendar text, notes, memory, audio, or transcripts into the database.'}</p>
+    </section>
+  );
+}
+
+function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
+  const [config, setConfig] = useState<JudgeVoiceConfig | null>(null);
+  const [usage, setUsage] = useState<JudgeVoiceUsage | null>(null);
+  const [apiKey, setApiKey] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [configResponse, usageResponse] = await Promise.all([
+        fetch('/api/owner/judge-voice/config', { cache: 'no-store' }),
+        fetch('/api/owner/judge-voice/usage?days=7', { cache: 'no-store' }),
+      ]);
+      const configBody = await configResponse.json() as JudgeVoiceConfig & { error?: string };
+      const usageBody = await usageResponse.json() as JudgeVoiceUsage & { error?: string };
+      if (!configResponse.ok) throw new Error(configBody.error ?? 'Judge voice settings could not be loaded.');
+      if (!usageResponse.ok) throw new Error(usageBody.error ?? 'Judge voice usage could not be loaded.');
+      setConfig(configBody);
+      setUsage(usageBody);
+      setMessage('');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Judge voice controls could not be loaded.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(timeout);
+  }, [load]);
+
+  const save = useCallback(async (next?: Partial<JudgeVoiceConfig>) => {
+    if (!config) return;
+    setSaving(true);
+    setMessage('');
+    try {
+      const response = await fetch('/api/owner/judge-voice/config', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          enabled: next?.enabled ?? config.enabled,
+          apiKey,
+          dailySessionLimit: next?.dailySessionLimit ?? config.dailySessionLimit,
+          sessionSeconds: next?.sessionSeconds ?? config.sessionSeconds,
+          maxToolCalls: next?.maxToolCalls ?? config.maxToolCalls,
+        }),
+      });
+      const body = await response.json() as JudgeVoiceConfig & { error?: string };
+      if (!response.ok) throw new Error(body.error ?? 'Judge voice settings could not be saved.');
+      setConfig(body);
+      setApiKey('');
+      setMessage(body.enabled ? 'Funded judge voice is enabled.' : 'Funded judge voice is paused.');
+      onChanged?.();
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Judge voice settings could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  }, [apiKey, config, load, onChanged]);
+
+  const removeKey = useCallback(async () => {
+    setSaving(true);
+    setMessage('');
+    try {
+      const response = await fetch('/api/owner/judge-voice/config', { method: 'DELETE' });
+      const body = await response.json() as JudgeVoiceConfig & { error?: string };
+      if (!response.ok) throw new Error(body.error ?? 'The judge voice key could not be removed.');
+      setConfig(body);
+      setApiKey('');
+      setMessage('The funded key was removed and judge-funded voice is paused.');
+      onChanged?.();
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'The judge voice key could not be removed.');
+    } finally {
+      setSaving(false);
+    }
+  }, [load, onChanged]);
+
+  return (
+    <section className="mb-8 overflow-hidden rounded-[24px] border border-[#E0BC63]/20 bg-[linear-gradient(145deg,rgba(224,188,99,0.07),rgba(255,255,255,0.018))] shadow-[0_18px_70px_rgba(0,0,0,0.22)]">
+      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-white/[0.08] px-5 py-5 sm:px-6">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">Owner only</p>
+          <h2 className="mt-1 text-xl font-semibold">Judge voice controls</h2>
+          <p className="mt-1 max-w-2xl text-sm leading-6 text-[#7c8a9c]">Fund the quick demo, set app limits, or let judges use their own private ChatGPT sign-in.</p>
+        </div>
+        <button type="button" onClick={() => void load()} disabled={loading || saving} className="rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white disabled:opacity-50">Refresh</button>
+      </div>
+
+      {loading && !config ? <div className="px-6 py-8 text-sm text-[#7c8a9c]">Loading secure settings…</div> : config && (
+        <div className="grid gap-6 px-5 py-6 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] sm:px-6">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${config.available ? 'bg-[#68D391]/10 text-[#8BE7AE]' : 'bg-[#FF8B78]/10 text-[#FFA898]'}`}>{config.available ? 'Funded demo ready' : config.enabled ? 'Key needed' : 'Paused'}</span>
+              <span className="text-xs text-[#667480]">{config.source === 'owner_key' ? 'Encrypted owner key' : config.source === 'worker_secret' ? 'Protected deployment key' : 'No funded key'}</span>
+            </div>
+
+            <label className="mt-5 block">
+              <span className="mb-2 block text-xs font-medium text-[#a4b1c2]">OpenAI API key</span>
+              <input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" spellCheck={false} placeholder={config.keyConfigured ? 'Key is saved securely · enter a new key to replace it' : 'Paste a funded project key'} className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none transition placeholder:text-[#53606e] focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10" />
+              <span className="mt-2 block text-[11px] leading-5 text-[#667480]">The key is verified server-side, encrypted in R2, and never returned to this page or shown to judges.</span>
+            </label>
+
+            <div className="mt-5 grid gap-3 sm:grid-cols-3">
+              <label className="block"><span className="mb-2 block text-xs text-[#a4b1c2]">Sessions / day</span><input type="number" min={1} max={100} value={config.dailySessionLimit} onChange={(event) => setConfig({ ...config, dailySessionLimit: Number(event.target.value) })} className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-[#E0BC63]/50" /></label>
+              <label className="block"><span className="mb-2 block text-xs text-[#a4b1c2]">Seconds / session</span><input type="number" min={60} max={300} step={30} value={config.sessionSeconds} onChange={(event) => setConfig({ ...config, sessionSeconds: Number(event.target.value) })} className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-[#E0BC63]/50" /></label>
+              <label className="block"><span className="mb-2 block text-xs text-[#a4b1c2]">Tools / session</span><input type="number" min={1} max={25} value={config.maxToolCalls} onChange={(event) => setConfig({ ...config, maxToolCalls: Number(event.target.value) })} className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-[#E0BC63]/50" /></label>
+            </div>
+
+            <div className="mt-5 flex flex-wrap gap-2">
+              <button type="button" onClick={() => void save({ enabled: true })} disabled={saving || (!apiKey && !config.keyConfigured)} className="rounded-xl bg-[#E0BC63] px-4 py-2.5 text-sm font-semibold text-[#17130a] transition hover:bg-[#F0CF77] disabled:cursor-not-allowed disabled:opacity-45">{saving ? 'Saving…' : config.enabled ? 'Save limits' : 'Enable funded demo'}</button>
+              {config.enabled && <button type="button" onClick={() => void save({ enabled: false })} disabled={saving} className="rounded-xl border border-white/10 px-4 py-2.5 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white disabled:opacity-45">Pause</button>}
+              {config.keyConfigured && <button type="button" onClick={() => void removeKey()} disabled={saving} className="rounded-xl border border-[#FF8B78]/20 px-4 py-2.5 text-sm text-[#FFA898] transition hover:border-[#FF8B78]/45 disabled:opacity-45">Remove key</button>}
+            </div>
+            {message && <p aria-live="polite" className="mt-4 rounded-xl border border-white/[0.08] bg-black/15 px-3 py-2.5 text-xs leading-5 text-[#a4b1c2]">{message}</p>}
+          </div>
+
+          <div className="min-w-0 rounded-2xl border border-white/[0.08] bg-black/15 p-4 sm:p-5">
+            <div className="flex items-center justify-between gap-3"><h3 className="text-sm font-semibold">Anonymous usage</h3><a href="https://platform.openai.com/usage" target="_blank" rel="noreferrer" className="text-xs font-medium text-[#E0BC63] underline decoration-[#E0BC63]/25 underline-offset-4">OpenAI usage</a></div>
+            {usage ? <>
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3">
+                {[
+                  ['Today', usage.todaySessions],
+                  ['Funded', usage.fundedToday],
+                  ['My ChatGPT', usage.subscriptionToday],
+                  ['Active', usage.activeSessions],
+                  ['Failures', usage.failures],
+                  ['Minutes', usage.totalMinutes],
+                ].map(([label, value]) => <div key={String(label)} className="rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-3"><p className="text-lg font-semibold tabular-nums">{value}</p><p className="mt-0.5 text-[10px] uppercase tracking-[0.12em] text-[#667480]">{label}</p></div>)}
+              </div>
+              <div className="mt-4 max-h-56 space-y-1 overflow-y-auto pr-1">
+                {usage.recent.length ? usage.recent.map((event) => <div key={event.eventId} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 text-xs transition hover:bg-white/[0.025]"><div className="min-w-0"><p className="truncate text-[#cbd4db]">{event.judgeLabel} · {event.kind === 'funded_session' ? 'Funded' : event.kind === 'subscription_session' ? 'My ChatGPT' : 'Sign-in'}</p><p className="mt-0.5 text-[10px] text-[#5b6879]">{new Date(event.startedAt).toLocaleString()} · {event.toolCalls} tools</p></div><span className={`shrink-0 text-[10px] font-semibold uppercase ${event.status === 'failed' ? 'text-[#FFA898]' : event.status === 'active' ? 'text-[#8BE7AE]' : 'text-[#7c8a9c]'}`}>{event.status}</span></div>) : <p className="py-5 text-center text-xs text-[#667480]">No judge voice use yet.</p>}
+              </div>
+            </> : <p className="mt-5 text-xs text-[#667480]">Usage has not loaded yet.</p>}
+            <p className="mt-4 border-t border-white/[0.07] pt-4 text-[11px] leading-5 text-[#667480]">Only session counts, time, tool counts, and safe error codes are stored. No audio, transcript, prompt, tool arguments, or Workspace content is saved.</p>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

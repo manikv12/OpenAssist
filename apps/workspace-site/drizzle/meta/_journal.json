@@ -15,6 +15,13 @@
       "when": 1787859569834,
       "tag": "0001_perpetual_typhoid_mary",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787885247541,
+      "tag": "0002_bright_omega_flight",
+      "breakpoints": true
     }
   ]
 }

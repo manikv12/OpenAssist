@@ -2,10 +2,10 @@
 
 This Cloudflare Worker connects voice to the WebMCP tools in the user's current Workspace tab.
 
-- **Quick judge demo** uses the OpenAI Realtime API only for synthetic Demo data. It stops after five minutes or 12 tool calls.
+- **Funded judge demo** uses the OpenAI Realtime API only for synthetic Demo data. The owner controls its daily session, time, and tool-call limits.
 - **My ChatGPT** forces ChatGPT subscription sign-in inside a separate short-lived Codex Container for each visitor.
 - **Owner voice** uses the same subscription Container path with owner-only Live tools.
-- The optional OpenAI API key stays in the Worker and is never sent to a browser or Container.
+- The optional OpenAI API key is verified server-side, encrypted with AES-GCM in private R2, and never sent to a browser or Container.
 
 ## Local checks
 
@@ -37,10 +37,12 @@ VOICE_AUTH_CANARY_PASSED=1 npm run verify:release
   - `VOICE_GATEWAY_SHARED_SECRET`
   - `VOICE_AUTH_ENCRYPTION_KEY`
   - `CONTAINER_INTERNAL_TOKEN`
-  - Optional `OPENAI_API_KEY` for **Quick judge demo**
+  - Optional `OPENAI_API_KEY` as a protected deployment fallback for funded judge voice
 - Exact variable: `SITE_ORIGIN`
 
 All three secrets should be independent random values of at least 32 bytes.
+
+The owner can add or replace the normal funded key from **Live → Activity → Judge Voice**. That encrypted R2 setting takes precedence over the optional deployment fallback. The public health response exposes only availability and limits; it never returns the key.
 
 ## Saved conversations
 
