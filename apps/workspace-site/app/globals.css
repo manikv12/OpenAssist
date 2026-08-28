@@ -1,14 +1,34 @@
 @import 'tailwindcss';
 
 :root {
-  --background: #0b0c0e;
-  --foreground: #e6edf3;
-  --brand: #D8B45A;
-  --brand-strong: #FFF0BF;
-  --surface: #0f1013;
-  --surface-raised: #151619;
-  --hairline: rgba(255, 255, 255, 0.08);
-  --muted: #74828e;
+  /* Ink: a cool blue-black instead of neutral grey, so the gold reads warm
+     against it rather than sitting on flat charcoal. */
+  --background: #08090d;
+  --surface: #0d0f14;
+  --surface-raised: #14171e;
+  --surface-hover: #191d26;
+
+  /* Text: a soft blue-white, stepped down through three clear levels. */
+  --foreground: #e8eef7;
+  --text-secondary: #a4b1c2;
+  --text-muted: #7c8a9c;
+  --text-faint: #5b6879;
+
+  /* Brand gold, plus the two accents that give the palette range. */
+  --brand: #E0BC63;
+  --brand-strong: #FFE9AE;
+  --brand-deep: #8A6B22;
+  --accent-violet: #7C6BF0;
+  --accent-teal: #3FB9C6;
+
+  /* Status */
+  --danger: #FF8B78;
+  --warning: #FFC178;
+  --success: #5FD3A3;
+
+  --hairline: rgba(255, 255, 255, 0.075);
+  --hairline-strong: rgba(255, 255, 255, 0.13);
+
   --shell-gutter: 1.25rem;
   --bottom-nav-space: 0px;
 }
@@ -25,10 +45,14 @@ html {
 }
 
 body {
+  /* Three light sources: warm gold overhead, a cool violet counter-light on the
+     right, and a faint teal lift at the bottom. Keeps a dark UI from going flat. */
   background:
-    radial-gradient(circle at 40% -12%, rgba(216, 180, 90, 0.07), transparent 34%),
-    radial-gradient(circle at 90% 8%, rgba(216, 180, 90, 0.035), transparent 26%),
+    radial-gradient(ellipse 90% 55% at 38% -12%, rgba(224, 188, 99, 0.10), transparent 62%),
+    radial-gradient(ellipse 70% 50% at 96% 6%, rgba(124, 107, 240, 0.09), transparent 58%),
+    radial-gradient(ellipse 80% 45% at 12% 102%, rgba(63, 185, 198, 0.055), transparent 60%),
     var(--background);
+  background-attachment: fixed;
   color: var(--foreground);
   font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
   /* Nothing may push the document sideways. */
@@ -40,7 +64,15 @@ button {
 }
 
 ::selection {
-  background: rgba(216, 180, 90, 0.28);
+  background: rgba(224, 188, 99, 0.30);
+  color: var(--brand-strong);
+}
+
+/* Focus ring: one consistent, visible treatment everywhere. */
+:focus-visible {
+  outline: 2px solid rgba(224, 188, 99, 0.75);
+  outline-offset: 2px;
+  border-radius: 8px;
 }
 
 /* Long unbroken strings (emails, URLs, IDs) must never widen a grid track. */
@@ -85,4 +117,88 @@ button {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   Voice orb
+   The <canvas> carries the fluid when WebGL is available. Until then (and when
+   reduced motion is on) the CSS disc below is what the user sees, so it has to
+   look deliberate on its own rather than like a missing asset.
+   --------------------------------------------------------------------------- */
+
+.oa-orb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  border-radius: 9999px;
+  isolation: isolate;
+  /* layout+style only: paint containment would clip the bloom. */
+  contain: layout style;
+}
+
+/* Fallback disc: a lit sphere, not a flat circle. */
+.oa-orb::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 32% 26%, var(--brand-strong), transparent 46%),
+    radial-gradient(circle at 72% 74%, var(--accent-violet), transparent 52%),
+    radial-gradient(circle at 50% 50%, var(--brand) 8%, var(--brand-deep) 62%, #14100a 100%);
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.28);
+  transition: opacity 240ms ease;
+}
+
+/* Bloom behind the orb, tinted by phase. */
+.oa-orb::after {
+  content: '';
+  position: absolute;
+  inset: -42%;
+  border-radius: inherit;
+  background: radial-gradient(circle, rgba(224, 188, 99, 0.30), transparent 66%);
+  filter: blur(10px);
+  opacity: 0.75;
+  z-index: -1;
+  transition: opacity 300ms ease, background 300ms ease;
+  pointer-events: none;
+}
+
+/* Once WebGL mounts, the shader owns the disc - drop the fallback fill. */
+.oa-orb.is-gl::before {
+  opacity: 0;
+}
+
+.oa-orb__canvas {
+  position: relative;
+  display: block;
+  border-radius: inherit;
+}
+
+.oa-orb--listening::after {
+  background: radial-gradient(circle, rgba(224, 188, 99, 0.46), transparent 68%);
+  opacity: 1;
+}
+
+.oa-orb--thinking::after {
+  background: radial-gradient(circle, rgba(124, 107, 240, 0.44), transparent 68%);
+  opacity: 1;
+}
+
+.oa-orb--speaking::after {
+  background: radial-gradient(circle, rgba(63, 185, 198, 0.42), transparent 68%);
+  opacity: 1;
+}
+
+/* Idle breathing for the fallback only; the shader has its own motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .oa-orb:not(.is-gl)::before {
+    animation: oa-orb-breathe 4.2s ease-in-out infinite;
+  }
+}
+
+@keyframes oa-orb-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.045); }
 }
