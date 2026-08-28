@@ -4,5 +4,6 @@
   { "id": "coral", "label": "Coral", "description": "Friendly and expressive" },
   { "id": "sage", "label": "Sage", "description": "Calm and measured" },
   { "id": "verse", "label": "Verse", "description": "Balanced and conversational" },
-  { "id": "ash", "label": "Ash", "description": "Bright and direct" }
+  { "id": "ash", "label": "Ash", "description": "Bright and direct" },
+  { "id": "sol", "label": "Sol", "description": "Savvy and relaxed" }
 ]

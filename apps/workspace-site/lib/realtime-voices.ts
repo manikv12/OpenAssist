@@ -5,6 +5,7 @@ export const REALTIME_VOICES = [
   { id: 'sage', label: 'Sage', description: 'Calm and measured' },
   { id: 'verse', label: 'Verse', description: 'Balanced and conversational' },
   { id: 'ash', label: 'Ash', description: 'Bright and direct' },
+  { id: 'sol', label: 'Sol', description: 'Savvy and relaxed' },
 ] as const;
 
 export type RealtimeVoice = (typeof REALTIME_VOICES)[number]['id'];

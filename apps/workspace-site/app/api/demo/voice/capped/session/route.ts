@@ -4,10 +4,12 @@ import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../.
 import { getPublicJudgeVoicePolicy } from '../../../../../../lib/judge-voice-policy';
 import { activateJudgeVoiceSession, failJudgeVoiceEvent, reserveJudgeVoiceSession } from '../../../../../../lib/judge-voice-store';
 import { parseRealtimeVoice } from '../../../../../../lib/realtime-voices';
+import { requireSignedInUser } from '../../../../../../lib/server-auth';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
+    await requireSignedInUser();
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request, 310_000);

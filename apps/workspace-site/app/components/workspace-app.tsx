@@ -707,6 +707,9 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
 
       const subscription = currentMode === 'live' || currentAccess === 'subscription';
       const subscriptionBase = currentMode === 'demo' ? '/api/demo/voice/subscription' : '/api/voice';
+      if (!subscription && selectedVoice === 'sol') {
+        throw new Error('Sol is available with My ChatGPT. Select My ChatGPT or choose another funded-demo voice.');
+      }
       if (subscription) {
         setVoiceStatus('Checking your ChatGPT subscription sign-in…');
         let authResponse = await fetch(`${subscriptionBase}/auth/status`, { cache: 'no-store' });

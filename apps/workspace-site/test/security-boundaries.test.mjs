@@ -85,6 +85,7 @@ test('demo routes never call the Live Workspace MCP', async () => {
     'app/api/demo/tool/route.ts',
     'app/api/demo/actions/propose/route.ts',
     'app/api/demo/actions/execute/route.ts',
+    'app/api/demo/voice/status/route.ts',
     'app/api/demo/voice/capped/session/route.ts',
     'app/api/demo/voice/capped/stop/route.ts',
     'app/api/demo/voice/subscription/auth/start/route.ts',
@@ -97,8 +98,31 @@ test('demo routes never call the Live Workspace MCP', async () => {
   for (const file of files) {
     const source = await read(file);
     assert.doesNotMatch(source, /mcp-client|workspaceAccessToken|executeLiveWorkspaceTool/, file);
-    assert.match(source, /getOrCreateDemoSession/, file);
+    if (!file.endsWith('/status/route.ts')) assert.match(source, /getOrCreateDemoSession/, file);
   }
+});
+
+test('the page and every demo API require ChatGPT sign-in', async () => {
+  const page = await read('app/page.tsx');
+  assert.match(page, /export const dynamic = 'force-dynamic'/);
+  assert.match(page, /requireChatGPTUser\('\/'\)/);
+
+  const demoRoutes = [
+    'app/api/demo/workspace/route.ts',
+    'app/api/demo/tool/route.ts',
+    'app/api/demo/actions/propose/route.ts',
+    'app/api/demo/actions/execute/route.ts',
+    'app/api/demo/voice/status/route.ts',
+    'app/api/demo/voice/capped/session/route.ts',
+    'app/api/demo/voice/capped/stop/route.ts',
+    'app/api/demo/voice/subscription/auth/start/route.ts',
+    'app/api/demo/voice/subscription/auth/status/route.ts',
+    'app/api/demo/voice/subscription/auth/disconnect/route.ts',
+    'app/api/demo/voice/subscription/session/route.ts',
+    'app/api/demo/voice/subscription/session/stop/route.ts',
+    'app/api/demo/voice/subscription/threads/route.ts',
+  ];
+  for (const route of demoRoutes) assert.match(await read(route), /await requireSignedInUser\(\)/, route);
 });
 
 test('server code does not log private Workspace content', async () => {

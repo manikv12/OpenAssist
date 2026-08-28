@@ -401,6 +401,9 @@ async function createDemoRealtimeCall(request: Request, env: Env, payload: Gatew
   const sdp = typeof body.sdp === 'string' ? body.sdp : '';
   const voice = parseRealtimeVoice(body.voice);
   if (!sdp || sdp.length > SDP_LIMIT) throw new Response('A valid WebRTC offer is required.', { status: 400 });
+  if (voice === 'sol') {
+    throw new Response('Sol is available through My ChatGPT sign-in. Choose another voice for the funded demo.', { status: 400 });
+  }
 
   const session = {
     type: 'realtime',

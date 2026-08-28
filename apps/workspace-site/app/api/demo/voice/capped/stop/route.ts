@@ -1,10 +1,12 @@
 import { attachDemoCookie, getOrCreateDemoSession } from '../../../../../../lib/demo-session';
 import { assertSameOrigin, readJsonObject, safeRoute } from '../../../../../../lib/http';
 import { stopJudgeVoiceSession } from '../../../../../../lib/judge-voice-store';
+import { requireSignedInUser } from '../../../../../../lib/server-auth';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
+    await requireSignedInUser();
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request);
