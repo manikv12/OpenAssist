@@ -241,6 +241,8 @@ test('owner access is Live-only while judge access is Demo-only', async () => {
   assert.match(app, /const mode: Mode = ownerAccess \? 'live' : 'demo'/);
   assert.match(app, /ownerAccess[\s\S]{0,80}'Private Live Workspace ready\.'/);
   assert.match(app, /owner \? 'Private Live' : 'Judge Demo'/);
+  assert.match(app, /!ownerAccess && !available/);
+  assert.match(app, /Ready with \$\{voiceLabel\(restored\)\}/);
 });
 
 test('demo judges use only the server-funded route while subscription routes remain owner-only', async () => {

@@ -326,8 +326,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     const stored = window.localStorage.getItem('openassist-realtime-voice');
     if (!stored) return;
     const frame = window.requestAnimationFrame(() => {
-      setSelectedVoice(parseRealtimeVoice(stored));
-      selectedVoiceRef.current = parseRealtimeVoice(stored);
+      const restored = parseRealtimeVoice(stored);
+      setSelectedVoice(restored);
+      selectedVoiceRef.current = restored;
+      setVoiceStatus(`Ready with ${voiceLabel(restored)}`);
     });
     return () => window.cancelAnimationFrame(frame);
   }, []);
@@ -356,11 +358,11 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         setJudgeVoicePolicy(policy);
         cappedToolLimitRef.current = policy.maxToolCalls;
         setCappedVoiceAvailable(available);
-        if (!available && demoVoiceAccessRef.current === 'capped') setVoiceStatus('Funded judge voice is not enabled in this deployment.');
+        if (!ownerAccess && !available && demoVoiceAccessRef.current === 'capped') setVoiceStatus('Funded judge voice is not enabled in this deployment.');
       })
       .catch(() => setCappedVoiceAvailable(false));
     return controller;
-  }, []);
+  }, [ownerAccess]);
 
   useEffect(() => {
     const controller = refreshJudgeVoicePolicy();
