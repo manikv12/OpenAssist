@@ -327,6 +327,24 @@ class AppServer {
       }
       return;
     }
+    if (message.method === 'thread/realtime/transcript/delta') {
+      const role = params.role === 'user' ? 'user' : params.role === 'assistant' ? 'assistant' : null;
+      if (role && typeof params.delta === 'string' && params.delta) {
+        this.session.send({ type: 'transcript', role, delta: params.delta });
+      }
+      return;
+    }
+    if (message.method === 'thread/realtime/transcript/done') {
+      const role = params.role === 'user' ? 'user' : params.role === 'assistant' ? 'assistant' : null;
+      if (role && typeof params.text === 'string' && params.text) {
+        this.session.send({ type: 'transcript', role, text: params.text });
+      }
+      return;
+    }
+    if (message.method === 'thread/realtime/error') {
+      this.session.send({ type: 'voice_error', message: typeof params.message === 'string' ? params.message : 'The realtime voice service returned an error.' });
+      return;
+    }
     if (message.id != null && message.method === 'item/tool/call') {
       const requestedTool = typeof params.tool === 'string' ? params.tool : params.tool?.name || params.name;
       try {
@@ -364,6 +382,7 @@ class AppServer {
         'Your only actions are the registered workspace_* tools and assistant_confirm_site_preview.',
         'The Workspace tools can list accounts, build a daily brief, search and read mail and attachments, find and manage tasks, manage calendar events, manage notes, read and manage approved memory, and focus the visible Workspace view.',
         'For every question about the Workspace, call the relevant registered tool before answering. Never guess that data is unavailable without trying the tool.',
+        'When the user asks to open or show a specific task, first find it, then call workspace_focus_view with view tasks and the exact task identifier returned by the search.',
         'When asked what you can do, describe the Workspace capabilities above. Do not claim you can inspect plugins or control the Linux computer.',
         'Never use shell, files, terminal, computer control, browser control, remote Mac, plugins, MCP servers, subagents, or collaboration.',
         'Every Workspace tool is executed by the user’s currently open OpenAssist Daily Workspace tab.',
@@ -703,7 +722,7 @@ const server = createServer(async (request, response) => {
       activeSessionId = sessionId;
       await session.appServer.start();
       const realtime = await session.appServer.startRealtime(sdp, threadId, voice);
-      sendJson(response, 200, { status: 'ready', sessionId, sdp: realtime.sdp, threadId: realtime.threadId, resumed: realtime.resumed });
+      sendJson(response, 200, { status: 'ready', sessionId, sdp: realtime.sdp, threadId: realtime.threadId, resumed: realtime.resumed, voice });
       return;
     }
     sendJson(response, 404, { message: 'Not found.' });

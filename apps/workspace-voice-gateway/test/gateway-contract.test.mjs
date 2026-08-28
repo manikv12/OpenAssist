@@ -111,6 +111,14 @@ test('the selected realtime voice reaches both subscription and funded sessions'
   assert.match(server, /outputModality: 'audio',[\s\S]{0,80}voice,/);
 });
 
+test('Codex realtime transcripts are forwarded to the visible Site voice panel', async () => {
+  const server = await read('container/server.mjs');
+  assert.match(server, /thread\/realtime\/transcript\/delta/);
+  assert.match(server, /thread\/realtime\/transcript\/done/);
+  assert.match(server, /thread\/realtime\/error/);
+  assert.match(server, /type: 'transcript'/);
+});
+
 test('the funded demo fallback is server-side, synthetic-only, and uses the exact visible tools', async () => {
   const worker = await read('src/index.ts');
   const config = await read('wrangler.jsonc');

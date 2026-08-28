@@ -154,7 +154,7 @@ export const WORKSPACE_TOOLS: readonly WorkspaceToolDefinition[] = [
   {
     name: 'workspace_find_tasks',
     title: 'Find tasks',
-    description: 'Find Google Tasks by list, text, status, date, or virtual tag.',
+    description: 'Find Google Tasks by list, text, status, date, or virtual tag. Results include task identifiers that can be passed to workspace_focus_view when the user asks to open a specific task.',
     inputSchema: objectSchema({
       account,
       query: string('Optional task text or tag.'),
@@ -410,7 +410,7 @@ export const WORKSPACE_TOOLS: readonly WorkspaceToolDefinition[] = [
     name: 'workspace_focus_view',
     title: 'Focus workspace view',
     description:
-      'Navigate the visible workspace to Today, Inbox, Tasks, Calendar, Notes, Memory, Accounts, or Activity and optionally focus one item.',
+      'Navigate the visible workspace to Today, Inbox, Tasks, Calendar, Notes, Memory, Accounts, or Activity. When the user asks to open or show one item, pass its exact identifier from the preceding search so the site opens its detail panel.',
     inputSchema: objectSchema(
       {
         view: string('Workspace view.', [

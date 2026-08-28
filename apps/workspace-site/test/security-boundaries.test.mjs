@@ -200,8 +200,8 @@ test('owner voice can start a saved conversation or resume an existing one', asy
   assert.match(app, /New conversation/);
   assert.match(app, /resumed saved conversation/);
   assert.match(app, /subscriptionBase = currentMode === 'demo' \? '\/api\/demo\/voice\/subscription' : '\/api\/voice'/);
-  assert.match(app, /\{ sdp: offerSdp, threadId: selectedVoiceThreadId, voice: selectedVoice \}/);
-  assert.match(app, /\{ sdp: offerSdp, voice: selectedVoice \}/);
+  assert.match(app, /\{ sdp: offerSdp, threadId: selectedVoiceThreadId, voice: voiceForSession \}/);
+  assert.match(app, /\{ sdp: offerSdp, voice: voiceForSession \}/);
   assert.match(session, /JSON\.stringify\(\{ sdp, threadId, voice \}\)/);
   assert.match(threads, /requireOwner\(\)/);
   assert.match(threads, /'\/threads'/);
@@ -219,6 +219,10 @@ test('voice selection and visible audio states are wired through every session p
 
   assert.match(app, /openassist-realtime-voice/);
   assert.match(app, /function VoicePicker/);
+  assert.match(app, /function VoiceStage/);
+  assert.match(app, /Live transcript only/);
+  assert.match(app, /input_audio_transcription\.delta/);
+  assert.match(app, /response\.output_audio_transcript\.delta/);
   assert.match(app, /Hearing you/);
   assert.match(app, /voiceThinking/);
   assert.match(app, /voiceStateLabel/);
@@ -230,6 +234,13 @@ test('voice selection and visible audio states are wired through every session p
     assert.match(route, /parseRealtimeVoice\(body\.voice\)/);
     assert.match(route, /voice/);
   }
+});
+
+test('owner access is Live-only while judge access is Demo-only', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  assert.match(app, /const mode: Mode = ownerAccess \? 'live' : 'demo'/);
+  assert.match(app, /ownerAccess[\s\S]{0,80}'Private Live Workspace ready\.'/);
+  assert.match(app, /owner \? 'Private Live' : 'Judge Demo'/);
 });
 
 test('demo judges use only the server-funded route while subscription routes remain owner-only', async () => {

@@ -596,7 +596,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     socketUrl.protocol = socketUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     socketUrl.pathname = `/tools/${sessionId}`;
     socketUrl.search = '';
-    return json({ status: 'ready', sessionId, threadId: result.threadId, resumed: result.resumed === true, sdp: answerSdp, toolSocketUrl: socketUrl.toString(), toolSocketToken: socketToken, warningAfterSeconds: 1_500, expiresAfterSeconds: 1_800 });
+    return json({ status: 'ready', sessionId, threadId: result.threadId, resumed: result.resumed === true, voice, sdp: answerSdp, toolSocketUrl: socketUrl.toString(), toolSocketToken: socketToken, warningAfterSeconds: 1_500, expiresAfterSeconds: 1_800 });
   }
 
   throw new Response('Not found.', { status: 404 });

@@ -47,6 +47,7 @@ type LiveState = {
   data: Partial<Record<WorkspaceView, unknown>>;
   accounts: unknown | null;
   error: string | null;
+  warning: string | null;
 };
 type VoicePrompt = { verificationUrl: string; userCode: string } | null;
 type VoiceThread = {
@@ -66,6 +67,12 @@ type OpenNote = {
   error?: string;
   openUrl?: string;
 };
+type OpenLiveItem = {
+  id: string;
+  view: WorkspaceView;
+  item: Record<string, unknown>;
+};
+type VoiceTranscript = { user: string; assistant: string };
 type DemoApiResponse = {
   workspace?: DemoWorkspaceState;
   expiresAt?: number;
@@ -104,6 +111,10 @@ type JudgeVoiceUsage = {
     errorCode: string | null;
   }>;
 };
+
+function voiceLabel(voice: RealtimeVoice): string {
+  return REALTIME_VOICES.find((item) => item.id === voice)?.label ?? voice;
+}
 
 const NAVIGATION: { view: WorkspaceView; label: string; key: string }[] = [
   { view: 'today', label: 'Today', key: 'T' },
@@ -240,14 +251,19 @@ async function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
 export function WorkspaceApp({ user }: { user: SiteUser }) {
   const router = useRouter();
   const ownerAccess = user?.access === 'owner';
-  const [mode, setMode] = useState<Mode>('demo');
+  const mode: Mode = ownerAccess ? 'live' : 'demo';
   const [view, setView] = useState<WorkspaceView>('today');
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>('mail-security-review');
   const [pending, setPending] = useState<PendingAction | null>(null);
-  const [toast, setToast] = useState('Private demo ready · 23 WebMCP tools available.');
+  const [toast, setToast] = useState(() => ownerAccess
+    ? 'Private Live Workspace ready.'
+    : 'Judge Demo ready · 23 WebMCP tools available.');
   const [voiceStatus, setVoiceStatus] = useState('Ready to check compatibility');
   const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
+  const [activeVoice, setActiveVoice] = useState<RealtimeVoice | null>(null);
+  const [voicePanelOpen, setVoicePanelOpen] = useState(false);
+  const [voiceTranscript, setVoiceTranscript] = useState<VoiceTranscript>({ user: '', assistant: '' });
   const [voicePrompt, setVoicePrompt] = useState<VoicePrompt>(null);
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceMuted, setVoiceMuted] = useState(false);
@@ -266,6 +282,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [demoExpiresAt, setDemoExpiresAt] = useState<number | null>(null);
   const [editor, setEditor] = useState<EditorKind>(null);
   const [openNote, setOpenNote] = useState<OpenNote | null>(null);
+  const [openLiveItem, setOpenLiveItem] = useState<OpenLiveItem | null>(null);
   const [ownerSetupCode, setOwnerSetupCode] = useState('');
   const [accounts, setAccounts] = useState<DemoAccount[]>([]);
   const [tasks, setTasks] = useState(DEMO_TASKS);
@@ -274,7 +291,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [notes, setNotes] = useState(DEMO_NOTES);
   const [memory, setMemory] = useState(DEMO_MEMORY);
   const [activity, setActivity] = useState(DEMO_ACTIVITY);
-  const [live, setLive] = useState<LiveState>({ loading: false, data: {}, accounts: null, error: null });
+  const [live, setLive] = useState<LiveState>({ loading: false, data: {}, accounts: null, error: null, warning: null });
+  const [liveRefreshKey, setLiveRefreshKey] = useState(0);
+  const liveRef = useRef(live);
+  const tasksRef = useRef(tasks);
   const modeRef = useRef(mode);
   const demoVoiceAccessRef = useRef(demoVoiceAccess);
   const pendingRef = useRef(pending);
@@ -290,6 +310,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const voiceToolCountRef = useRef(0);
   const cappedToolLimitRef = useRef(12);
   const voiceMeterRef = useRef<VoiceLevelMeter | null>(null);
+  const selectedVoiceRef = useRef<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
+  const lastFocusedItemRef = useRef<Partial<Record<WorkspaceView, string>>>({});
   const [voiceMeter, setVoiceMeter] = useState<VoiceLevelMeter | null>(null);
   const [voiceHearing, setVoiceHearing] = useState(false);
   const [voiceThinking, setVoiceThinking] = useState(false);
@@ -298,17 +320,21 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { demoVoiceAccessRef.current = demoVoiceAccess; }, [demoVoiceAccess]);
   useEffect(() => { pendingRef.current = pending; }, [pending]);
+  useEffect(() => { liveRef.current = live; }, [live]);
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => {
     const stored = window.localStorage.getItem('openassist-realtime-voice');
     if (!stored) return;
     const frame = window.requestAnimationFrame(() => {
       setSelectedVoice(parseRealtimeVoice(stored));
+      selectedVoiceRef.current = parseRealtimeVoice(stored);
     });
     return () => window.cancelAnimationFrame(frame);
   }, []);
 
   const selectVoice = useCallback((voice: RealtimeVoice) => {
     if (voiceConnected) return;
+    selectedVoiceRef.current = voice;
     setSelectedVoice(voice);
     window.localStorage.setItem('openassist-realtime-voice', voice);
     const option = REALTIME_VOICES.find((item) => item.id === voice);
@@ -414,9 +440,23 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
 
     if (name === 'workspace_focus_view') {
       const nextView = String(args.view ?? 'today') as WorkspaceView;
-      focusView(nextView, typeof args.itemId === 'string' ? args.itemId : undefined);
+      const requestedItemId = typeof args.itemId === 'string' ? args.itemId : undefined;
+      const resolvedItemId = requestedItemId ?? lastFocusedItemRef.current[nextView];
+      if (!requestedItemId && resolvedItemId) delete lastFocusedItemRef.current[nextView];
+      focusView(nextView, resolvedItemId);
+      if (resolvedItemId && nextView !== 'notes' && nextView !== 'activity') {
+        if (modeRef.current === 'demo' && nextView === 'tasks') {
+          const task = tasksRef.current.find((candidate) => candidate.id === resolvedItemId);
+          if (task) setOpenLiveItem({ id: resolvedItemId, view: nextView, item: { ...task, _kind: 'Demo task' } });
+        } else if (modeRef.current === 'live') {
+          const current = liveRef.current;
+          const source = nextView === 'accounts' ? current.accounts : current.data[nextView];
+          const item = liveRows(nextView, source).find((candidate, index) => liveItemId(candidate, `${nextView}-${index + 1}`) === resolvedItemId);
+          if (item) setOpenLiveItem({ id: resolvedItemId, view: nextView, item });
+        }
+      }
       setToast(`Focused ${nextView}.`);
-      return { status: 'focused', view: nextView, itemId: args.itemId ?? null };
+      return { status: 'focused', view: nextView, itemId: resolvedItemId ?? null, opened: Boolean(resolvedItemId) };
     }
 
     if (!tool.readOnly) {
@@ -434,6 +474,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const body = (await response.json()) as DemoApiResponse;
       if (!response.ok) throw new Error(body.error ?? 'The demo request failed.');
       if (body.workspace) hydrateDemoWorkspace(body.workspace, body.expiresAt);
+      if (name === 'workspace_find_tasks') {
+        const first = liveRows('tasks', body.result)[0];
+        if (first) lastFocusedItemRef.current.tasks = liveItemId(first, 'task-result-1');
+      }
       setToast(`${tool.title} completed with synthetic data.`);
       return body.result;
     }
@@ -446,6 +490,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     });
     const result = (await response.json()) as { error?: string };
     if (!response.ok) throw new Error(result.error ?? 'Workspace request failed.');
+    if (name === 'workspace_find_tasks') {
+      const first = liveRows('tasks', result)[0];
+      if (first) lastFocusedItemRef.current.tasks = liveItemId(first, 'task-result-1');
+    }
     setActivity((current) => [{ id: randomId('activity'), actor: 'Workspace', action: `Read: ${tool.title}`, time: 'Just now', type: 'read' as const }, ...current].slice(0, 40));
     setToast(`${tool.title} completed.`);
     return result;
@@ -483,7 +531,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     if (mode !== 'live' || !user) return;
     const controller = new AbortController();
     const timeout = window.setTimeout(() => {
-      setLive((current) => ({ ...current, loading: true, error: null }));
+      setLive((current) => ({ ...current, loading: true, error: null, warning: null }));
       const now = new Date();
       const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -505,19 +553,27 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         setLive((current) => ({
           loading: false,
           error: null,
+          warning: null,
           accounts: accountsResult,
           data: { ...current.data, [view]: viewResult },
         }));
       }).catch((error: unknown) => {
         if (controller.signal.aborted) return;
-        setLive((current) => ({ ...current, loading: false, error: error instanceof Error ? error.message : 'Workspace could not be loaded.' }));
+        const message = error instanceof Error ? error.message : 'Workspace could not be loaded.';
+        const reconnectRequired = /Workspace (?:is not connected|must be reconnected|authorization expired)/i.test(message);
+        setLive((current) => ({
+          ...current,
+          loading: false,
+          error: reconnectRequired || message.startsWith('Owner access') ? message : null,
+          warning: reconnectRequired ? null : message,
+        }));
       });
     }, 0);
     return () => {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [invokeTool, live.accounts, mode, user, view]);
+  }, [invokeTool, live.accounts, liveRefreshKey, mode, user, view]);
 
   useEffect(() => {
     if (!document.modelContext) {
@@ -629,6 +685,19 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     }
   }, [user]);
 
+  const updateVoiceTranscript = useCallback((role: 'user' | 'assistant', text: string, final = false) => {
+    const clean = text.replace(/\s+/g, ' ').slice(0, 2_000);
+    if (!clean.trim()) return;
+    setVoiceTranscript((current) => ({
+      ...current,
+      [role]: final ? clean.trim() : `${current[role]}${clean}`.slice(-2_000),
+    }));
+  }, []);
+
+  const resetVoiceTurn = useCallback((role: 'user' | 'assistant') => {
+    setVoiceTranscript((current) => ({ ...current, [role]: '' }));
+  }, []);
+
   const stopVoice = useCallback((message = 'Voice stopped', persist = true) => {
     const kind = activeVoiceKindRef.current;
     const callId = voiceCallIdRef.current;
@@ -688,6 +757,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   }, [refreshVoiceThreads]);
 
   const connectVoice = useCallback(async () => {
+    setVoicePanelOpen(true);
     if (voiceConnected) {
       stopVoice();
       return;
@@ -699,12 +769,14 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       return;
     }
     try {
+      const voiceForSession = selectedVoiceRef.current;
+      setVoiceTranscript({ user: '', assistant: '' });
       setVoiceStatus(currentMode === 'live' ? 'Checking your private Workspace connection…' : 'Checking the synthetic demo workspace…');
       await invokeTool('workspace_list_accounts', {});
 
       const subscription = currentMode === 'live' || currentAccess === 'subscription';
       const subscriptionBase = currentMode === 'demo' ? '/api/demo/voice/subscription' : '/api/voice';
-      if (!subscription && selectedVoice === 'sol') {
+      if (!subscription && voiceForSession === 'sol') {
         throw new Error('Sol is available with My ChatGPT. Select My ChatGPT or choose another funded-demo voice.');
       }
       if (subscription) {
@@ -756,12 +828,18 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         dataChannel = peer.createDataChannel('oai-events');
         voiceDataChannelRef.current = dataChannel;
         dataChannel.addEventListener('message', (event) => {
-          let message: { type?: string; name?: string; call_id?: string; arguments?: string; error?: { message?: string } };
+          let message: { type?: string; name?: string; call_id?: string; arguments?: string; delta?: string; transcript?: string; text?: string; error?: { message?: string } };
           try { message = JSON.parse(String(event.data)) as typeof message; } catch { return; }
           if (message.type === 'error') {
             setVoiceStatus(message.error?.message ?? 'The demo voice service returned an error.');
             return;
           }
+          if (message.type === 'input_audio_buffer.speech_started') resetVoiceTurn('user');
+          if (message.type === 'response.created') resetVoiceTurn('assistant');
+          if (message.type === 'conversation.item.input_audio_transcription.delta' && message.delta) updateVoiceTranscript('user', message.delta);
+          if (message.type === 'conversation.item.input_audio_transcription.completed' && message.transcript) updateVoiceTranscript('user', message.transcript, true);
+          if ((message.type === 'response.audio_transcript.delta' || message.type === 'response.output_audio_transcript.delta' || message.type === 'response.text.delta') && message.delta) updateVoiceTranscript('assistant', message.delta);
+          if ((message.type === 'response.audio_transcript.done' || message.type === 'response.output_audio_transcript.done' || message.type === 'response.text.done') && (message.transcript || message.text)) updateVoiceTranscript('assistant', message.transcript ?? message.text ?? '', true);
           if (message.type !== 'response.function_call_arguments.done' || !message.call_id || !message.name) return;
           voiceToolCountRef.current += 1;
           const sendResult = (output: unknown) => {
@@ -796,7 +874,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         });
         dataChannel.addEventListener('open', () => {
           setVoiceConnected(true);
-          setVoiceStatus(`Listening · funded ${Math.ceil(judgeVoicePolicy.sessionSeconds / 60)}-minute synthetic demo`);
+          setActiveVoice(voiceForSession);
+          setVoiceStatus(`Listening with ${voiceLabel(voiceForSession)} · funded ${Math.ceil(judgeVoicePolicy.sessionSeconds / 60)}-minute synthetic demo`);
         });
       } else {
         activeVoiceKindRef.current = currentMode === 'demo' ? 'demo_subscription' : 'live_subscription';
@@ -812,10 +891,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(subscription
-          ? { sdp: offerSdp, threadId: selectedVoiceThreadId, voice: selectedVoice }
-          : { sdp: offerSdp, voice: selectedVoice }),
+          ? { sdp: offerSdp, threadId: selectedVoiceThreadId, voice: voiceForSession }
+          : { sdp: offerSdp, voice: voiceForSession }),
       });
-      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean; callId?: string; sessionId?: string; expiresAfterSeconds?: number; warningAfterSeconds?: number; maxToolCalls?: number };
+      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean; callId?: string; sessionId?: string; voice?: string; expiresAfterSeconds?: number; warningAfterSeconds?: number; maxToolCalls?: number };
       if (!response.ok || body.status !== 'ready' || !body.sdp) throw new Error(body.message ?? body.error ?? 'Voice is not compatible yet.');
       if (body.threadId) setSelectedVoiceThreadId(body.threadId);
       if (body.callId) voiceCallIdRef.current = body.callId;
@@ -837,8 +916,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const socket = new WebSocket(body.toolSocketUrl, ['openassist-tools', `openassist-token.${body.toolSocketToken}`]);
       voiceSocketRef.current = socket;
       socket.addEventListener('message', (event) => {
-        let message: { type?: string; callId?: string; operation?: string; tool?: string; args?: Record<string, unknown>; previewId?: string; message?: string };
+        let message: { type?: string; callId?: string; operation?: string; tool?: string; args?: Record<string, unknown>; previewId?: string; message?: string; role?: string; delta?: string; text?: string };
         try { message = JSON.parse(String(event.data)) as typeof message; } catch { return; }
+        if (message.type === 'transcript' && (message.role === 'user' || message.role === 'assistant')) {
+          updateVoiceTranscript(message.role, message.text ?? message.delta ?? '', Boolean(message.text));
+          return;
+        }
         if (message.type === 'tool_call') voiceToolCountRef.current += 1;
         if (message.type === 'tool_call' && message.callId && message.operation === 'confirm_preview' && message.previewId) {
           void approve('voice', message.previewId).then((result) => {
@@ -854,13 +937,17 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
           });
         } else if (message.type === 'session_warning') {
           setVoiceStatus(message.message ?? 'Voice will stop in five minutes.');
+        } else if (message.type === 'voice_error') {
+          setVoiceStatus(message.message ?? 'The realtime voice service returned an error.');
         } else if (message.type === 'session_ended') {
           stopVoice(message.message ?? 'Voice session ended.');
         }
       });
       socket.addEventListener('open', () => {
         setVoiceConnected(true);
-        setVoiceStatus(body.resumed ? 'Listening · resumed saved conversation' : 'Listening · new saved conversation');
+        const confirmedVoice = parseRealtimeVoice(body.voice ?? voiceForSession);
+        setActiveVoice(confirmedVoice);
+        setVoiceStatus(body.resumed ? `Listening with ${voiceLabel(confirmedVoice)} · resumed saved conversation` : `Listening with ${voiceLabel(confirmedVoice)} · new saved conversation`);
       });
       socket.addEventListener('close', () => {
         if (voiceSocketRef.current === socket) stopVoice('Voice connection ended.');
@@ -868,7 +955,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     } catch (error) {
       stopVoice(error instanceof Error ? error.message : 'Voice is temporarily unavailable.');
     }
-  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, selectedVoice, selectedVoiceThreadId, stopVoice, user, voiceConnected]);
+  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, resetVoiceTurn, selectedVoiceThreadId, stopVoice, updateVoiceTranscript, user, voiceConnected]);
 
   const toggleVoiceMute = useCallback(() => {
     const next = !voiceMuted;
@@ -1000,22 +1087,6 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     });
   }, [invokeTool]);
 
-  const selectMode = useCallback((nextMode: Mode) => {
-    if (nextMode === 'live' && !ownerAccess) {
-      setToast('Live Workspace is available only through the owner ChatGPT login.');
-      return;
-    }
-    if (nextMode !== modeRef.current && voiceConnected) stopVoice('Voice stopped because the workspace mode changed.');
-    setMode(nextMode);
-    setVoicePrompt(null);
-    if (nextMode === 'live') void refreshVoiceThreads(true);
-    if (nextMode === 'demo' && demoVoiceAccessRef.current !== 'subscription') {
-      setVoiceThreads([]);
-      setSelectedVoiceThreadId(null);
-    }
-    setToast(nextMode === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.');
-  }, [ownerAccess, refreshVoiceThreads, stopVoice, voiceConnected]);
-
   const signOut = useCallback(async () => {
     if (voiceConnected) stopVoice('Voice stopped before signing out.');
     if (user?.access === 'owner') {
@@ -1053,11 +1124,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     ? { eyebrow: 'Temporary demo notes', title: 'Notes', subtitle: 'Judge-created notes stay isolated from Google and expire automatically.' }
     : mode === 'demo' && view === 'memory'
       ? { eyebrow: 'Temporary demo memory', title: 'Memory', subtitle: 'Safe synthetic preferences for testing agent decisions.' }
-      : VIEW_COPY[view];
+      : mode === 'live' && view === 'inbox'
+        ? { ...VIEW_COPY.inbox, eyebrow: 'Connected Google accounts' }
+        : VIEW_COPY[view];
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_38%_-14%,rgba(224,188,99,0.07),transparent_34%),radial-gradient(circle_at_88%_8%,rgba(224,188,99,0.035),transparent_24%),#08090d] text-[#e8eef7]">
       <div className="mx-auto grid min-h-screen w-full max-w-[1800px] grid-cols-[238px_minmax(0,1fr)_minmax(300px,340px)] max-xl:grid-cols-[84px_minmax(0,1fr)] max-md:grid-cols-1">
-        <Sidebar mode={mode} view={view} user={user} onMode={selectMode} onView={focusView} onToast={setToast} onSignOut={() => void signOut()} />
+        <Sidebar view={view} user={user} onView={focusView} onSignOut={() => void signOut()} />
         <section id={`view-${view}`} className="min-w-0 pb-[calc(88px+env(safe-area-inset-bottom))] md:pb-10">
           <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] px-5 py-3.5 md:hidden">
             <div className="flex min-w-0 items-center gap-2.5">
@@ -1078,7 +1151,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                   <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">{copy.title}</h1>
                   <p className="mt-1 max-w-prose text-sm leading-5 text-[#7c8a9c] max-sm:oa-clamp-2">{copy.subtitle}</p>
                 </div>
-                <button onClick={connectVoice} aria-label={voiceConnected ? `Stop voice · ${voiceStateLabel}` : `Start voice · ${voiceStateLabel}`} title={voiceStateLabel} className="group grid shrink-0 place-items-center rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E0BC63]/50">
+                <button onClick={() => setVoicePanelOpen(true)} aria-label={`Open voice · ${voiceStateLabel}`} title={`Open voice · ${voiceStateLabel}`} className="group grid shrink-0 place-items-center rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E0BC63]/50">
                   <VoiceOrb phase={orbPhase} meter={voiceMeter} size={48} />
                 </button>
               </div>
@@ -1088,22 +1161,20 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                   <span className="sr-only">Search current view</span>
                   <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search workspace" className="w-full min-w-0 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm outline-none transition placeholder:text-[#5b6879] focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10" />
                 </label>
-                {ownerAccess && <div aria-label="Workspace mode" className="grid shrink-0 grid-cols-2 rounded-xl border border-white/[0.08] bg-white/[0.04] p-1 xl:hidden">{(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => selectMode(item)} aria-pressed={mode === item} className={`rounded-lg px-3 py-1.5 text-xs font-semibold capitalize transition ${mode === item ? 'bg-[#E0BC63] text-[#17130a] shadow-[0_4px_16px_rgba(224,188,99,0.12)]' : 'text-[#7c8a9c] hover:bg-white/[0.05] hover:text-white'}`}>{item}</button>)}</div>}
+                {ownerAccess && <span className="shrink-0 rounded-xl border border-[#E0BC63]/20 bg-[#E0BC63]/[0.06] px-3 py-2 text-xs font-semibold text-[#FFE9AE] xl:hidden">Private Live</span>}
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={selectDemoVoiceAccess} /></div></div>}
-            <div className="mt-4 xl:hidden"><VoicePicker value={selectedVoice} connected={voiceConnected} onChange={selectVoice} /></div>
-            {mode === 'live' && <div className="mt-3 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
+            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div></div>}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
                 ? <ActivityView mode={mode} activity={activity} owner={Boolean(user?.owner)} onVoicePolicyChanged={refreshJudgeVoicePolicy} />
-                : <LiveWorkspaceView view={view} live={live} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onOpenNote={(item) => void openLiveNote(item)} />
+                : <LiveWorkspaceView view={view} live={live} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => { setSelectedId(id); setOpenLiveItem({ id, view, item }); }} />
             ) : demoLoading ? <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Preparing your private demo workspace…</p></div></div> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
               {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
-              {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={setSelectedId} onCreate={() => setEditor('task')} />}
+              {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); const task = tasks.find((candidate) => candidate.id === id); if (task) setOpenLiveItem({ id, view: 'tasks', item: { ...task, _kind: 'Demo task' } }); }} onCreate={() => setEditor('task')} />}
               {view === 'calendar' && <CalendarView events={events} selectedId={selectedId} onSelect={setSelectedId} onCreate={() => void invokeTool('workspace_create_calendar_event', { account: 'Main', summary: 'WebMCP demo review', start: '2026-08-28T11:00:00-05:00', end: '2026-08-28T11:30:00-05:00', timeZone: 'America/Chicago', reminderMinutes: [10] })} />}
               {view === 'notes' && <NotesView mode={mode} notes={notes} onCreate={() => setEditor('note')} onOpen={openDemoNote} />}
               {view === 'memory' && <MemoryView mode={mode} memory={memory} onRemember={() => void invokeTool('workspace_remember_fact', { category: 'Preferences', fact: 'Use the Main account for personal reminders.' })} />}
@@ -1113,11 +1184,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             </div>
           </div>
         </section>
-        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} judgeVoicePolicy={judgeVoicePolicy} activity={activity} toast={toast} voiceStatus={voiceStatus} voiceStateLabel={voiceStateLabel} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} selectedVoice={selectedVoice} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onVoiceChange={selectVoice} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
+        <ActivityRail activity={activity} toast={toast} voiceStatus={voiceStatus} voiceStateLabel={voiceStateLabel} voiceConnected={voiceConnected} orbPhase={orbPhase} voiceMeter={voiceMeter} onOpenVoice={() => setVoicePanelOpen(true)} onOpenActivity={() => focusView('activity')} />
       </div>
+      {voicePanelOpen && <VoiceStage mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} judgeVoicePolicy={judgeVoicePolicy} status={voiceStatus} stateLabel={voiceStateLabel} prompt={voicePrompt} connected={voiceConnected} muted={voiceMuted} selectedVoice={selectedVoice} activeVoice={activeVoice} phase={orbPhase} meter={voiceMeter} transcript={voiceTranscript} threads={voiceThreads} selectedThreadId={selectedVoiceThreadId} threadsLoading={voiceThreadsLoading} onClose={() => setVoicePanelOpen(false)} onVoice={connectVoice} onMute={toggleVoiceMute} onVoiceChange={selectVoice} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectThread={setSelectedVoiceThreadId} onRefreshThreads={() => void refreshVoiceThreads()} />}
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
       {openNote && <NoteReader note={openNote} onClose={() => setOpenNote(null)} />}
+      {openLiveItem && <LiveItemReader value={openLiveItem} onClose={() => setOpenLiveItem(null)} />}
       <MobileNavigation view={view} onView={focusView} />
     </main>
   );
@@ -1189,9 +1262,9 @@ function MobileNavigation({ view, onView }: { view: WorkspaceView; onView: (view
   );
 }
 
-function Sidebar({ mode, view, user, onMode, onView, onToast, onSignOut }: { mode: Mode; view: WorkspaceView; user: SiteUser; onMode: (mode: Mode) => void; onView: (view: WorkspaceView) => void; onToast: (message: string) => void; onSignOut: () => void }) {
+function Sidebar({ view, user, onView, onSignOut }: { view: WorkspaceView; user: SiteUser; onView: (view: WorkspaceView) => void; onSignOut: () => void }) {
   const owner = user?.access === 'owner';
-  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{NAVIGATION.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Access</p>{owner && <div className="mt-3 grid grid-cols-2 rounded-xl bg-white/[0.04] p-1">{(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => { onMode(item); onToast(item === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.'); }} className={`rounded-lg px-2 py-2 text-xs font-semibold capitalize ${mode === item ? 'bg-[#E0BC63] text-[#17130a]' : 'text-[#7c8a9c]'}`}>{item}</button>)}</div>}<p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-[#E0BC63] transition hover:text-[#F2D783]">Sign out</button></div></aside>;
+  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{NAVIGATION.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Access</p><span className="mt-3 inline-flex rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#E0BC63]">{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-[#E0BC63] transition hover:text-[#F2D783]">Sign out</button></div></aside>;
 }
 
 function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, onRefresh }: { threads: VoiceThread[]; selectedId: string | null; loading: boolean; connected: boolean; onSelect: (threadId: string | null) => void; onRefresh: () => void }) {
@@ -1247,12 +1320,7 @@ function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }
   );
 }
 
-function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePolicy, activity, toast, voiceStatus, voiceStateLabel, voicePrompt, voiceConnected, voiceMuted, selectedVoice, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onVoiceChange, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; judgeVoicePolicy: JudgeVoicePolicy; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voiceStateLabel: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; selectedVoice: RealtimeVoice; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onVoiceChange: (voice: RealtimeVoice) => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
-  const voiceLabel = mode === 'live'
-    ? 'Owner voice'
-    : demoVoiceAccess === 'capped'
-      ? 'Funded demo voice'
-      : 'ChatGPT subscription voice';
+function ActivityRail({ activity, toast, voiceStatus, voiceStateLabel, voiceConnected, orbPhase, voiceMeter, onOpenVoice, onOpenActivity }: { activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voiceStateLabel: string; voiceConnected: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; onOpenVoice: () => void; onOpenActivity: () => void }) {
   return (
     <aside className="min-w-0 border-l border-white/[0.08] bg-[#08090d] px-5 py-7 max-xl:hidden">
       <div className="flex items-start justify-between gap-3">
@@ -1264,7 +1332,7 @@ function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoiceP
       </div>
       <div className="mt-6 space-y-1">
         {activity.slice(0, 5).map((item) => (
-          <button key={item.id} onClick={onOpen} className="block w-full rounded-xl border-l border-white/10 px-3 py-2.5 text-left transition hover:border-[#E0BC63] hover:bg-[#E0BC63]/[0.05]">
+          <button key={item.id} onClick={onOpenActivity} className="block w-full rounded-xl border-l border-white/10 px-3 py-2.5 text-left transition hover:border-[#E0BC63] hover:bg-[#E0BC63]/[0.05]">
             <p className="oa-clamp-2 text-sm leading-5 text-[#d6dfeb]">{item.action}</p>
             <p className="mt-1 oa-clamp-1 text-xs text-[#5b6879]">{item.actor} · {item.time}</p>
           </button>
@@ -1272,29 +1340,42 @@ function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoiceP
       </div>
       <div className="mt-8 border-t border-white/[0.08] pt-6">
         <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5b6879]">Voice</p>
-        {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} /></div>}
-        <button onClick={onVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl border border-transparent px-2 py-3 text-left transition hover:border-white/[0.06] hover:bg-white/[0.04] focus-visible:border-[#E0BC63]/35 focus-visible:outline-none">
+        <button onClick={onOpenVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl border border-white/[0.07] bg-white/[0.025] px-3 py-3 text-left transition hover:border-[#E0BC63]/25 hover:bg-[#E0BC63]/[0.04] focus-visible:border-[#E0BC63]/35 focus-visible:outline-none">
           <VoiceOrb phase={orbPhase} meter={voiceMeter} size={56} />
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-medium">{voiceConnected ? `Stop ${voiceLabel.toLowerCase()}` : voiceLabel}</span>
+            <span className="block truncate text-sm font-medium">{voiceConnected ? 'Voice is active' : 'Open voice'}</span>
             <span className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-0.5 text-[10px] font-semibold text-[#cbd4db]"><span className={`oa-voice-state-dot oa-voice-state-dot--${orbPhase}`} />{voiceStateLabel}</span>
             <span className="mt-0.5 block oa-clamp-2 text-xs leading-4 text-[#7c8a9c]">{voiceStatus}</span>
           </span>
         </button>
-        {voiceConnected && <button onClick={onMute} className="mt-2 w-full rounded-xl border border-white/[0.08] px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/40 hover:text-white">{voiceMuted ? 'Unmute microphone' : 'Mute microphone'}</button>}
-        <div className="mt-3"><VoicePicker value={selectedVoice} connected={voiceConnected} onChange={onVoiceChange} /></div>
-        {mode === 'live' && <div className="mt-3"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={onSelectVoiceThread} onRefresh={onRefreshVoiceThreads} /></div>}
-        {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2.5 text-[11px] leading-4 text-[#7c8a9c]">Uses only synthetic data. The server key is never sent to this browser.</p>}
-        {voicePrompt && (
-          <div className="mt-3 rounded-2xl border border-[#E0BC63]/20 bg-[#E0BC63]/[0.06] p-4">
-            <p className="text-xs leading-5 text-[#a4b1c2]">Open the secure ChatGPT sign-in page, then enter this one-time code.</p>
-            <a href={voicePrompt.verificationUrl} target="_blank" rel="noreferrer" className="mt-3 block oa-wrap-anywhere text-xs font-semibold text-[#E0BC63] underline decoration-[#E0BC63]/30 underline-offset-4">Open ChatGPT sign-in</a>
-            <code className="mt-3 block oa-wrap-anywhere rounded-lg bg-black/25 px-3 py-2 text-center text-sm font-semibold tracking-[0.18em] text-white">{voicePrompt.userCode}</code>
-          </div>
-        )}
       </div>
       <div aria-live="polite" className="mt-7 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 oa-clamp-3 text-xs leading-5 text-[#a4b1c2]">{toast}</div>
     </aside>
+  );
+}
+
+function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePolicy, status, stateLabel, prompt, connected, muted, selectedVoice, activeVoice, phase, meter, transcript, threads, selectedThreadId, threadsLoading, onClose, onVoice, onMute, onVoiceChange, onDemoVoiceAccess, onSelectThread, onRefreshThreads }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; judgeVoicePolicy: JudgeVoicePolicy; status: string; stateLabel: string; prompt: VoicePrompt; connected: boolean; muted: boolean; selectedVoice: RealtimeVoice; activeVoice: RealtimeVoice | null; phase: OrbPhase; meter: VoiceLevelMeter | null; transcript: VoiceTranscript; threads: VoiceThread[]; selectedThreadId: string | null; threadsLoading: boolean; onClose: () => void; onVoice: () => void; onMute: () => void; onVoiceChange: (voice: RealtimeVoice) => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectThread: (threadId: string | null) => void; onRefreshThreads: () => void }) {
+  const liveVoice = activeVoice ?? selectedVoice;
+  return (
+    <div className="fixed inset-0 z-[70] grid place-items-center bg-black/60 p-3 backdrop-blur-md sm:p-6" role="dialog" aria-modal="true" aria-label="OpenAssist voice" onMouseDown={(event) => { if (event.target === event.currentTarget && !connected) onClose(); }}>
+      <section className="relative max-h-[94vh] w-full max-w-2xl overflow-y-auto rounded-[32px] border border-[#E0BC63]/20 bg-[radial-gradient(circle_at_50%_3%,rgba(224,188,99,0.11),transparent_35%),#0b0d12] p-5 shadow-[0_35px_120px_rgba(0,0,0,0.75),0_0_70px_rgba(224,188,99,0.08)] sm:p-7">
+        <div className="flex items-center justify-between gap-4"><div><p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">OpenAssist voice</p><p className="mt-1 text-sm text-[#7c8a9c]">{mode === 'live' ? 'Private Live Workspace' : 'Isolated judge demo'}</p></div><button onClick={onClose} aria-label="Close voice panel" className="grid h-10 w-10 place-items-center rounded-full border border-white/10 text-xl text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">×</button></div>
+        <div className="mt-4 flex flex-col items-center text-center">
+          <div className={`relative grid h-40 w-40 place-items-center rounded-full transition duration-300 ${connected ? 'shadow-[0_0_75px_rgba(224,188,99,0.16)]' : ''}`}><VoiceOrb phase={phase} meter={meter} size={144} /><span className="absolute -bottom-1 inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-[#11141a]/95 px-3 py-1 text-[11px] font-semibold text-[#d6dfeb]"><span className={`oa-voice-state-dot oa-voice-state-dot--${phase}`} />{stateLabel}</span></div>
+          <h2 className="mt-5 text-xl font-semibold">{connected ? `${voiceLabel(liveVoice)} is ${stateLabel.toLowerCase()}` : `Talk with ${voiceLabel(selectedVoice)}`}</h2>
+          <p aria-live="polite" className="mt-2 max-w-lg text-sm leading-6 text-[#8997a8]">{status}</p>
+        </div>
+        <div className="mt-6 grid gap-3 sm:grid-cols-2">
+          <div className="min-h-24 rounded-2xl border border-white/[0.08] bg-white/[0.025] p-4"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">You</p><p className="mt-2 oa-wrap-anywhere text-sm leading-6 text-[#d6dfeb]">{transcript.user || (connected ? 'Listening for your voice…' : 'Your live words will appear here.')}</p></div>
+          <div className="min-h-24 rounded-2xl border border-[#E0BC63]/12 bg-[#E0BC63]/[0.025] p-4"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">OpenAssist</p><p className="mt-2 oa-wrap-anywhere text-sm leading-6 text-[#d6dfeb]">{transcript.assistant || (connected ? 'Waiting to respond…' : 'The spoken answer will appear here.')}</p></div>
+        </div>
+        <p className="mt-2 text-center text-[10px] text-[#5b6879]">Live transcript only · not saved by the website</p>
+        <div className="mt-5 flex flex-wrap justify-center gap-2"><button onClick={onVoice} className={`min-w-36 rounded-xl px-5 py-2.5 text-sm font-semibold transition ${connected ? 'border border-[#FF8B78]/30 bg-[#FF8B78]/10 text-[#FFA898] hover:bg-[#FF8B78]/15' : 'bg-[#E0BC63] text-[#17130a] hover:bg-[#e6c877]'}`}>{connected ? 'Stop voice' : 'Start voice'}</button>{connected && <button onClick={onMute} className="rounded-xl border border-white/10 px-5 py-2.5 text-sm text-[#c5ced8] transition hover:border-[#E0BC63]/30 hover:text-white">{muted ? 'Unmute' : 'Mute'}</button>}</div>
+        <div className="mt-6 grid gap-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} />{mode === 'live' && <div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div>}</div>
+        {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-3 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2.5 text-[11px] leading-4 text-[#7c8a9c]">Uses only synthetic data. The server key is never sent to this browser.</p>}
+        {prompt && <div className="mt-4 rounded-2xl border border-[#E0BC63]/20 bg-[#E0BC63]/[0.06] p-4"><p className="text-xs leading-5 text-[#a4b1c2]">Open the secure ChatGPT sign-in page, then enter this one-time code.</p><a href={prompt.verificationUrl} target="_blank" rel="noreferrer" className="mt-3 block text-xs font-semibold text-[#E0BC63] underline underline-offset-4">Open ChatGPT sign-in</a><code className="mt-3 block rounded-lg bg-black/25 px-3 py-2 text-center text-sm font-semibold tracking-[0.18em] text-white">{prompt.userCode}</code></div>}
+      </section>
+    </div>
   );
 }
 
@@ -1711,6 +1792,10 @@ function displayText(item: Record<string, unknown>, keys: string[], fallback: st
   return fallback;
 }
 
+function liveItemId(item: Record<string, unknown>, fallback: string): string {
+  return displayText(item, ['id', 'taskId', 'messageId', 'eventId', 'documentId', 'noteId', 'factId'], fallback);
+}
+
 function noteRecord(value: unknown, depth = 0): Record<string, unknown> {
   const record = objectValue(value);
   if (depth >= 4) return record;
@@ -1732,7 +1817,7 @@ function safeExternalUrl(value: string): string | undefined {
   }
 }
 
-function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, onReconnect, onOpenNote }: { view: WorkspaceView; live: LiveState; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void; onOpenNote: (item: Record<string, unknown>) => void }) {
+function LiveWorkspaceView({ view, live, selectedId, ownerCode, onOwnerCode, onBootstrap, onReconnect, onRetry, onOpenNote, onOpenItem }: { view: WorkspaceView; live: LiveState; selectedId: string | null; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void; onRetry: () => void; onOpenNote: (item: Record<string, unknown>) => void; onOpenItem: (id: string, item: Record<string, unknown>) => void }) {
   const source = view === 'accounts' || view === 'activity' ? live.accounts : live.data[view];
   const rows = useMemo(() => liveRows(view, source), [source, view]);
   const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(rows, PAGE_SIZE, `${view}-${rows.length}`);
@@ -1747,7 +1832,7 @@ function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, on
     return <div className="mx-auto max-w-xl rounded-[26px] border border-[#FF8B78]/20 bg-[#FF8B78]/[0.045] p-6 sm:p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#FFA898]">Live Workspace unavailable</p><h2 className="mt-2 text-xl font-semibold">Reconnect securely</h2><p className="mt-3 oa-wrap-anywhere text-sm leading-6 text-[#a4b1c2]">{live.error}</p><button onClick={onReconnect} className="mt-6 w-full rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a] sm:w-auto">Connect Workspace</button></div>;
   }
   if (!source) {
-    return <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.025] p-6 sm:p-7"><p className="text-sm leading-6 text-[#a4b1c2]">Connect Workspace to load private data. Demo records are intentionally hidden in Live mode.</p><button onClick={onReconnect} className="mt-5 w-full rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a] sm:w-auto">Connect Workspace</button></div>;
+    return <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.025] p-6 sm:p-7"><p className="text-sm leading-6 text-[#a4b1c2]">{live.warning ?? 'Connect Workspace to load private data. Demo records are intentionally hidden in Live mode.'}</p><button onClick={live.warning ? onRetry : onReconnect} className="mt-5 w-full rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a] sm:w-auto">{live.warning ? 'Try again' : 'Connect Workspace'}</button></div>;
   }
 
   return (
@@ -1759,6 +1844,7 @@ function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, on
         </div>
         <button onClick={onReconnect} className="shrink-0 rounded-xl border border-[#E0BC63]/25 px-3 py-2 text-xs text-[#FFE9AE] transition hover:border-[#E0BC63]/50">Connection</button>
       </div>
+      {live.warning && <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#FFC178]/20 bg-[#FFC178]/[0.05] px-4 py-3 text-sm text-[#d7c399]"><span>Refresh failed. Showing the last loaded Workspace data.</span><button onClick={onRetry} className="rounded-lg border border-[#FFC178]/25 px-3 py-1.5 text-xs font-semibold text-[#FFE9AE]">Retry</button></div>}
       {total ? (
         <>
           <div className="space-y-2">
@@ -1766,8 +1852,9 @@ function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, on
               const kind = String(item._kind ?? 'Workspace');
               const title = displayText(item, ['subject', 'title', 'summary', 'friendlyLabel', 'fact', 'name', 'email'], `${kind} ${rangeStart + index}`);
               const subtitle = displayText(item, ['sender', 'from', 'email', 'due', 'start', 'account', 'category', 'status'], 'Live Workspace item');
+              const itemId = liveItemId(item, `${view}-${rangeStart + index}`);
               return (
-                <HaloRow key={displayText(item, ['id', 'messageId', 'eventId', 'documentId'], `${view}-${rangeStart + index}`)} id={`live-${view}-${rangeStart + index}`} selected={false} onClick={view === 'notes' ? () => onOpenNote(item) : undefined}>
+                <HaloRow key={itemId} id={itemId} selected={selectedId === itemId} onClick={view === 'notes' ? () => onOpenNote(item) : () => onOpenItem(itemId, item)}>
                   <div className="flex items-start justify-between gap-4">
                     <div className="min-w-0 flex-1">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#E0BC63]">{kind}</p>
@@ -1959,6 +2046,33 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
         </div>
       )}
     </section>
+  );
+}
+
+function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () => void }) {
+  const item = value.item;
+  const kind = displayText(item, ['_kind'], value.view === 'tasks' ? 'Task' : 'Workspace item');
+  const title = displayText(item, ['subject', 'title', 'summary', 'friendlyLabel', 'fact', 'name', 'email'], kind);
+  const fields = [
+    ['Account', displayText(item, ['account', '_account', 'email'], '')],
+    ['List', displayText(item, ['list', 'taskListTitle', 'listTitle'], '')],
+    ['Due', displayText(item, ['due', 'dueDate'], '')],
+    ['Status', displayText(item, ['status'], '')],
+    ['Notes', displayText(item, ['notes', 'description', 'snippet'], '')],
+  ].filter((entry) => entry[1]);
+  return (
+    <div className="fixed inset-0 z-[80] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={`${kind} details`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="w-full max-w-xl rounded-[28px] border border-[#E0BC63]/20 bg-[#0d0f14]/95 p-6 shadow-[0_30px_100px_rgba(0,0,0,0.65),0_0_40px_rgba(224,188,99,0.06)] sm:p-7">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">{kind}</p><h2 className="mt-2 oa-wrap-anywhere text-xl font-semibold leading-7">{title}</h2></div>
+          <button onClick={onClose} aria-label="Close details" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-white/10 text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">×</button>
+        </div>
+        <dl className="mt-6 divide-y divide-white/[0.07] rounded-2xl border border-white/[0.07] bg-white/[0.025] px-4">
+          {fields.map(([label, text]) => <div key={label} className="grid gap-1 py-3 sm:grid-cols-[84px_1fr]"><dt className="text-xs font-medium text-[#7c8a9c]">{label}</dt><dd className="oa-wrap-anywhere text-sm leading-5 text-[#d6dfeb]">{text}</dd></div>)}
+        </dl>
+        <p className="mt-4 text-xs leading-5 text-[#667480]">Loaded live from OpenAssist. This content is not copied into the site database.</p>
+      </section>
+    </div>
   );
 }
 
