@@ -3,6 +3,7 @@ import { recordDemoVoiceSession } from '../../../../../../lib/demo-store';
 import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../../../lib/http';
 import { getPublicJudgeVoicePolicy } from '../../../../../../lib/judge-voice-policy';
 import { activateJudgeVoiceSession, failJudgeVoiceEvent, reserveJudgeVoiceSession } from '../../../../../../lib/judge-voice-store';
+import { parseRealtimeVoice } from '../../../../../../lib/realtime-voices';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
@@ -11,6 +12,7 @@ export async function POST(request: Request): Promise<Response> {
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request, 310_000);
     const sdp = typeof body.sdp === 'string' ? body.sdp : '';
+    const voice = parseRealtimeVoice(body.voice);
     if (!sdp) throw new Response('A WebRTC offer is required.', { status: 400 });
     const policy = await getPublicJudgeVoicePolicy();
     if (!policy.available) throw new Response('The funded judge voice demo is not enabled.', { status: 503 });
@@ -25,7 +27,7 @@ export async function POST(request: Request): Promise<Response> {
       request,
       demoVoiceUserId(session.workspaceId),
       '/demo/realtime',
-      { method: 'POST', body: JSON.stringify({ sdp }) },
+      { method: 'POST', body: JSON.stringify({ sdp, voice }) },
       'demo',
     );
     const result = await response.json().catch(() => ({})) as Record<string, unknown>;

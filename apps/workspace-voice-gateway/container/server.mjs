@@ -16,8 +16,11 @@ const configPath = path.join(codexHome, 'config.toml');
 const containerDir = path.dirname(fileURLToPath(import.meta.url));
 const configTemplate = await readFile(path.join(containerDir, 'config.toml'), 'utf8');
 const toolManifest = JSON.parse(await readFile(path.join(containerDir, 'tool-manifest.json'), 'utf8'));
+const realtimeVoiceOptions = JSON.parse(await readFile(path.join(containerDir, 'realtime-voices.json'), 'utf8'));
 const toolNames = toolManifest.map((tool) => tool.name);
 const toolNameSet = new Set(toolNames);
+const realtimeVoiceNames = new Set(realtimeVoiceOptions.map((voice) => voice.id));
+const defaultRealtimeVoice = 'marin';
 const sessions = new Map();
 const THREAD_STATE_LIMIT = 24_000_000;
 const THREAD_STATE_UNCOMPRESSED_LIMIT = 96_000_000;
@@ -143,6 +146,10 @@ async function restoreAuth(authJson) {
 
 function validThreadId(value) {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(value);
+}
+
+function validRealtimeVoice(value) {
+  return typeof value === 'string' && realtimeVoiceNames.has(value);
 }
 
 async function threadFiles(root, prefix) {
@@ -428,7 +435,7 @@ class AppServer {
       }));
   }
 
-  async startRealtime(offerSdp, requestedThreadId = null) {
+  async startRealtime(offerSdp, requestedThreadId = null, voice = defaultRealtimeVoice) {
     const instructions = this.threadInstructions();
     const prepared = requestedThreadId
       ? await this.request('thread/resume', {
@@ -464,6 +471,7 @@ class AppServer {
       await this.request('thread/realtime/start', {
         threadId,
         outputModality: 'audio',
+        voice,
         version: 'v3',
         includeStartupContext: true,
         flushTranscriptTailOnSessionEnd: true,
@@ -683,8 +691,10 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const sdp = typeof body.sdp === 'string' ? body.sdp : '';
       const threadId = body.threadId == null || body.threadId === '' ? null : body.threadId;
+      const voice = body.voice == null || body.voice === '' ? defaultRealtimeVoice : body.voice;
       if (!sdp || sdp.length > 300_000) throw Object.assign(new Error('A valid WebRTC offer is required.'), { status: 400 });
       if (threadId != null && !validThreadId(threadId)) throw Object.assign(new Error('The selected voice conversation is invalid.'), { status: 400 });
+      if (!validRealtimeVoice(voice)) throw Object.assign(new Error('The selected voice is not supported.'), { status: 400 });
       await restoreAuth(body.authJson);
       await stopActiveSession('A newer voice session started.');
       const sessionId = crypto.randomUUID().replace(/-/g, '');
@@ -692,7 +702,7 @@ const server = createServer(async (request, response) => {
       sessions.set(sessionId, session);
       activeSessionId = sessionId;
       await session.appServer.start();
-      const realtime = await session.appServer.startRealtime(sdp, threadId);
+      const realtime = await session.appServer.startRealtime(sdp, threadId, voice);
       sendJson(response, 200, { status: 'ready', sessionId, sdp: realtime.sdp, threadId: realtime.threadId, resumed: realtime.resumed });
       return;
     }

@@ -1,0 +1,8 @@
+[
+  { "id": "marin", "label": "Marin", "description": "Warm and natural" },
+  { "id": "cedar", "label": "Cedar", "description": "Clear and grounded" },
+  { "id": "coral", "label": "Coral", "description": "Friendly and expressive" },
+  { "id": "sage", "label": "Sage", "description": "Calm and measured" },
+  { "id": "verse", "label": "Verse", "description": "Balanced and conversational" },
+  { "id": "ash", "label": "Ash", "description": "Bright and direct" }
+]

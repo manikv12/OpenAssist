@@ -5,6 +5,12 @@ import { useRouter } from 'next/navigation';
 import { VoiceOrb, type OrbPhase } from './voice-orb';
 import { VoiceLevelMeter } from '../../lib/voice-levels';
 import {
+  DEFAULT_REALTIME_VOICE,
+  parseRealtimeVoice,
+  REALTIME_VOICES,
+  type RealtimeVoice,
+} from '../../lib/realtime-voices';
+import {
   DEMO_ACTIVITY,
   DEMO_EVENTS,
   DEMO_MAIL,
@@ -240,6 +246,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [toast, setToast] = useState('Private demo ready · 23 WebMCP tools available.');
   const [voiceStatus, setVoiceStatus] = useState('Ready to check compatibility');
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
   const [voicePrompt, setVoicePrompt] = useState<VoicePrompt>(null);
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceMuted, setVoiceMuted] = useState(false);
@@ -283,11 +290,29 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const cappedToolLimitRef = useRef(12);
   const voiceMeterRef = useRef<VoiceLevelMeter | null>(null);
   const [voiceMeter, setVoiceMeter] = useState<VoiceLevelMeter | null>(null);
+  const [voiceHearing, setVoiceHearing] = useState(false);
+  const [voiceThinking, setVoiceThinking] = useState(false);
   const [voiceSpeaking, setVoiceSpeaking] = useState(false);
 
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { demoVoiceAccessRef.current = demoVoiceAccess; }, [demoVoiceAccess]);
   useEffect(() => { pendingRef.current = pending; }, [pending]);
+  useEffect(() => {
+    const stored = window.localStorage.getItem('openassist-realtime-voice');
+    if (!stored) return;
+    const frame = window.requestAnimationFrame(() => {
+      setSelectedVoice(parseRealtimeVoice(stored));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  const selectVoice = useCallback((voice: RealtimeVoice) => {
+    if (voiceConnected) return;
+    setSelectedVoice(voice);
+    window.localStorage.setItem('openassist-realtime-voice', voice);
+    const option = REALTIME_VOICES.find((item) => item.id === voice);
+    setVoiceStatus(`Ready with ${option?.label ?? voice}`);
+  }, [voiceConnected]);
 
   const refreshJudgeVoicePolicy = useCallback(() => {
     const controller = new AbortController();
@@ -786,7 +811,9 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const response = await fetch(sessionEndpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(subscription ? { sdp: offerSdp, threadId: selectedVoiceThreadId } : { sdp: offerSdp }),
+        body: JSON.stringify(subscription
+          ? { sdp: offerSdp, threadId: selectedVoiceThreadId, voice: selectedVoice }
+          : { sdp: offerSdp, voice: selectedVoice }),
       });
       const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean; callId?: string; sessionId?: string; expiresAfterSeconds?: number; warningAfterSeconds?: number; maxToolCalls?: number };
       if (!response.ok || body.status !== 'ready' || !body.sdp) throw new Error(body.message ?? body.error ?? 'Voice is not compatible yet.');
@@ -841,7 +868,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     } catch (error) {
       stopVoice(error instanceof Error ? error.message : 'Voice is temporarily unavailable.');
     }
-  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, selectedVoiceThreadId, stopVoice, user, voiceConnected]);
+  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, selectedVoice, selectedVoiceThreadId, stopVoice, user, voiceConnected]);
 
   const toggleVoiceMute = useCallback(() => {
     const next = !voiceMuted;
@@ -869,34 +896,76 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
 
   useEffect(() => () => stopVoice('Voice stopped'), [stopVoice]);
 
-  // "Speaking" is derived from the assistant's own audio rather than a protocol
-  // event, so the orb stays in sync with what the user actually hears.
+  // Derive the visible conversation state from the audio the user actually
+  // hears and the microphone signal we actually receive. This keeps the orb in
+  // sync even when the realtime protocol does not emit a UI-friendly event.
   useEffect(() => {
     if (!voiceMeter) return;
     let frame = 0;
     let last = performance.now();
+    let hearingFor = 0;
     let speakingFor = 0;
+    let wasHearing = false;
+    let thinkingUntil = 0;
     const tick = (now: number) => {
       const dt = Math.min((now - last) / 1000, 0.1);
       last = now;
-      const { output } = voiceMeter.sample(dt);
+      const { mic, output } = voiceMeter.sample(dt);
       // Require a short sustained level so a click or breath cannot flip state.
-      speakingFor = output > 0.06 ? speakingFor + dt : 0;
-      const active = output > 0.06 ? speakingFor > 0.08 : false;
-      setVoiceSpeaking((current) => (current === active ? current : active));
+      hearingFor = mic > 0.045 ? hearingFor + dt : 0;
+      speakingFor = output > 0.04 ? speakingFor + dt : 0;
+      const hearing = mic > 0.045 && hearingFor > 0.055;
+      const speaking = output > 0.04 && speakingFor > 0.065;
+
+      if (hearing) thinkingUntil = 0;
+      else if (wasHearing) thinkingUntil = now + 2_400;
+      if (speaking) thinkingUntil = 0;
+      const thinking = !hearing && !speaking && now < thinkingUntil;
+
+      setVoiceHearing((current) => (current === hearing ? current : hearing));
+      setVoiceThinking((current) => (current === thinking ? current : thinking));
+      setVoiceSpeaking((current) => (current === speaking ? current : speaking));
+      wasHearing = hearing;
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(frame);
+      setVoiceHearing(false);
+      setVoiceThinking(false);
+      setVoiceSpeaking(false);
+    };
   }, [voiceMeter]);
 
+  const voiceStatusLower = voiceStatus.toLowerCase();
+  const voiceIsConnecting = /checking|starting|pending|sign-in|connecting/.test(voiceStatusLower);
+  const voiceHasError = /failed|error|unavailable|could not|ended|not compatible/.test(voiceStatusLower);
   const orbPhase: OrbPhase = !voiceConnected
-    ? (voiceStatus.includes('Checking') || voiceStatus.includes('Starting') ? 'thinking' : 'idle')
-    : voiceSpeaking
-      ? 'speaking'
-      : voiceMuted
-        ? 'idle'
-        : 'listening';
+    ? voiceIsConnecting
+      ? 'connecting'
+      : voiceHasError
+        ? 'error'
+        : 'idle'
+    : voiceMuted
+      ? 'muted'
+      : voiceSpeaking
+        ? 'speaking'
+        : voiceThinking
+          ? 'thinking'
+          : 'listening';
+  const voiceStateLabel = orbPhase === 'connecting'
+    ? 'Connecting'
+    : orbPhase === 'error'
+      ? 'Needs attention'
+      : orbPhase === 'muted'
+        ? 'Muted'
+        : orbPhase === 'speaking'
+          ? 'Speaking'
+          : orbPhase === 'thinking'
+            ? 'Thinking'
+            : orbPhase === 'listening'
+              ? voiceHearing ? 'Hearing you' : 'Listening'
+              : 'Ready';
 
   const filteredMessages = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -999,8 +1068,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                   <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">{copy.title}</h1>
                   <p className="mt-1 max-w-prose text-sm leading-5 text-[#7c8a9c] max-sm:oa-clamp-2">{copy.subtitle}</p>
                 </div>
-                <button onClick={connectVoice} aria-label={voiceConnected ? 'Stop voice' : 'Start voice'} className="group grid shrink-0 place-items-center rounded-full transition focus-visible:outline-none">
-                  <VoiceOrb phase={orbPhase} meter={voiceMeter} size={42} />
+                <button onClick={connectVoice} aria-label={voiceConnected ? `Stop voice · ${voiceStateLabel}` : `Start voice · ${voiceStateLabel}`} title={voiceStateLabel} className="group grid shrink-0 place-items-center rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E0BC63]/50">
+                  <VoiceOrb phase={orbPhase} meter={voiceMeter} size={48} />
                 </button>
               </div>
 
@@ -1016,7 +1085,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
               </div>
             </header>
             {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={selectDemoVoiceAccess} /></div></div>}
-            {(mode === 'live' || (mode === 'demo' && demoVoiceAccess === 'subscription')) && <div className="mt-4 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
+            <div className="mt-4 xl:hidden"><VoicePicker value={selectedVoice} connected={voiceConnected} onChange={selectVoice} /></div>
+            {(mode === 'live' || (mode === 'demo' && demoVoiceAccess === 'subscription')) && <div className="mt-3 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
@@ -1035,7 +1105,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             </div>
           </div>
         </section>
-        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} judgeVoicePolicy={judgeVoicePolicy} activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
+        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} judgeVoicePolicy={judgeVoicePolicy} activity={activity} toast={toast} voiceStatus={voiceStatus} voiceStateLabel={voiceStateLabel} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} selectedVoice={selectedVoice} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onVoiceChange={selectVoice} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
       </div>
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
@@ -1136,6 +1206,22 @@ function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, 
   );
 }
 
+function VoicePicker({ value, connected, onChange }: { value: RealtimeVoice; connected: boolean; onChange: (voice: RealtimeVoice) => void }) {
+  const selectId = useId();
+  const selected = REALTIME_VOICES.find((voice) => voice.id === value) ?? REALTIME_VOICES[0];
+  return (
+    <div className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-3.5">
+      <div className="flex items-center justify-between gap-3">
+        <label htmlFor={selectId} className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">Voice</label>
+        <span className="text-[10px] text-[#5b6879]">{connected ? 'Stop to change' : selected.description}</span>
+      </div>
+      <select id={selectId} value={value} onChange={(event) => onChange(parseRealtimeVoice(event.target.value))} disabled={connected} className="mt-2 w-full rounded-xl border border-white/10 bg-[#101215] px-3 py-2.5 text-sm text-[#dce4ea] outline-none transition focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10 disabled:cursor-not-allowed disabled:opacity-60">
+        {REALTIME_VOICES.map((voice) => <option key={voice.id} value={voice.id}>{voice.label} · {voice.description}</option>)}
+      </select>
+    </div>
+  );
+}
+
 function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; policy: JudgeVoicePolicy; onChange: (access: DemoVoiceAccess) => void }) {
   const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
     { id: 'capped', title: 'Funded judge demo', detail: `No sign-in · ${Math.ceil(policy.sessionSeconds / 60)} min · ${policy.maxToolCalls} tools` },
@@ -1153,7 +1239,7 @@ function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }
   );
 }
 
-function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePolicy, activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; judgeVoicePolicy: JudgeVoicePolicy; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
+function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePolicy, activity, toast, voiceStatus, voiceStateLabel, voicePrompt, voiceConnected, voiceMuted, selectedVoice, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onVoiceChange, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; judgeVoicePolicy: JudgeVoicePolicy; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voiceStateLabel: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; selectedVoice: RealtimeVoice; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onVoiceChange: (voice: RealtimeVoice) => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
   const voiceLabel = mode === 'live'
     ? 'Owner voice'
     : demoVoiceAccess === 'capped'
@@ -1179,14 +1265,16 @@ function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoiceP
       <div className="mt-8 border-t border-white/[0.08] pt-6">
         <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5b6879]">Voice</p>
         {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} /></div>}
-        <button onClick={onVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl px-2 py-3 text-left transition hover:bg-white/[0.04]">
-          <VoiceOrb phase={orbPhase} meter={voiceMeter} size={44} />
+        <button onClick={onVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl border border-transparent px-2 py-3 text-left transition hover:border-white/[0.06] hover:bg-white/[0.04] focus-visible:border-[#E0BC63]/35 focus-visible:outline-none">
+          <VoiceOrb phase={orbPhase} meter={voiceMeter} size={56} />
           <span className="min-w-0 flex-1">
             <span className="block truncate text-sm font-medium">{voiceConnected ? `Stop ${voiceLabel.toLowerCase()}` : voiceLabel}</span>
+            <span className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-0.5 text-[10px] font-semibold text-[#cbd4db]"><span className={`oa-voice-state-dot oa-voice-state-dot--${orbPhase}`} />{voiceStateLabel}</span>
             <span className="mt-0.5 block oa-clamp-2 text-xs leading-4 text-[#7c8a9c]">{voiceStatus}</span>
           </span>
         </button>
         {voiceConnected && <button onClick={onMute} className="mt-2 w-full rounded-xl border border-white/[0.08] px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/40 hover:text-white">{voiceMuted ? 'Unmute microphone' : 'Mute microphone'}</button>}
+        <div className="mt-3"><VoicePicker value={selectedVoice} connected={voiceConnected} onChange={onVoiceChange} /></div>
         {(mode === 'live' || demoVoiceAccess === 'subscription') && <div className="mt-3"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={onSelectVoiceThread} onRefresh={onRefreshVoiceThreads} /></div>}
         {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2.5 text-[11px] leading-4 text-[#7c8a9c]">Uses only synthetic data. The server key is never sent to this browser.</p>}
         {voicePrompt && (

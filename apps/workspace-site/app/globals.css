@@ -127,6 +127,9 @@ button {
    --------------------------------------------------------------------------- */
 
 .oa-orb {
+  --oa-orb-scale: 1;
+  --oa-orb-bloom: 0.75;
+  --oa-orb-bloom-scale: 0.94;
   position: relative;
   display: grid;
   place-items: center;
@@ -135,6 +138,10 @@ button {
   isolation: isolate;
   /* layout+style only: paint containment would clip the bloom. */
   contain: layout style;
+  transform: scale(var(--oa-orb-scale));
+  filter: saturate(1) brightness(1);
+  transition: transform 70ms linear, filter 220ms ease;
+  will-change: transform, filter;
 }
 
 /* Fallback disc: a lit sphere, not a flat circle. */
@@ -159,9 +166,10 @@ button {
   border-radius: inherit;
   background: radial-gradient(circle, rgba(224, 188, 99, 0.30), transparent 66%);
   filter: blur(10px);
-  opacity: 0.75;
+  opacity: var(--oa-orb-bloom);
+  transform: scale(var(--oa-orb-bloom-scale));
   z-index: -1;
-  transition: opacity 300ms ease, background 300ms ease;
+  transition: opacity 220ms ease, transform 70ms linear, background 300ms ease;
   pointer-events: none;
 }
 
@@ -181,6 +189,11 @@ button {
   opacity: 1;
 }
 
+.oa-orb--connecting::after {
+  background: radial-gradient(circle, rgba(224, 188, 99, 0.44), transparent 68%);
+  opacity: 1;
+}
+
 .oa-orb--thinking::after {
   background: radial-gradient(circle, rgba(124, 107, 240, 0.44), transparent 68%);
   opacity: 1;
@@ -191,14 +204,78 @@ button {
   opacity: 1;
 }
 
+.oa-orb--muted {
+  filter: saturate(0.25) brightness(0.72);
+}
+
+.oa-orb--muted::after {
+  background: radial-gradient(circle, rgba(124, 137, 151, 0.26), transparent 68%);
+  opacity: 0.58;
+}
+
+.oa-orb--error {
+  filter: saturate(0.72) brightness(0.88);
+}
+
+.oa-orb--error::after {
+  background: radial-gradient(circle, rgba(255, 111, 97, 0.42), transparent 68%);
+  opacity: 0.94;
+}
+
+.oa-voice-state-dot {
+  display: inline-block;
+  width: 0.42rem;
+  height: 0.42rem;
+  flex: 0 0 auto;
+  border-radius: 9999px;
+  background: #7c8a9c;
+  box-shadow: 0 0 0 3px rgba(124, 138, 156, 0.08);
+}
+
+.oa-voice-state-dot--connecting,
+.oa-voice-state-dot--listening {
+  background: #e0bc63;
+  box-shadow: 0 0 0 3px rgba(224, 188, 99, 0.10), 0 0 10px rgba(224, 188, 99, 0.48);
+}
+
+.oa-voice-state-dot--thinking {
+  background: #8f7ff0;
+  box-shadow: 0 0 0 3px rgba(143, 127, 240, 0.10), 0 0 10px rgba(143, 127, 240, 0.46);
+}
+
+.oa-voice-state-dot--speaking {
+  background: #4dc7d2;
+  box-shadow: 0 0 0 3px rgba(77, 199, 210, 0.10), 0 0 10px rgba(77, 199, 210, 0.46);
+}
+
+.oa-voice-state-dot--muted {
+  background: #7c8a9c;
+}
+
+.oa-voice-state-dot--error {
+  background: #ff6f61;
+  box-shadow: 0 0 0 3px rgba(255, 111, 97, 0.10), 0 0 10px rgba(255, 111, 97, 0.42);
+}
+
 /* Idle breathing for the fallback only; the shader has its own motion. */
 @media (prefers-reduced-motion: no-preference) {
   .oa-orb:not(.is-gl)::before {
     animation: oa-orb-breathe 4.2s ease-in-out infinite;
+  }
+
+  .oa-orb--connecting::after,
+  .oa-voice-state-dot--connecting,
+  .oa-voice-state-dot--thinking {
+    animation: oa-voice-pulse 1.35s ease-in-out infinite;
   }
 }
 
 @keyframes oa-orb-breathe {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.045); }
+}
+
+@keyframes oa-voice-pulse {
+  0%, 100% { opacity: 0.58; }
+  50% { opacity: 1; }
 }

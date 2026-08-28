@@ -151,12 +151,36 @@ test('owner voice can start a saved conversation or resume an existing one', asy
   assert.match(app, /New conversation/);
   assert.match(app, /resumed saved conversation/);
   assert.match(app, /subscriptionBase = currentMode === 'demo' \? '\/api\/demo\/voice\/subscription' : '\/api\/voice'/);
-  assert.match(app, /subscription \? \{ sdp: offerSdp, threadId: selectedVoiceThreadId \} : \{ sdp: offerSdp \}/);
-  assert.match(session, /JSON\.stringify\(\{ sdp, threadId \}\)/);
+  assert.match(app, /\{ sdp: offerSdp, threadId: selectedVoiceThreadId, voice: selectedVoice \}/);
+  assert.match(app, /\{ sdp: offerSdp, voice: selectedVoice \}/);
+  assert.match(session, /JSON\.stringify\(\{ sdp, threadId, voice \}\)/);
   assert.match(threads, /requireOwner\(\)/);
   assert.match(threads, /'\/threads'/);
   assert.match(stop, /assertSameOrigin\(request\)/);
   assert.match(stop, /'\/session\/stop'/);
+});
+
+test('voice selection and visible audio states are wired through every session path', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  const orb = await read('app/components/voice-orb.tsx');
+  const styles = await read('app/globals.css');
+  const ownerSession = await read('app/api/voice/session/route.ts');
+  const demoSubscription = await read('app/api/demo/voice/subscription/session/route.ts');
+  const demoCapped = await read('app/api/demo/voice/capped/session/route.ts');
+
+  assert.match(app, /openassist-realtime-voice/);
+  assert.match(app, /function VoicePicker/);
+  assert.match(app, /Hearing you/);
+  assert.match(app, /voiceThinking/);
+  assert.match(app, /voiceStateLabel/);
+  assert.match(orb, /'connecting'.*'muted'.*'error'/);
+  assert.match(orb, /--oa-orb-scale/);
+  assert.match(styles, /oa-voice-state-dot--speaking/);
+  assert.match(styles, /oa-orb--error/);
+  for (const route of [ownerSession, demoSubscription, demoCapped]) {
+    assert.match(route, /parseRealtimeVoice\(body\.voice\)/);
+    assert.match(route, /voice/);
+  }
 });
 
 test('demo judges can use an isolated ChatGPT subscription or the server-funded realtime fallback', async () => {

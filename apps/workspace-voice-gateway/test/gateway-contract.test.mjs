@@ -98,6 +98,18 @@ test('voice has strict per-user, time, and instance limits', async () => {
   assert.match(config, /"max_instances": 10/);
 });
 
+test('the selected realtime voice reaches both subscription and funded sessions', async () => {
+  const worker = await read('src/index.ts');
+  const server = await read('container/server.mjs');
+  const options = JSON.parse(await read('container/realtime-voices.json'));
+
+  assert.deepEqual(options.map((voice) => voice.id), ['marin', 'cedar', 'coral', 'sage', 'verse', 'ash']);
+  assert.match(worker, /parseRealtimeVoice\(body\.voice\)/);
+  assert.match(worker, /output: \{ voice \}/);
+  assert.match(server, /startRealtime\(offerSdp, requestedThreadId = null, voice = defaultRealtimeVoice\)/);
+  assert.match(server, /outputModality: 'audio',[\s\S]{0,80}voice,/);
+});
+
 test('the funded demo fallback is server-side, synthetic-only, and uses the exact visible tools', async () => {
   const worker = await read('src/index.ts');
   const config = await read('wrangler.jsonc');

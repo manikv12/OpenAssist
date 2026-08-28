@@ -3,7 +3,7 @@
 import { useEffect, useRef } from 'react';
 import type { VoiceLevelMeter } from '../../lib/voice-levels';
 
-export type OrbPhase = 'idle' | 'listening' | 'thinking' | 'speaking';
+export type OrbPhase = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'muted' | 'error';
 
 const VERTEX_SHADER = `
 attribute vec2 a_position;
@@ -83,11 +83,11 @@ void main() {
   float flow = fbm(uv * 1.55 + warp * 1.6 - churn * 0.12);
 
   // Mic reacts instantly; the reply swells gently on phrase shape.
-  float swell = u_micLevel * 0.15 + u_outputLevel * 0.09;
+  float swell = u_micLevel * 0.26 + u_outputLevel * 0.18;
 
   // Sphere first: an almost-round silhouette that only breathes a little.
   float baseRadius = 0.94 + swell * 0.5 + u_think * 0.015;
-  float wobble = detail * (0.020 + u_micLevel * 0.030) + sin(u_time * 0.55) * 0.006;
+  float wobble = detail * (0.020 + u_micLevel * 0.046 + u_outputLevel * 0.018) + sin(u_time * 0.55) * 0.006;
   float edge = baseRadius + wobble;
 
   // Tight falloff = a solid body with a soft rim, not a cloud.
@@ -272,12 +272,17 @@ export function VoiceOrb({
       outVelocity += outAccel * dt;
       outValue = Math.max(0, outValue + outVelocity * dt);
 
-      const drive = Math.max(micValue, outValue * 0.7);
+      const drive = Math.min(1, Math.max(micValue, outValue * 0.82));
       cumulative += drive * dt * (current === 'speaking' ? 3.6 : 3.0);
+
+      const host = canvas.parentElement;
+      host?.style.setProperty('--oa-orb-scale', (1 + drive * 0.17).toFixed(3));
+      host?.style.setProperty('--oa-orb-bloom', (0.72 + drive * 0.28).toFixed(3));
+      host?.style.setProperty('--oa-orb-bloom-scale', (0.94 + drive * 0.18).toFixed(3));
 
       const ease = 1 - Math.exp(-dt / 0.28);
       blend.listening += ((current === 'listening' ? 1 : 0) - blend.listening) * ease;
-      blend.thinking += ((current === 'thinking' ? 1 : 0) - blend.thinking) * ease;
+      blend.thinking += (((current === 'thinking' || current === 'connecting') ? 1 : 0) - blend.thinking) * ease;
       blend.speaking += ((current === 'speaking' ? 1 : 0) - blend.speaking) * ease;
 
       gl.uniform1f(uTime, now / 1000);
@@ -298,6 +303,9 @@ export function VoiceOrb({
     return () => {
       cancelAnimationFrame(frame);
       canvas.parentElement?.classList.remove('is-gl');
+      canvas.parentElement?.style.removeProperty('--oa-orb-scale');
+      canvas.parentElement?.style.removeProperty('--oa-orb-bloom');
+      canvas.parentElement?.style.removeProperty('--oa-orb-bloom-scale');
       gl.deleteProgram(program);
       gl.deleteShader(vertex);
       gl.deleteShader(fragment);

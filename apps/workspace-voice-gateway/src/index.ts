@@ -1,4 +1,5 @@
 import { Container } from '@cloudflare/containers';
+import realtimeVoiceOptions from '../container/realtime-voices.json';
 import toolManifest from '../container/tool-manifest.json';
 import {
   decryptAuth,
@@ -28,6 +29,16 @@ const DEMO_FUNDING_OBJECT_KEY = 'admin/judge-voice-funding.enc';
 const DEFAULT_DAILY_SESSION_LIMIT = 25;
 const DEFAULT_DEMO_SECONDS = 300;
 const DEFAULT_DEMO_TOOL_LIMIT = 12;
+const DEFAULT_REALTIME_VOICE = 'marin';
+const REALTIME_VOICE_IDS = new Set<string>(realtimeVoiceOptions.map((voice) => voice.id));
+
+function parseRealtimeVoice(value: unknown): string {
+  if (value == null || value === '') return DEFAULT_REALTIME_VOICE;
+  if (typeof value !== 'string' || !REALTIME_VOICE_IDS.has(value)) {
+    throw new Response('The selected voice is not supported.', { status: 400 });
+  }
+  return value;
+}
 
 type DemoFundingConfig = {
   version: 1;
@@ -388,6 +399,7 @@ async function createDemoRealtimeCall(request: Request, env: Env, payload: Gatew
   if (!funding.available || !funding.apiKey) throw new Response('Capped demo voice is not configured yet.', { status: 503 });
   const body = await readJson(request, SDP_LIMIT + 2_000);
   const sdp = typeof body.sdp === 'string' ? body.sdp : '';
+  const voice = parseRealtimeVoice(body.voice);
   if (!sdp || sdp.length > SDP_LIMIT) throw new Response('A valid WebRTC offer is required.', { status: 400 });
 
   const session = {
@@ -401,7 +413,7 @@ async function createDemoRealtimeCall(request: Request, env: Env, payload: Gatew
     tools: demoRealtimeTools(),
     audio: {
       input: { turn_detection: { type: 'semantic_vad' } },
-      output: { voice: 'marin' },
+      output: { voice },
     },
   };
   const form = new FormData();
@@ -549,6 +561,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     const body = await readJson(request, SDP_LIMIT + 2_000);
     const sdp = typeof body.sdp === 'string' ? body.sdp : '';
     const threadId = body.threadId == null || body.threadId === '' ? null : body.threadId;
+    const voice = parseRealtimeVoice(body.voice);
     if (!sdp || sdp.length > SDP_LIMIT) throw new Response('A valid WebRTC offer is required.', { status: 400 });
     if (threadId != null && (typeof threadId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(threadId))) {
       throw new Response('The selected voice conversation is invalid.', { status: 400 });
@@ -559,7 +572,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
     JSON.parse(authJson);
     await restoreThreadState(container, env, payload.userHash);
-    const result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId });
+    const result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId, voice });
     const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
     const answerSdp = typeof result.sdp === 'string' ? result.sdp : '';
     if (!sessionId || !answerSdp) throw new Response('The subscription realtime compatibility check did not return audio.', { status: 503 });
