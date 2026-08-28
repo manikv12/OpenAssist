@@ -20,6 +20,7 @@ interface Env {
 
 const AUTH_LIMIT = 256_000;
 const SDP_LIMIT = 300_000;
+const THREAD_STATE_LIMIT = 24_000_000;
 
 export class VoiceContainer extends Container<Env> {
   defaultPort = 8080;
@@ -34,6 +35,35 @@ export class VoiceContainer extends Container<Env> {
     CONTAINER_INTERNAL_TOKEN: this.env.CONTAINER_INTERNAL_TOKEN,
     CODEX_RUNTIME_VERSION: this.env.CODEX_RUNTIME_VERSION,
   };
+
+  async bindThreadOwner(userHash: string): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(userHash)) throw new Error('Voice owner identity is invalid.');
+    await this.ctx.storage.put('threadOwnerHash', userHash);
+  }
+
+  async checkpointThreadState(): Promise<void> {
+    const userHash = await this.ctx.storage.get<string>('threadOwnerHash');
+    if (!userHash) return;
+    const response = await this.containerFetch('http://container/threads/export', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-openassist-container-token': this.env.CONTAINER_INTERNAL_TOKEN,
+      },
+      body: '{}',
+    });
+    if (!response.ok) throw new Error('Voice conversation checkpoint failed.');
+    const result = await response.json() as { snapshot?: unknown };
+    await saveEncryptedThreadState(this.env, userHash, result.snapshot);
+  }
+
+  override async onActivityExpired(): Promise<void> {
+    try {
+      await this.checkpointThreadState();
+    } finally {
+      await this.stop();
+    }
+  }
 }
 
 function json(value: unknown, init: ResponseInit = {}): Response {
@@ -111,6 +141,10 @@ function authObjectKey(userHash: string): string {
   return `chatgpt-auth/${userHash}.enc`;
 }
 
+function threadStateObjectKey(userHash: string): string {
+  return `codex-thread-state/${userHash}.enc`;
+}
+
 async function saveEncryptedAuth(env: Env, objectKey: string, authJson: unknown): Promise<void> {
   if (typeof authJson !== 'string' || authJson.length > AUTH_LIMIT) {
     throw new Response('ChatGPT sign-in data is unexpectedly large.', { status: 400 });
@@ -121,6 +155,32 @@ async function saveEncryptedAuth(env: Env, objectKey: string, authJson: unknown)
     httpMetadata: { contentType: 'application/octet-stream' },
     customMetadata: { version: '1' },
   });
+}
+
+async function saveEncryptedThreadState(env: Env, userHash: string, snapshot: unknown): Promise<void> {
+  if (typeof snapshot !== 'string' || snapshot.length > THREAD_STATE_LIMIT || !snapshot.startsWith('v1.')) {
+    throw new Response('Voice conversation checkpoint is invalid.', { status: 400 });
+  }
+  const encrypted = await encryptAuth(snapshot, env.VOICE_AUTH_ENCRYPTION_KEY);
+  await env.VOICE_AUTH.put(threadStateObjectKey(userHash), encrypted, {
+    httpMetadata: { contentType: 'application/octet-stream' },
+    customMetadata: { version: '1', kind: 'codex-thread-state' },
+  });
+}
+
+async function restoreThreadState(container: ReturnType<typeof ownerContainer>, env: Env, userHash: string): Promise<void> {
+  const saved = await env.VOICE_AUTH.get(threadStateObjectKey(userHash));
+  const snapshot = saved ? await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY) : null;
+  if (snapshot && snapshot.length > THREAD_STATE_LIMIT) throw new Response('Saved voice conversation history is invalid.', { status: 400 });
+  await containerJson(container, env, '/threads/restore', { snapshot });
+}
+
+async function checkpointThreadState(container: ReturnType<typeof ownerContainer>, env: Env, userHash: string): Promise<boolean> {
+  const state = await container.getState().catch(() => ({ status: 'stopped' as const, lastChange: 0 }));
+  if (state.status !== 'running' && state.status !== 'healthy') return false;
+  const result = await containerJson(container, env, '/threads/export', {});
+  await saveEncryptedThreadState(env, userHash, result.snapshot);
+  return true;
 }
 
 async function requireSiteToken(request: Request, env: Env): Promise<GatewayToken> {
@@ -155,6 +215,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   const payload = await requireSiteToken(request, env);
   const container = ownerContainer(env);
   const objectKey = authObjectKey(payload.userHash);
+  await container.bindThreadOwner(payload.userHash);
 
   if (request.method === 'POST' && url.pathname === '/auth/start') {
     const result = await containerJson(container, env, '/auth/start', {});
@@ -179,22 +240,46 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === 'POST' && url.pathname === '/disconnect') {
+    await checkpointThreadState(container, env, payload.userHash).catch(() => undefined);
     await env.VOICE_AUTH.delete(objectKey);
     await containerJson(container, env, '/disconnect', {}).catch(() => undefined);
     await container.stop('SIGTERM').catch(() => undefined);
     return json({ status: 'disconnected' });
   }
 
+  if (request.method === 'GET' && url.pathname === '/threads') {
+    const saved = await env.VOICE_AUTH.get(objectKey);
+    if (!saved) return json({ status: 'auth_required', message: 'Connect your ChatGPT subscription to see saved conversations.' }, { status: 409 });
+    const authJson = await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY);
+    if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
+    JSON.parse(authJson);
+    await restoreThreadState(container, env, payload.userHash);
+    const result = await containerJson(container, env, '/threads/list', { authJson });
+    return json({ status: 'ready', threads: Array.isArray(result.threads) ? result.threads : [] });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/session/stop') {
+    const saved = await env.VOICE_AUTH.head(objectKey);
+    if (!saved) return json({ status: 'disconnected' });
+    await checkpointThreadState(container, env, payload.userHash);
+    return json({ status: 'saved' });
+  }
+
   if (request.method === 'POST' && url.pathname === '/session') {
     const body = await readJson(request, SDP_LIMIT + 2_000);
     const sdp = typeof body.sdp === 'string' ? body.sdp : '';
+    const threadId = body.threadId == null || body.threadId === '' ? null : body.threadId;
     if (!sdp || sdp.length > SDP_LIMIT) throw new Response('A valid WebRTC offer is required.', { status: 400 });
+    if (threadId != null && (typeof threadId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(threadId))) {
+      throw new Response('The selected voice conversation is invalid.', { status: 400 });
+    }
     const saved = await env.VOICE_AUTH.get(objectKey);
     if (!saved) return json({ status: 'auth_required', message: 'Connect your ChatGPT subscription for voice first.' }, { status: 409 });
     const authJson = await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY);
     if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
     JSON.parse(authJson);
-    const result = await containerJson(container, env, '/session/start', { sdp, authJson });
+    await restoreThreadState(container, env, payload.userHash);
+    const result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId });
     const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
     const answerSdp = typeof result.sdp === 'string' ? result.sdp : '';
     if (!sessionId || !answerSdp) throw new Response('The subscription realtime compatibility check did not return audio.', { status: 503 });
@@ -214,7 +299,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     socketUrl.protocol = socketUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     socketUrl.pathname = `/tools/${sessionId}`;
     socketUrl.search = '';
-    return json({ status: 'ready', sessionId, sdp: answerSdp, toolSocketUrl: socketUrl.toString(), toolSocketToken: socketToken, warningAfterSeconds: 1_500, expiresAfterSeconds: 1_800 });
+    return json({ status: 'ready', sessionId, threadId: result.threadId, resumed: result.resumed === true, sdp: answerSdp, toolSocketUrl: socketUrl.toString(), toolSocketToken: socketToken, warningAfterSeconds: 1_500, expiresAfterSeconds: 1_800 });
   }
 
   throw new Response('Not found.', { status: 404 });

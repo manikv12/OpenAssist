@@ -122,3 +122,18 @@ test('voice errors are shown instead of being mislabeled as pending', async () =
   const app = await read('app/components/workspace-app.tsx');
   assert.match(app, /if \(!authResponse\.ok\) throw new Error\(auth\.error \?\? auth\.message/);
 });
+
+test('owner voice can start a saved conversation or resume an existing one', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  const session = await read('app/api/voice/session/route.ts');
+  const threads = await read('app/api/voice/threads/route.ts');
+  const stop = await read('app/api/voice/session/stop/route.ts');
+  assert.match(app, /New conversation/);
+  assert.match(app, /resumed saved conversation/);
+  assert.match(app, /JSON\.stringify\(\{ sdp: offerSdp, threadId: selectedVoiceThreadId \}\)/);
+  assert.match(session, /JSON\.stringify\(\{ sdp, threadId \}\)/);
+  assert.match(threads, /requireOwner\(\)/);
+  assert.match(threads, /'\/threads'/);
+  assert.match(stop, /assertSameOrigin\(request\)/);
+  assert.match(stop, /'\/session\/stop'/);
+});

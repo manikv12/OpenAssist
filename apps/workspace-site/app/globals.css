@@ -5,6 +5,12 @@
   --foreground: #e6edf3;
   --brand: #D8B45A;
   --brand-strong: #FFF0BF;
+  --surface: #0f1013;
+  --surface-raised: #151619;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --muted: #74828e;
+  --shell-gutter: 1.25rem;
+  --bottom-nav-space: 0px;
 }
 
 @theme inline {
@@ -14,6 +20,10 @@
   --font-mono: var(--font-geist-mono);
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   background:
     radial-gradient(circle at 40% -12%, rgba(216, 180, 90, 0.07), transparent 34%),
@@ -21,6 +31,8 @@ body {
     var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  /* Nothing may push the document sideways. */
+  overflow-x: hidden;
 }
 
 button {
@@ -29,4 +41,48 @@ button {
 
 ::selection {
   background: rgba(216, 180, 90, 0.28);
+}
+
+/* Long unbroken strings (emails, URLs, IDs) must never widen a grid track. */
+.oa-wrap-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Clamp helpers: keep list rows to a predictable height instead of letting a
+   long subject or snippet reflow the whole list. */
+.oa-clamp-1,
+.oa-clamp-2,
+.oa-clamp-3 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.oa-clamp-1 { -webkit-line-clamp: 1; line-clamp: 1; }
+.oa-clamp-2 { -webkit-line-clamp: 2; line-clamp: 2; }
+.oa-clamp-3 { -webkit-line-clamp: 3; line-clamp: 3; }
+
+/* Horizontal chip strips scroll instead of wrapping onto a second line. */
+.oa-scroll-x {
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  overscroll-behavior-x: contain;
+}
+
+.oa-scroll-x::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

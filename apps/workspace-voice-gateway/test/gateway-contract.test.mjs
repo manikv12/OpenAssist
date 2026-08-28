@@ -91,6 +91,22 @@ test('voice has strict owner, time, and instance limits', async () => {
   assert.match(config, /"max_instances": 1/);
 });
 
+test('Linux Codex conversations are saved, encrypted, listed, and resumable', async () => {
+  const worker = await read('src/index.ts');
+  const server = await read('container/server.mjs');
+  assert.match(server, /ephemeral: false/);
+  assert.match(server, /this\.request\('thread\/resume'/);
+  assert.match(server, /this\.request\('thread\/list'/);
+  assert.match(server, /sourceKinds: \['appServer'\]/);
+  assert.match(server, /normalized\.startsWith\('sessions\/'\)/);
+  assert.match(server, /normalized\.startsWith\('archived_sessions\/'\)/);
+  assert.doesNotMatch(server, /memories\//);
+  assert.match(worker, /codex-thread-state\/\$\{userHash\}\.enc/);
+  assert.match(worker, /encryptAuth\(snapshot, env\.VOICE_AUTH_ENCRYPTION_KEY\)/);
+  assert.match(worker, /override async onActivityExpired/);
+  assert.match(worker, /await this\.checkpointThreadState\(\)/);
+});
+
 test('voice socket authorization stays out of URLs and logs', async () => {
   const worker = await read('src/index.ts');
   const site = await read('../../apps/workspace-site/app/components/workspace-app.tsx');

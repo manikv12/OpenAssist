@@ -36,6 +36,14 @@ VOICE_AUTH_CANARY_PASSED=1 npm run verify:release
 
 All three secrets should be independent random values of at least 32 bytes.
 
+## Saved conversations
+
+- Every new Linux voice conversation creates a normal saved Codex thread.
+- The owner can choose **New conversation** or resume an existing conversation from the Workspace Site.
+- Before the Container sleeps or the user stops voice, only Codex `sessions` and `archived_sessions` rollout files are compressed, encrypted with AES-GCM, and saved in the private R2 bucket.
+- ChatGPT auth and conversation history use separate encrypted R2 objects.
+- Mac Codex chats, workspace files, automatic memory, raw audio, and temporary transcripts are not copied into this Container history.
+
 ## Release gate
 
 Before deployment is considered ready:
