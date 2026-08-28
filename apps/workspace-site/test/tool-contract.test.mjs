@@ -31,10 +31,12 @@ test('WebMCP annotations and visible approval previews are always registered', a
 test('demo and owner Live mode remain separate', async () => {
   const component = await text('app/components/workspace-app.tsx');
   assert.match(component, /modeRef\.current === 'demo'/);
-  assert.match(component, /Switch to owner Live mode first/);
   assert.match(component, /Public synthetic judge data\. No private content/);
   assert.match(component, /\/api\/demo\/tool/);
   assert.match(component, /\/api\/workspace\/tool/);
+  assert.match(component, /\/api\/demo\/voice\/capped\/session/);
+  assert.match(component, /\/api\/demo\/voice\/subscription/);
+  assert.match(component, /currentMode === 'live' \|\| currentAccess === 'subscription'/);
   assert.match(component, /Reset demo/);
   assert.match(component, /ItemEditor/);
   assert.match(component, /workspace_create_task/);

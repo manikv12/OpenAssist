@@ -6,9 +6,9 @@ OpenAssist is a voice-first personal AI assistant for macOS and iPhone. It keeps
 
 The new [`apps/workspace-site`](apps/workspace-site) is a professional browser workspace for Gmail, Tasks, Calendar, notes, memory, accounts, and activity. Its public demo gives each visitor a separate 24-hour synthetic Cloudflare workspace that judges can safely edit through the UI or WebMCP. Owner-only Live mode remains connected to the existing OpenAssist Workspace MCP and Composio; private Google data is never copied into Demo mode.
 
-It exposes 23 structured WebMCP tools that ChatGPT's in-app browser and the same-page subscription voice agent can use. Every write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database.
+It exposes 23 structured WebMCP tools that ChatGPT's in-app browser and the same-page voice agent can use. Every write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database.
 
-The owner-only voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). It uses one short-lived Cloudflare Container, forces ChatGPT subscription sign-in, has no API-key billing fallback, and is blocked from release until its authenticated microphone and spoken-audio canary passes.
+The voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). In Demo mode, a judge can use a short server-funded synthetic voice session or sign in with their own ChatGPT subscription inside a separate Cloudflare Container. Live mode remains owner-only. The server API key never enters the browser or a Container.
 
 See [the architecture and security boundaries](docs/workspace-architecture.md) and [the focused challenge demo plan](docs/webmcp-challenge-demo.md).
 

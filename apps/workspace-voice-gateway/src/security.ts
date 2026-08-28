@@ -48,6 +48,7 @@ async function hmac(value: string, secret: string): Promise<Uint8Array> {
 export type GatewayToken = {
   version: 1;
   purpose: 'voice_gateway' | 'voice_tool_socket';
+  access: 'owner' | 'demo';
   userHash: string;
   origin: string;
   issuedAt: number;
@@ -80,6 +81,7 @@ export async function verifyGatewayToken(
   if (
     payload.version !== 1
     || payload.purpose !== expectedPurpose
+    || (payload.access !== 'owner' && payload.access !== 'demo')
     || payload.origin !== expectedOrigin
     || !payload.userHash
     || !payload.nonce

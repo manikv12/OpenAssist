@@ -7,14 +7,15 @@ flowchart LR
   U[User or ChatGPT in-app browser] --> S[ChatGPT Site]
   U --> V[Voice in the same browser tab]
   S --> R[Shared 23-tool registry]
-  V --> G[Owner-only voice gateway]
-  G --> C[One short-lived Codex Container]
+  V --> G[Voice gateway]
+  G --> C[Per-user short-lived Codex Container]
+  G --> A[OpenAI Realtime synthetic fallback]
   C --> R
   R --> P[Locked write preview]
   R --> M[Existing Workspace MCP]
   M --> O[Composio-managed Google connections]
   S --> D[(D1 live pointers plus isolated demo workspaces)]
-  G --> E[(R2 encrypted ChatGPT auth only)]
+  G --> E[(R2 encrypted per-user auth and saved threads)]
 ```
 
 ## Two separate modes
@@ -56,18 +57,19 @@ Demo records contain only clearly labelled synthetic accounts, mail, tasks, even
 
 D1 and server logs do not contain any real Google messages, Gmail IDs, attachments, task text, calendar text, notes, memory text, audio, or voice transcripts.
 
-R2 contains only the AES-GCM encrypted ChatGPT subscription authentication file for the owner. The key stays in the Worker. Disconnect deletes the object, runs Codex logout, and stops the Container.
+R2 contains only AES-GCM encrypted ChatGPT subscription authentication and saved Codex thread files, separated by an opaque visitor hash. The key stays in the Worker. Disconnect deletes that visitor's objects, runs Codex logout, and stops only that visitor's Container.
 
 ## Voice compatibility gate
 
-- One `basic` Cloudflare Container is allowed.
+- Each subscription user receives a separate `basic` Cloudflare Container; at most 10 can be active.
 - It stops after 15 idle minutes.
 - The user is warned after 25 minutes and the voice session stops after 30 minutes.
-- ChatGPT device sign-in is forced. API-key variables are removed and no paid fallback exists.
+- ChatGPT device sign-in is forced inside Containers. API-key variables are removed from Containers.
+- The synthetic fallback key exists only in the Worker. Its sessions stop after five minutes or 12 tool calls and can execute only the visible synthetic tool registry.
 - The Container has an empty workspace, read-only sandbox, no remote Mac, no computer control, no plugin tools, and one visible Site bridge.
 - Codex `0.150.1` is pinned.
 - The release check rejects `session.model` and any realtime request that sends `model`.
-- Public release remains blocked until a real owner microphone → transcript → site tool → visible update → spoken response canary passes with API-key variables removed.
+- Subscription voice remains gated by a real microphone → transcript → site tool → visible update → spoken response canary with API-key variables removed from the Container.
 
 ## External systems that stay unchanged
 

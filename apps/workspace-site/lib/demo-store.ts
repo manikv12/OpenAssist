@@ -24,6 +24,8 @@ const MAX_EVENTS = 50;
 const MAX_NOTES = 25;
 const MAX_MEMORY_FACTS = 30;
 const MAX_ACTIVITY_ITEMS = 100;
+const FUNDED_VOICE_ACTOR = 'OpenAI demo voice';
+const FUNDED_VOICE_ACTION = 'Started a capped five-minute voice session';
 
 type Arguments = Record<string, unknown>;
 
@@ -398,6 +400,10 @@ async function addActivity(workspaceId: string, actor: string, action: string, t
 
 export async function recordDemoRead(workspaceId: string, title: string): Promise<void> {
   await addActivity(workspaceId, 'ChatGPT', `Read: ${title}`, 'read');
+}
+
+export async function recordDemoVoiceSession(workspaceId: string): Promise<void> {
+  await addActivity(workspaceId, FUNDED_VOICE_ACTOR, FUNDED_VOICE_ACTION, 'write');
 }
 
 export type DemoWriteResult = {

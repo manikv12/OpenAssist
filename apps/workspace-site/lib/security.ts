@@ -91,6 +91,7 @@ export async function constantTimeTextEqual(left: string, right: string): Promis
 export type VoiceGatewayTokenPayload = {
   version: 1;
   purpose: 'voice_gateway';
+  access: 'owner' | 'demo';
   userHash: string;
   origin: string;
   issuedAt: number;

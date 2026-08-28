@@ -23,6 +23,8 @@ import {
 
 type SiteUser = { id: string; email: string; name: string } | null;
 type Mode = 'demo' | 'live';
+type DemoVoiceAccess = 'capped' | 'subscription';
+type ActiveVoiceKind = 'live_subscription' | 'demo_subscription' | 'demo_capped';
 type PendingAction = {
   id: string;
   tool: WorkspaceToolName;
@@ -201,6 +203,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [voiceThreads, setVoiceThreads] = useState<VoiceThread[]>([]);
   const [selectedVoiceThreadId, setSelectedVoiceThreadId] = useState<string | null>(null);
   const [voiceThreadsLoading, setVoiceThreadsLoading] = useState(false);
+  const [demoVoiceAccess, setDemoVoiceAccess] = useState<DemoVoiceAccess>('capped');
   const [demoLoading, setDemoLoading] = useState(true);
   const [demoExpiresAt, setDemoExpiresAt] = useState<number | null>(null);
   const [editor, setEditor] = useState<EditorKind>(null);
@@ -214,13 +217,20 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [activity, setActivity] = useState(DEMO_ACTIVITY);
   const [live, setLive] = useState<LiveState>({ loading: false, data: {}, accounts: null, error: null });
   const modeRef = useRef(mode);
+  const demoVoiceAccessRef = useRef(demoVoiceAccess);
   const pendingRef = useRef(pending);
   const voicePeerRef = useRef<RTCPeerConnection | null>(null);
   const voiceStreamRef = useRef<MediaStream | null>(null);
   const voiceSocketRef = useRef<WebSocket | null>(null);
+  const voiceDataChannelRef = useRef<RTCDataChannel | null>(null);
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const voiceCallIdRef = useRef<string | null>(null);
+  const activeVoiceKindRef = useRef<ActiveVoiceKind | null>(null);
+  const voiceTimeoutRef = useRef<number | null>(null);
+  const cappedToolCountRef = useRef(0);
 
   useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { demoVoiceAccessRef.current = demoVoiceAccess; }, [demoVoiceAccess]);
   useEffect(() => { pendingRef.current = pending; }, [pending]);
 
   const hydrateDemoWorkspace = useCallback((workspace: DemoWorkspaceState, expiresAt?: number) => {
@@ -454,10 +464,21 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   }, [focusView, hydrateDemoWorkspace]);
 
   const refreshVoiceThreads = useCallback(async (force = false) => {
-    if (!user || (!force && modeRef.current !== 'live')) return;
+    const currentMode = modeRef.current;
+    const currentAccess = demoVoiceAccessRef.current;
+    if (!force && currentMode !== 'live' && currentAccess !== 'subscription') return;
+    if (currentMode === 'live' && !user) return;
+    if (currentMode === 'demo' && currentAccess !== 'subscription') {
+      setVoiceThreads([]);
+      setSelectedVoiceThreadId(null);
+      return;
+    }
     setVoiceThreadsLoading(true);
     try {
-      const response = await fetch('/api/voice/threads', { cache: 'no-store' });
+      const endpoint = currentMode === 'demo'
+        ? '/api/demo/voice/subscription/threads'
+        : '/api/voice/threads';
+      const response = await fetch(endpoint, { cache: 'no-store' });
       const body = (await response.json()) as { status?: string; message?: string; error?: string; threads?: VoiceThread[] };
       if (response.ok && Array.isArray(body.threads)) {
         setVoiceThreads(body.threads);
@@ -473,24 +494,48 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   }, [user]);
 
   const stopVoice = useCallback((message = 'Voice stopped', persist = true) => {
+    const kind = activeVoiceKindRef.current;
+    const callId = voiceCallIdRef.current;
     const socket = voiceSocketRef.current;
-    const hadSession = Boolean(socket || voicePeerRef.current || voiceStreamRef.current);
+    const channel = voiceDataChannelRef.current;
+    const peer = voicePeerRef.current;
+    const stream = voiceStreamRef.current;
+    const hadSession = Boolean(kind || socket || channel || peer || stream);
+    activeVoiceKindRef.current = null;
+    voiceCallIdRef.current = null;
+    cappedToolCountRef.current = 0;
+    if (voiceTimeoutRef.current != null) window.clearTimeout(voiceTimeoutRef.current);
+    voiceTimeoutRef.current = null;
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'control', action: 'stop' }));
     socket?.close();
     voiceSocketRef.current = null;
-    voicePeerRef.current?.close();
+    channel?.close();
+    voiceDataChannelRef.current = null;
     voicePeerRef.current = null;
-    voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    peer?.close();
     voiceStreamRef.current = null;
+    stream?.getTracks().forEach((track) => track.stop());
     if (voiceAudioRef.current) voiceAudioRef.current.srcObject = null;
     voiceAudioRef.current = null;
     setVoiceConnected(false);
     setVoiceMuted(false);
     setVoiceStatus(message);
-    if (persist && hadSession) {
-      void fetch('/api/voice/session/stop', { method: 'POST', keepalive: true })
-        .then((response) => response.ok ? refreshVoiceThreads() : undefined)
-        .catch(() => undefined);
+    if (persist && hadSession && kind) {
+      if (kind === 'demo_capped' && callId) {
+        void fetch('/api/demo/voice/capped/stop', {
+          method: 'POST',
+          keepalive: true,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ callId }),
+        }).catch(() => undefined);
+      } else {
+        const endpoint = kind === 'demo_subscription'
+          ? '/api/demo/voice/subscription/session/stop'
+          : '/api/voice/session/stop';
+        void fetch(endpoint, { method: 'POST', keepalive: true })
+          .then((response) => response.ok ? refreshVoiceThreads() : undefined)
+          .catch(() => undefined);
+      }
     }
   }, [refreshVoiceThreads]);
 
@@ -499,29 +544,37 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       stopVoice();
       return;
     }
-    if (modeRef.current !== 'live' || !user) {
-      setVoiceStatus('Switch to owner Live mode first.');
+    const currentMode = modeRef.current;
+    const currentAccess = demoVoiceAccessRef.current;
+    if (currentMode === 'live' && !user) {
+      setVoiceStatus('Sign in before starting Live voice.');
       return;
     }
-    setVoiceStatus('Checking your private Workspace connection…');
     try {
+      setVoiceStatus(currentMode === 'live' ? 'Checking your private Workspace connection…' : 'Checking the synthetic demo workspace…');
       await invokeTool('workspace_list_accounts', {});
-      setVoiceStatus('Checking your ChatGPT subscription sign-in…');
-      let authResponse = await fetch('/api/voice/auth/status', { cache: 'no-store' });
-      let auth = (await authResponse.json()) as { status?: string; message?: string; error?: string; verificationUrl?: string; userCode?: string };
-      if (!authResponse.ok && auth.status !== 'pending') {
-        authResponse = await fetch('/api/voice/auth/start', { method: 'POST' });
-        auth = (await authResponse.json()) as typeof auth;
-      } else if (auth.status !== 'ready' && auth.status !== 'pending') {
-        authResponse = await fetch('/api/voice/auth/start', { method: 'POST' });
-        auth = (await authResponse.json()) as typeof auth;
+
+      const subscription = currentMode === 'live' || currentAccess === 'subscription';
+      const subscriptionBase = currentMode === 'demo' ? '/api/demo/voice/subscription' : '/api/voice';
+      if (subscription) {
+        setVoiceStatus('Checking your ChatGPT subscription sign-in…');
+        let authResponse = await fetch(`${subscriptionBase}/auth/status`, { cache: 'no-store' });
+        let auth = (await authResponse.json()) as { status?: string; message?: string; error?: string; verificationUrl?: string; userCode?: string };
+        if (!authResponse.ok && auth.status !== 'pending') {
+          authResponse = await fetch(`${subscriptionBase}/auth/start`, { method: 'POST' });
+          auth = (await authResponse.json()) as typeof auth;
+        } else if (auth.status !== 'ready' && auth.status !== 'pending') {
+          authResponse = await fetch(`${subscriptionBase}/auth/start`, { method: 'POST' });
+          auth = (await authResponse.json()) as typeof auth;
+        }
+        if (!authResponse.ok) throw new Error(auth.error ?? auth.message ?? 'The voice gateway could not start ChatGPT sign-in.');
+        if (auth.status !== 'ready') {
+          if (auth.verificationUrl && auth.userCode) setVoicePrompt({ verificationUrl: auth.verificationUrl, userCode: auth.userCode });
+          setVoiceStatus(auth.message ?? (auth.userCode ? 'Finish ChatGPT sign-in, then press voice again.' : 'Voice sign-in is pending.'));
+          return;
+        }
       }
-      if (!authResponse.ok) throw new Error(auth.error ?? auth.message ?? 'The voice gateway could not start ChatGPT sign-in.');
-      if (auth.status !== 'ready') {
-        if (auth.verificationUrl && auth.userCode) setVoicePrompt({ verificationUrl: auth.verificationUrl, userCode: auth.userCode });
-        setVoiceStatus(auth.message ?? (auth.userCode ? 'Finish ChatGPT sign-in, then press voice again.' : 'Voice sign-in is pending.'));
-        return;
-      }
+
       setVoicePrompt(null);
       stopVoice('Starting microphone…', false);
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
@@ -534,23 +587,91 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         void audio.play().catch(() => undefined);
       };
       peer.onconnectionstatechange = () => {
-        if (peer.connectionState === 'failed' || peer.connectionState === 'closed') stopVoice('Voice connection ended.');
+        if ((peer.connectionState === 'failed' || peer.connectionState === 'closed') && voicePeerRef.current === peer) stopVoice('Voice connection ended.');
       };
       voicePeerRef.current = peer;
       voiceStreamRef.current = stream;
       voiceAudioRef.current = audio;
+
+      let dataChannel: RTCDataChannel | null = null;
+      if (!subscription) {
+        activeVoiceKindRef.current = 'demo_capped';
+        dataChannel = peer.createDataChannel('oai-events');
+        voiceDataChannelRef.current = dataChannel;
+        dataChannel.addEventListener('message', (event) => {
+          let message: { type?: string; name?: string; call_id?: string; arguments?: string; error?: { message?: string } };
+          try { message = JSON.parse(String(event.data)) as typeof message; } catch { return; }
+          if (message.type === 'error') {
+            setVoiceStatus(message.error?.message ?? 'The demo voice service returned an error.');
+            return;
+          }
+          if (message.type !== 'response.function_call_arguments.done' || !message.call_id || !message.name) return;
+          cappedToolCountRef.current += 1;
+          const sendResult = (output: unknown) => {
+            if (dataChannel?.readyState !== 'open') return;
+            dataChannel.send(JSON.stringify({
+              type: 'conversation.item.create',
+              item: { type: 'function_call_output', call_id: message.call_id, output: JSON.stringify(output ?? null) },
+            }));
+            dataChannel.send(JSON.stringify({ type: 'response.create' }));
+          };
+          if (cappedToolCountRef.current > 12) {
+            sendResult({ error: 'This five-minute demo reached its 12-tool safety limit.' });
+            setVoiceStatus('This demo reached its 12-tool limit. Start a new session later or use your subscription.');
+            return;
+          }
+          if (!isWorkspaceToolName(message.name)) {
+            sendResult({ error: 'Only the visible synthetic Workspace tools are allowed.' });
+            return;
+          }
+          let args: Record<string, unknown> = {};
+          try {
+            const parsed: unknown = JSON.parse(message.arguments || '{}');
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
+          } catch {
+            sendResult({ error: 'The voice tool arguments were invalid.' });
+            return;
+          }
+          void invokeTool(message.name, args)
+            .then((result) => sendResult({ success: true, result }))
+            .catch((error: unknown) => sendResult({ success: false, error: error instanceof Error ? error.message : 'Workspace tool failed.' }));
+        });
+        dataChannel.addEventListener('open', () => {
+          setVoiceConnected(true);
+          setVoiceStatus('Listening · capped five-minute synthetic demo');
+        });
+      } else {
+        activeVoiceKindRef.current = currentMode === 'demo' ? 'demo_subscription' : 'live_subscription';
+      }
+
       await peer.setLocalDescription(await peer.createOffer({ offerToReceiveAudio: true }));
       await waitForIceGathering(peer);
       const offerSdp = peer.localDescription?.sdp ?? '';
-      const response = await fetch('/api/voice/session', {
+      const sessionEndpoint = subscription
+        ? `${subscriptionBase}/session`
+        : '/api/demo/voice/capped/session';
+      const response = await fetch(sessionEndpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sdp: offerSdp, threadId: selectedVoiceThreadId }),
+        body: JSON.stringify(subscription ? { sdp: offerSdp, threadId: selectedVoiceThreadId } : { sdp: offerSdp }),
       });
-      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean };
-      if (!response.ok || body.status !== 'ready' || !body.sdp || !body.toolSocketUrl || !body.toolSocketToken) throw new Error(body.message ?? body.error ?? 'Subscription voice is not compatible yet.');
+      const body = (await response.json()) as { status?: string; message?: string; error?: string; sdp?: string; toolSocketUrl?: string; toolSocketToken?: string; threadId?: string; resumed?: boolean; callId?: string; expiresAfterSeconds?: number; warningAfterSeconds?: number };
+      if (!response.ok || body.status !== 'ready' || !body.sdp) throw new Error(body.message ?? body.error ?? 'Voice is not compatible yet.');
       if (body.threadId) setSelectedVoiceThreadId(body.threadId);
+      if (body.callId) voiceCallIdRef.current = body.callId;
       await peer.setRemoteDescription({ type: 'answer', sdp: body.sdp });
+
+      if (!subscription) {
+        const warningSeconds = Math.max(1, body.warningAfterSeconds ?? 240);
+        const expirySeconds = Math.max(warningSeconds + 1, body.expiresAfterSeconds ?? 300);
+        voiceTimeoutRef.current = window.setTimeout(() => {
+          setVoiceStatus('One minute remains in this capped demo voice session.');
+          voiceTimeoutRef.current = window.setTimeout(() => stopVoice('Five-minute demo voice session ended.'), (expirySeconds - warningSeconds) * 1_000);
+        }, warningSeconds * 1_000);
+        return;
+      }
+
+      if (!body.toolSocketUrl || !body.toolSocketToken) throw new Error('Subscription voice did not return its secure tool connection.');
       const socket = new WebSocket(body.toolSocketUrl, ['openassist-tools', `openassist-token.${body.toolSocketToken}`]);
       voiceSocketRef.current = socket;
       socket.addEventListener('message', (event) => {
@@ -590,8 +711,21 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     const next = !voiceMuted;
     voiceStreamRef.current?.getAudioTracks().forEach((track) => { track.enabled = !next; });
     setVoiceMuted(next);
-    setVoiceStatus(next ? 'Microphone muted' : 'Listening through your ChatGPT subscription');
+    setVoiceStatus(next ? 'Microphone muted' : activeVoiceKindRef.current === 'demo_capped' ? 'Listening · capped synthetic demo' : 'Listening through your ChatGPT subscription');
   }, [voiceMuted]);
+
+  const selectDemoVoiceAccess = useCallback((access: DemoVoiceAccess) => {
+    if (voiceConnected) stopVoice('Voice stopped before changing access.');
+    demoVoiceAccessRef.current = access;
+    setDemoVoiceAccess(access);
+    setVoicePrompt(null);
+    setVoiceThreads([]);
+    setSelectedVoiceThreadId(null);
+    setVoiceStatus(access === 'capped'
+      ? 'Ready for a capped five-minute synthetic demo'
+      : 'Ready to connect your own ChatGPT subscription');
+    if (access === 'subscription') void refreshVoiceThreads(true);
+  }, [refreshVoiceThreads, stopVoice, voiceConnected]);
 
   useEffect(() => () => stopVoice('Voice stopped'), [stopVoice]);
 
@@ -601,6 +735,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   }, [messages, search]);
 
   const resetDemo = useCallback(async () => {
+    if (voiceConnected) stopVoice('Voice stopped because the demo was reset.');
     setDemoLoading(true);
     const response = await fetch('/api/demo/workspace', {
       method: 'POST',
@@ -617,7 +752,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     hydrateDemoWorkspace(body.workspace, body.expiresAt);
     setToast('Demo workspace reset to safe sample data.');
     focusView('today');
-  }, [focusView, hydrateDemoWorkspace]);
+  }, [focusView, hydrateDemoWorkspace, stopVoice, voiceConnected]);
 
   const submitEditor = useCallback((kind: Exclude<EditorKind, null>, args: Record<string, unknown>) => {
     setEditor(null);
@@ -632,10 +767,16 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       router.push('/signin-with-chatgpt?return_to=%2F');
       return;
     }
+    if (nextMode !== modeRef.current && voiceConnected) stopVoice('Voice stopped because the workspace mode changed.');
     setMode(nextMode);
+    setVoicePrompt(null);
     if (nextMode === 'live') void refreshVoiceThreads(true);
+    if (nextMode === 'demo' && demoVoiceAccessRef.current !== 'subscription') {
+      setVoiceThreads([]);
+      setSelectedVoiceThreadId(null);
+    }
     setToast(nextMode === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.');
-  }, [refreshVoiceThreads, router, user]);
+  }, [refreshVoiceThreads, router, stopVoice, user, voiceConnected]);
 
   const completeOwnerSetup = useCallback(async () => {
     const code = ownerSetupCode.trim();
@@ -689,7 +830,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                   <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">{copy.title}</h1>
                   <p className="mt-1 max-w-prose text-sm leading-5 text-[#74828e] max-sm:oa-clamp-2">{copy.subtitle}</p>
                 </div>
-                <button onClick={connectVoice} aria-label={voiceConnected ? 'Stop owner voice' : 'Start owner voice'} className={`grid h-10 w-10 shrink-0 place-items-center rounded-full text-sm font-bold shadow-[0_0_0_5px_rgba(216,180,90,0.08)] transition ${voiceConnected ? 'bg-[#ff806d] text-[#230704]' : 'bg-[#D8B45A] text-[#120f08]'}`}>{voiceConnected ? '■' : '●'}</button>
+                <button onClick={connectVoice} aria-label={voiceConnected ? 'Stop voice' : 'Start voice'} className={`grid h-10 w-10 shrink-0 place-items-center rounded-full text-sm font-bold shadow-[0_0_0_5px_rgba(216,180,90,0.08)] transition ${voiceConnected ? 'bg-[#ff806d] text-[#230704]' : 'bg-[#D8B45A] text-[#120f08]'}`}>{voiceConnected ? '■' : '●'}</button>
               </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-2.5">
@@ -703,8 +844,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-white/10 px-3 py-2 text-xs text-[#9aa6b0] transition hover:border-[#D8B45A]/35 hover:text-white">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 rounded-xl border border-[#D8B45A]/15 bg-[#D8B45A]/[0.035] px-4 py-2.5 text-xs text-[#7f8c96]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div>}
-            {mode === 'live' && user && <div className="mt-4 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
+            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#D8B45A]/15 bg-[#D8B45A]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7f8c96]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} onChange={selectDemoVoiceAccess} /></div></div>}
+            {(mode === 'live' || (mode === 'demo' && demoVoiceAccess === 'subscription')) && <div className="mt-4 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
@@ -723,7 +864,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             </div>
           </div>
         </section>
-        <ActivityRail activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
+        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
       </div>
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
@@ -823,7 +964,29 @@ function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, 
   );
 }
 
-function ActivityRail({ activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
+function DemoVoiceChoice({ value, connected, onChange }: { value: DemoVoiceAccess; connected: boolean; onChange: (access: DemoVoiceAccess) => void }) {
+  const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
+    { id: 'capped', title: 'Quick judge demo', detail: 'Server-funded · 5 min · 12 tools' },
+    { id: 'subscription', title: 'My ChatGPT', detail: 'Private isolated sign-in · saved chats' },
+  ];
+  return (
+    <div role="radiogroup" aria-label="Demo voice access" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+      {choices.map((choice) => (
+        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${value === choice.id ? 'border-[#D8B45A]/45 bg-[#D8B45A]/[0.09] shadow-[0_0_18px_rgba(216,180,90,0.06)]' : 'border-white/[0.08] bg-white/[0.025] hover:border-[#D8B45A]/25'}`}>
+          <span className={`block text-xs font-semibold ${value === choice.id ? 'text-[#F2D783]' : 'text-[#cbd4db]'}`}>{choice.title}</span>
+          <span className="mt-0.5 block text-[10px] leading-4 text-[#667480]">{choice.detail}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ActivityRail({ mode, demoVoiceAccess, activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
+  const voiceLabel = mode === 'live'
+    ? 'Owner voice'
+    : demoVoiceAccess === 'capped'
+      ? 'Quick demo voice'
+      : 'ChatGPT subscription voice';
   return (
     <aside className="min-w-0 border-l border-white/[0.08] bg-[#0b0c0e] px-5 py-7 max-xl:hidden">
       <div className="flex items-start justify-between gap-3">
@@ -843,15 +1006,17 @@ function ActivityRail({ activity, toast, voiceStatus, voicePrompt, voiceConnecte
       </div>
       <div className="mt-8 border-t border-white/[0.08] pt-6">
         <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5f6c78]">Voice</p>
+        {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} onChange={onDemoVoiceAccess} /></div>}
         <button onClick={onVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl px-2 py-3 text-left transition hover:bg-white/[0.04]">
           <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-full border text-sm transition group-hover:shadow-[0_0_24px_rgba(216,180,90,0.16)] ${voiceConnected ? 'border-[#ff806d]/40 bg-[#ff806d]/10 text-[#ff9a89]' : 'border-[#D8B45A]/30 bg-[#D8B45A]/[0.07] text-[#D8B45A]'}`}>{voiceConnected ? '■' : '●'}</span>
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-medium">{voiceConnected ? 'Stop owner voice' : 'Owner voice'}</span>
+            <span className="block truncate text-sm font-medium">{voiceConnected ? `Stop ${voiceLabel.toLowerCase()}` : voiceLabel}</span>
             <span className="mt-0.5 block oa-clamp-2 text-xs leading-4 text-[#667480]">{voiceStatus}</span>
           </span>
         </button>
         {voiceConnected && <button onClick={onMute} className="mt-2 w-full rounded-xl border border-white/[0.08] px-3 py-2 text-xs text-[#94a1ac] transition hover:border-[#D8B45A]/40 hover:text-white">{voiceMuted ? 'Unmute microphone' : 'Mute microphone'}</button>}
-        <div className="mt-3"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={onSelectVoiceThread} onRefresh={onRefreshVoiceThreads} /></div>
+        {(mode === 'live' || demoVoiceAccess === 'subscription') && <div className="mt-3"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={onSelectVoiceThread} onRefresh={onRefreshVoiceThreads} /></div>}
+        {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2.5 text-[11px] leading-4 text-[#667480]">Uses only synthetic data. The server key is never sent to this browser.</p>}
         {voicePrompt && (
           <div className="mt-3 rounded-2xl border border-[#D8B45A]/20 bg-[#D8B45A]/[0.06] p-4">
             <p className="text-xs leading-5 text-[#9dabb5]">Open the secure ChatGPT sign-in page, then enter this one-time code.</p>

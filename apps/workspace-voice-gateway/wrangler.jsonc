@@ -26,7 +26,7 @@
       "class_name": "VoiceContainer",
       "image": "./Dockerfile",
       "instance_type": "basic",
-      "max_instances": 1
+      "max_instances": 10
     }
   ],
   "r2_buckets": [
@@ -37,6 +37,7 @@
   ],
   "vars": {
     "CODEX_RUNTIME_VERSION": "0.150.1",
+    "DEMO_REALTIME_MODEL": "gpt-realtime-2.1-mini",
     "SITE_ORIGIN": "https://openassist-daily-workspace.developingadventures.chatgpt.site"
   }
 }

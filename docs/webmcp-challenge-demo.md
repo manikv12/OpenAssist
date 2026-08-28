@@ -11,7 +11,9 @@ The public URL opens in **Demo** mode with clearly labelled synthetic data. Each
 5. Ask ChatGPT to create a demo task or note. The exact proposed change appears in a locked preview.
 6. Approve it on screen. The change is saved once, read back, highlighted, and recorded in Activity.
 7. Show that delete, trash, and forget still require a screen tap.
-8. Optionally switch to owner-only Live mode to demonstrate the same tools against Composio-managed Google data.
+8. Select **Quick judge demo**, speak a request, and show the same WebMCP tool updating the visible synthetic workspace.
+9. Optionally select **My ChatGPT** to show isolated subscription sign-in and saved conversation resume.
+10. Optionally switch to owner-only Live mode to demonstrate the same tools against Composio-managed Google data.
 
 ## Recording rules
 
@@ -29,5 +31,6 @@ The public URL opens in **Demo** mode with clearly labelled synthetic data. Each
 - Architecture and security explanation.
 - Confirm WebMCP discovery in ChatGPT's in-app browser.
 - Confirm owner Live mode cannot be opened by another Site user.
-- Confirm the authenticated subscription voice canary passes before showing voice as available.
+- Confirm Quick judge demo completes microphone → tool → visible result → spoken response without exposing a key.
+- Confirm the authenticated subscription voice canary passes before showing subscription voice as available.
 - Submit by September 2, keeping September 3 as buffer.

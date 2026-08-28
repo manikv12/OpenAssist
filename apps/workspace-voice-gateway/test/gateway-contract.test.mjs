@@ -33,9 +33,10 @@ test('voice has the same Workspace tool contract as the Site', async () => {
   assert.equal(voice.length, 23);
 });
 
-test('voice removes API-key variables and forces ChatGPT sign-in', async () => {
+test('subscription containers remove API-key variables and force ChatGPT sign-in', async () => {
   const server = await read('container/server.mjs');
   const config = await read('container/config.toml');
+  const worker = await read('src/index.ts');
   assert.match(config, /forced_login_method = "chatgpt"/);
   assert.match(server, /OPENAI_API_KEY\|CODEX_API_KEY\|AZURE_OPENAI_API_KEY/);
   assert.match(server, /API-key authentication is not allowed/);
@@ -43,6 +44,8 @@ test('voice removes API-key variables and forces ChatGPT sign-in', async () => {
   assert.match(config, /cli_auth_credentials_store = "file"/);
   assert.match(config, /realtime_conversation = true/);
   assert.match(server, /'--strict-config', '--enable', 'realtime_conversation', 'app-server'/);
+  const containerEnv = worker.match(/envVars: Record<string, string> = \{([\s\S]*?)\n  \};/)?.[1] ?? '';
+  assert.doesNotMatch(containerEnv, /OPENAI_API_KEY|CODEX_API_KEY|AZURE_OPENAI_API_KEY/);
 });
 
 test('voice is isolated and directly exposes only visible Site tools', async () => {
@@ -61,7 +64,6 @@ test('voice is isolated and directly exposes only visible Site tools', async () 
   assert.match(config, /unified_exec = false/);
   assert.match(config, /persistence = "none"/);
   assert.match(worker, /enableInternet = true/);
-  assert.doesNotMatch(worker, /OPENAI_API_KEY\s*:/);
 });
 
 test('refreshed ChatGPT subscription auth is re-encrypted by the Worker', async () => {
@@ -80,15 +82,34 @@ test('pending device sign-in keeps its code available across status checks', asy
   assert.match(worker, /userCode: result\.userCode/);
 });
 
-test('voice has strict owner, time, and instance limits', async () => {
+test('voice has strict per-user, time, and instance limits', async () => {
   const worker = await read('src/index.ts');
   const server = await read('container/server.mjs');
   const config = await read('wrangler.jsonc');
-  assert.match(worker, /openassist-owner-voice/);
+  assert.match(worker, /idFromName\(`openassist-voice-\$\{userHash\}`\)/);
   assert.match(worker, /sleepAfter = '15m'/);
   assert.match(server, /25 \* 60_000/);
   assert.match(server, /30 \* 60_000/);
-  assert.match(config, /"max_instances": 1/);
+  assert.match(worker, /warningAfterSeconds: 240/);
+  assert.match(worker, /expiresAfterSeconds: 300/);
+  assert.match(worker, /maxToolCalls: 12/);
+  assert.match(config, /"max_instances": 10/);
+});
+
+test('the funded demo fallback is server-side, synthetic-only, and uses the exact visible tools', async () => {
+  const worker = await read('src/index.ts');
+  const config = await read('wrangler.jsonc');
+  assert.match(worker, /OPENAI_API_KEY\?: string/);
+  assert.match(worker, /payload\.access !== 'demo'/);
+  assert.match(worker, /env\.DEMO_REALTIME_MODEL \|\| 'gpt-realtime-2\.1-mini'/);
+  assert.match(worker, /toolManifest\.map/);
+  assert.match(worker, /parallel_tool_calls: false/);
+  assert.match(worker, /max_output_tokens: 512/);
+  assert.match(worker, /OpenAI-Safety-Identifier/);
+  assert.match(worker, /https:\/\/api\.openai\.com\/v1\/realtime\/calls/);
+  assert.match(worker, /\/hangup/);
+  assert.match(worker, /synthetic workspace visible in the current browser tab/);
+  assert.match(config, /"DEMO_REALTIME_MODEL": "gpt-realtime-2\.1-mini"/);
 });
 
 test('Linux Codex conversations are saved, encrypted, listed, and resumable', async () => {

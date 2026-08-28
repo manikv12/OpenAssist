@@ -7,6 +7,7 @@ export async function callVoiceGateway(
   userId: string,
   path: string,
   init: RequestInit = {},
+  access: 'owner' | 'demo' = 'owner',
 ): Promise<Response> {
   if (!env.VOICE_GATEWAY_URL) {
     return new Response(JSON.stringify({ status: 'unavailable', message: 'Voice is temporarily unavailable until the subscription realtime canary passes.' }), {
@@ -18,6 +19,7 @@ export async function callVoiceGateway(
   const token = await signVoiceGatewayToken({
     version: 1,
     purpose: 'voice_gateway',
+    access,
     userHash: await opaqueUserHash(userId),
     origin,
     issuedAt: Date.now(),
@@ -32,4 +34,8 @@ export async function callVoiceGateway(
 
 export async function voiceAuthPointer(userId: string): Promise<string> {
   return `chatgpt-auth/${await opaqueUserHash(userId)}.enc`;
+}
+
+export function demoVoiceUserId(workspaceId: string): string {
+  return `demo:${workspaceId}`;
 }

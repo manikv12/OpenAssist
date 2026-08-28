@@ -5,6 +5,8 @@ This ChatGPT Site provides a polished WebMCP dashboard for the existing OpenAssi
 ## Demo and Live data
 
 - **Demo mode** gives every visitor a separate synthetic workspace in Cloudflare D1. Judges can create and update demo tasks, calendar events, notes, and memory without touching Google.
+- Judges can use **Quick judge demo** for a five-minute, 12-tool synthetic voice session, or **My ChatGPT** to sign in with their own subscription and resume isolated saved conversations.
+- Judges never enter an API key. The optional project-funded key stays in the voice gateway Worker.
 - The demo workspace expires after 24 hours. **Reset demo** immediately deletes it and creates a clean copy.
 - **Live mode** is owner-only and continues to use the existing Workspace MCP and Composio-managed Google connections.
 - Demo and Live routes are separate. Private Google content is never copied into the demo database.

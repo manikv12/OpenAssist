@@ -85,6 +85,14 @@ test('demo routes never call the Live Workspace MCP', async () => {
     'app/api/demo/tool/route.ts',
     'app/api/demo/actions/propose/route.ts',
     'app/api/demo/actions/execute/route.ts',
+    'app/api/demo/voice/capped/session/route.ts',
+    'app/api/demo/voice/capped/stop/route.ts',
+    'app/api/demo/voice/subscription/auth/start/route.ts',
+    'app/api/demo/voice/subscription/auth/status/route.ts',
+    'app/api/demo/voice/subscription/auth/disconnect/route.ts',
+    'app/api/demo/voice/subscription/session/route.ts',
+    'app/api/demo/voice/subscription/session/stop/route.ts',
+    'app/api/demo/voice/subscription/threads/route.ts',
   ];
   for (const file of files) {
     const source = await read(file);
@@ -130,10 +138,37 @@ test('owner voice can start a saved conversation or resume an existing one', asy
   const stop = await read('app/api/voice/session/stop/route.ts');
   assert.match(app, /New conversation/);
   assert.match(app, /resumed saved conversation/);
-  assert.match(app, /JSON\.stringify\(\{ sdp: offerSdp, threadId: selectedVoiceThreadId \}\)/);
+  assert.match(app, /subscriptionBase = currentMode === 'demo' \? '\/api\/demo\/voice\/subscription' : '\/api\/voice'/);
+  assert.match(app, /subscription \? \{ sdp: offerSdp, threadId: selectedVoiceThreadId \} : \{ sdp: offerSdp \}/);
   assert.match(session, /JSON\.stringify\(\{ sdp, threadId \}\)/);
   assert.match(threads, /requireOwner\(\)/);
   assert.match(threads, /'\/threads'/);
   assert.match(stop, /assertSameOrigin\(request\)/);
   assert.match(stop, /'\/session\/stop'/);
+});
+
+test('demo judges can use an isolated ChatGPT subscription or the server-funded realtime fallback', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  const gatewayClient = await read('lib/voice-gateway.ts');
+  const cappedSession = await read('app/api/demo/voice/capped/session/route.ts');
+  const subscriptionSession = await read('app/api/demo/voice/subscription/session/route.ts');
+  const subscriptionAuth = await read('app/api/demo/voice/subscription/auth/start/route.ts');
+  const demoStore = await read('lib/demo-store.ts');
+
+  assert.match(app, /Quick judge demo/);
+  assert.match(app, /My ChatGPT/);
+  assert.match(app, /response\.function_call_arguments\.done/);
+  assert.match(app, /cappedToolCountRef\.current > 12/);
+  assert.match(app, /Five-minute demo voice session ended/);
+  assert.match(gatewayClient, /access: 'owner' \| 'demo'/);
+  for (const source of [cappedSession, subscriptionSession, subscriptionAuth]) {
+    assert.match(source, /getOrCreateDemoSession/);
+    assert.match(source, /demoVoiceUserId/);
+    assert.match(source, /'demo'/);
+    assert.doesNotMatch(source, /requireOwner|executeLiveWorkspaceTool|mcp-client/);
+  }
+  assert.match(demoStore, /recordDemoVoiceSession/);
+  assert.doesNotMatch(demoStore, /FUNDED_VOICE_(WORKSPACE|GLOBAL)_LIMIT/);
+  const siteFiles = [app, gatewayClient, cappedSession, subscriptionSession, subscriptionAuth].join('\n');
+  assert.doesNotMatch(siteFiles, /OPENAI_API_KEY/);
 });
