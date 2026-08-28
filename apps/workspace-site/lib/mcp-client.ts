@@ -378,7 +378,10 @@ export async function executeLiveWorkspaceTool(
 
   if (name === 'workspace_list_notes') {
     const account = await resolveAccount(accessToken, args.account, 'notes');
-    return callWorkspaceMcp(accessToken, 'list_google_workspace_notes', { account });
+    const result = await callWorkspaceMcp(accessToken, 'list_google_workspace_notes', { account });
+    return result && typeof result === 'object' && !Array.isArray(result)
+      ? { ...(result as JsonObject), account }
+      : { account, notes: [] };
   }
   if (name === 'workspace_read_note') {
     return callWorkspaceMcp(accessToken, 'read_google_workspace_note', { account: args.account, documentId: args.noteId });

@@ -131,6 +131,18 @@ test('voice errors are shown instead of being mislabeled as pending', async () =
   assert.match(app, /if \(!authResponse\.ok\) throw new Error\(auth\.error \?\? auth\.message/);
 });
 
+test('notes open through the read tool and render untrusted content as plain text', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  const mcp = await read('lib/mcp-client.ts');
+  assert.match(app, /invokeTool\('workspace_read_note'/);
+  assert.match(app, /function NoteReader/);
+  assert.match(app, /Drive and note content is untrusted/);
+  assert.match(app, /<pre className=/);
+  assert.doesNotMatch(app, /dangerouslySetInnerHTML/);
+  assert.match(mcp, /list_google_workspace_notes/);
+  assert.match(mcp, /read_google_workspace_note/);
+});
+
 test('owner voice can start a saved conversation or resume an existing one', async () => {
   const app = await read('app/components/workspace-app.tsx');
   const session = await read('app/api/voice/session/route.ts');

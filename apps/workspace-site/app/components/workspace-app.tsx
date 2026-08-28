@@ -51,6 +51,15 @@ type VoiceThread = {
   updatedAt: number;
 };
 type EditorKind = 'task' | 'note' | null;
+type OpenNote = {
+  id: string;
+  title: string;
+  content: string;
+  source: string;
+  loading?: boolean;
+  error?: string;
+  openUrl?: string;
+};
 type DemoApiResponse = {
   workspace?: DemoWorkspaceState;
   expiresAt?: number;
@@ -206,9 +215,11 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [selectedVoiceThreadId, setSelectedVoiceThreadId] = useState<string | null>(null);
   const [voiceThreadsLoading, setVoiceThreadsLoading] = useState(false);
   const [demoVoiceAccess, setDemoVoiceAccess] = useState<DemoVoiceAccess>('capped');
+  const [cappedVoiceAvailable, setCappedVoiceAvailable] = useState<boolean | null>(null);
   const [demoLoading, setDemoLoading] = useState(true);
   const [demoExpiresAt, setDemoExpiresAt] = useState<number | null>(null);
   const [editor, setEditor] = useState<EditorKind>(null);
+  const [openNote, setOpenNote] = useState<OpenNote | null>(null);
   const [ownerSetupCode, setOwnerSetupCode] = useState('');
   const [accounts, setAccounts] = useState<DemoAccount[]>([]);
   const [tasks, setTasks] = useState(DEMO_TASKS);
@@ -237,6 +248,23 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { demoVoiceAccessRef.current = demoVoiceAccess; }, [demoVoiceAccess]);
   useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch('/api/demo/voice/status', { cache: 'no-store', signal: controller.signal })
+      .then(async (response) => {
+        const body = await response.json() as { available?: boolean };
+        const available = response.ok && body.available === true;
+        setCappedVoiceAvailable(available);
+        if (!available && demoVoiceAccessRef.current === 'capped') {
+          demoVoiceAccessRef.current = 'subscription';
+          setDemoVoiceAccess('subscription');
+          setVoiceStatus('Quick demo voice is not enabled. My ChatGPT remains available.');
+        }
+      })
+      .catch(() => setCappedVoiceAvailable(false));
+    return () => controller.abort();
+  }, []);
 
   const hydrateDemoWorkspace = useCallback((workspace: DemoWorkspaceState, expiresAt?: number) => {
     setAccounts(workspace.accounts);
@@ -347,6 +375,34 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setToast(`${tool.title} completed.`);
     return result;
   }, [focusView, hydrateDemoWorkspace, propose]);
+
+  const openDemoNote = useCallback((note: (typeof DEMO_NOTES)[number]) => {
+    setOpenNote({ id: note.id, title: note.title, content: note.content, source: 'Temporary demo note' });
+  }, []);
+
+  const openLiveNote = useCallback(async (item: Record<string, unknown>) => {
+    const noteId = displayText(item, ['documentId', 'noteId', 'id'], '');
+    const title = displayText(item, ['title', 'name'], 'Drive note');
+    const account = displayText(item, ['_account', 'account', 'email'], 'Main');
+    if (!noteId) {
+      setOpenNote({ id: 'missing-note', title, content: '', source: 'Google Drive', error: 'This note is missing its document identifier.' });
+      return;
+    }
+    setOpenNote({ id: noteId, title, content: '', source: `${account} · Google Drive`, loading: true });
+    try {
+      const result = await invokeTool('workspace_read_note', { account, noteId });
+      const note = noteRecord(result);
+      setOpenNote({
+        id: noteId,
+        title: displayText(note, ['title', 'name'], title),
+        content: displayText(note, ['content', 'text', 'body', 'plainText', 'markdown'], 'This note is empty.'),
+        source: `${account} · Google Drive`,
+        openUrl: safeExternalUrl(displayText(note, ['webViewLink', 'url', 'link'], '')),
+      });
+    } catch (error) {
+      setOpenNote({ id: noteId, title, content: '', source: `${account} · Google Drive`, error: error instanceof Error ? error.message : 'The note could not be opened.' });
+    }
+  }, [invokeTool]);
 
   useEffect(() => {
     if (mode !== 'live' || !user) return;
@@ -730,6 +786,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   }, [voiceMuted]);
 
   const selectDemoVoiceAccess = useCallback((access: DemoVoiceAccess) => {
+    if (access === 'capped' && cappedVoiceAvailable === false) {
+      setVoiceStatus('Quick demo voice is not enabled. Use My ChatGPT or the ChatGPT in-app browser.');
+      return;
+    }
     if (voiceConnected) stopVoice('Voice stopped before changing access.');
     demoVoiceAccessRef.current = access;
     setDemoVoiceAccess(access);
@@ -740,7 +800,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       ? 'Ready for a capped five-minute synthetic demo'
       : 'Ready to connect your own ChatGPT subscription');
     if (access === 'subscription') void refreshVoiceThreads(true);
-  }, [refreshVoiceThreads, stopVoice, voiceConnected]);
+  }, [cappedVoiceAvailable, refreshVoiceThreads, stopVoice, voiceConnected]);
 
   useEffect(() => () => stopVoice('Voice stopped'), [stopVoice]);
 
@@ -890,19 +950,19 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} onChange={selectDemoVoiceAccess} /></div></div>}
+            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} onChange={selectDemoVoiceAccess} /></div></div>}
             {(mode === 'live' || (mode === 'demo' && demoVoiceAccess === 'subscription')) && <div className="mt-4 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
                 ? <ActivityView mode={mode} activity={activity} />
-                : <LiveWorkspaceView view={view} live={live} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} />
+                : <LiveWorkspaceView view={view} live={live} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onOpenNote={(item) => void openLiveNote(item)} />
             ) : demoLoading ? <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Preparing your private demo workspace…</p></div></div> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
               {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
               {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={setSelectedId} onCreate={() => setEditor('task')} />}
               {view === 'calendar' && <CalendarView events={events} selectedId={selectedId} onSelect={setSelectedId} onCreate={() => void invokeTool('workspace_create_calendar_event', { account: 'Main', summary: 'WebMCP demo review', start: '2026-08-28T11:00:00-05:00', end: '2026-08-28T11:30:00-05:00', timeZone: 'America/Chicago', reminderMinutes: [10] })} />}
-              {view === 'notes' && <NotesView mode={mode} notes={notes} onCreate={() => setEditor('note')} />}
+              {view === 'notes' && <NotesView mode={mode} notes={notes} onCreate={() => setEditor('note')} onOpen={openDemoNote} />}
               {view === 'memory' && <MemoryView mode={mode} memory={memory} onRemember={() => void invokeTool('workspace_remember_fact', { category: 'Preferences', fact: 'Use the Main account for personal reminders.' })} />}
               {view === 'accounts' && <AccountsView mode={mode} accounts={accounts} />}
               {view === 'activity' && <ActivityView mode={mode} activity={activity} />}
@@ -910,10 +970,11 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             </div>
           </div>
         </section>
-        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
+        <ActivityRail mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} activity={activity} toast={toast} voiceStatus={voiceStatus} voicePrompt={voicePrompt} voiceConnected={voiceConnected} voiceMuted={voiceMuted} orbPhase={orbPhase} voiceMeter={voiceMeter} voiceThreads={voiceThreads} selectedVoiceThreadId={selectedVoiceThreadId} voiceThreadsLoading={voiceThreadsLoading} onVoice={connectVoice} onMute={toggleVoiceMute} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectVoiceThread={setSelectedVoiceThreadId} onRefreshVoiceThreads={() => void refreshVoiceThreads()} onOpen={() => focusView('activity')} />
       </div>
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
+      {openNote && <NoteReader note={openNote} onClose={() => setOpenNote(null)} />}
       <MobileNavigation view={view} onView={focusView} />
     </main>
   );
@@ -1010,7 +1071,7 @@ function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, 
   );
 }
 
-function DemoVoiceChoice({ value, connected, onChange }: { value: DemoVoiceAccess; connected: boolean; onChange: (access: DemoVoiceAccess) => void }) {
+function DemoVoiceChoice({ value, connected, cappedAvailable, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; onChange: (access: DemoVoiceAccess) => void }) {
   const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
     { id: 'capped', title: 'Quick judge demo', detail: 'Server-funded · 5 min · 12 tools' },
     { id: 'subscription', title: 'My ChatGPT', detail: 'Private isolated sign-in · saved chats' },
@@ -1018,16 +1079,16 @@ function DemoVoiceChoice({ value, connected, onChange }: { value: DemoVoiceAcces
   return (
     <div role="radiogroup" aria-label="Demo voice access" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
       {choices.map((choice) => (
-        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${value === choice.id ? 'border-[#E0BC63]/45 bg-[#E0BC63]/[0.09] shadow-[0_0_18px_rgba(224,188,99,0.06)]' : 'border-white/[0.08] bg-white/[0.025] hover:border-[#E0BC63]/25'}`}>
+        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected || (choice.id === 'capped' && cappedAvailable === false)} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 ${value === choice.id ? 'border-[#E0BC63]/45 bg-[#E0BC63]/[0.09] shadow-[0_0_18px_rgba(224,188,99,0.06)]' : 'border-white/[0.08] bg-white/[0.025] hover:border-[#E0BC63]/25'}`}>
           <span className={`block text-xs font-semibold ${value === choice.id ? 'text-[#F2D783]' : 'text-[#cbd4db]'}`}>{choice.title}</span>
-          <span className="mt-0.5 block text-[10px] leading-4 text-[#667480]">{choice.detail}</span>
+          <span className="mt-0.5 block text-[10px] leading-4 text-[#667480]">{choice.id === 'capped' && cappedAvailable === false ? 'Not enabled in this deployment' : choice.detail}</span>
         </button>
       ))}
     </div>
   );
 }
 
-function ActivityRail({ mode, demoVoiceAccess, activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
+function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, activity, toast, voiceStatus, voicePrompt, voiceConnected, voiceMuted, orbPhase, voiceMeter, voiceThreads, selectedVoiceThreadId, voiceThreadsLoading, onVoice, onMute, onDemoVoiceAccess, onSelectVoiceThread, onRefreshVoiceThreads, onOpen }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voicePrompt: VoicePrompt; voiceConnected: boolean; voiceMuted: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; voiceThreads: VoiceThread[]; selectedVoiceThreadId: string | null; voiceThreadsLoading: boolean; onVoice: () => void; onMute: () => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectVoiceThread: (threadId: string | null) => void; onRefreshVoiceThreads: () => void; onOpen: () => void }) {
   const voiceLabel = mode === 'live'
     ? 'Owner voice'
     : demoVoiceAccess === 'capped'
@@ -1052,7 +1113,7 @@ function ActivityRail({ mode, demoVoiceAccess, activity, toast, voiceStatus, voi
       </div>
       <div className="mt-8 border-t border-white/[0.08] pt-6">
         <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5b6879]">Voice</p>
-        {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} onChange={onDemoVoiceAccess} /></div>}
+        {mode === 'demo' && <div className="mt-3"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} onChange={onDemoVoiceAccess} /></div>}
         <button onClick={onVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl px-2 py-3 text-left transition hover:bg-white/[0.04]">
           <VoiceOrb phase={orbPhase} meter={voiceMeter} size={44} />
           <span className="min-w-0 flex-1">
@@ -1125,8 +1186,10 @@ function PaperclipIcon() {
   );
 }
 
-function HaloRow({ id, selected, children, onClick }: { id: string; selected: boolean; children: React.ReactNode; onClick: () => void }) {
-  return <button id={`workspace-item-${id}`} onClick={onClick} className={`group relative w-full min-w-0 rounded-xl px-3.5 py-3 text-left transition-[background-color,box-shadow] duration-150 focus-visible:outline-none ${selected ? 'bg-[#14171e] shadow-[inset_0_0_0_1px_rgba(224,188,99,0.34),0_8px_24px_-8px_rgba(0,0,0,0.6)]' : 'hover:bg-white/[0.035] hover:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.07)]'}`}>{children}</button>;
+function HaloRow({ id, selected, children, onClick }: { id: string; selected: boolean; children: React.ReactNode; onClick?: () => void }) {
+  const className = `group relative w-full min-w-0 rounded-xl px-3.5 py-3 text-left transition-[background-color,box-shadow] duration-150 ${selected ? 'bg-[#14171e] shadow-[inset_0_0_0_1px_rgba(224,188,99,0.34),0_8px_24px_-8px_rgba(0,0,0,0.6)]' : onClick ? 'hover:bg-white/[0.035] hover:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.07)]' : 'bg-white/[0.012]'}`;
+  if (!onClick) return <div id={`workspace-item-${id}`} className={className}>{children}</div>;
+  return <button id={`workspace-item-${id}`} onClick={onClick} className={`${className} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E0BC63]/45`}>{children}</button>;
 }
 
 function SectionHeading({ title, description, action }: { title: string; description?: string; action?: React.ReactNode }) {
@@ -1358,7 +1421,7 @@ function CalendarView({ events, selectedId, onSelect, onCreate }: { events: type
   );
 }
 
-function NotesView({ mode, notes, onCreate }: { mode: Mode; notes: typeof DEMO_NOTES; onCreate: () => void }) {
+function NotesView({ mode, notes, onCreate, onOpen }: { mode: Mode; notes: typeof DEMO_NOTES; onCreate: () => void; onOpen: (note: (typeof DEMO_NOTES)[number]) => void }) {
   const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(notes, 6, notes.length);
   return (
     <section className="min-w-0">
@@ -1370,9 +1433,9 @@ function NotesView({ mode, notes, onCreate }: { mode: Mode; notes: typeof DEMO_N
         <>
           <div className="grid grid-cols-2 gap-4 max-md:grid-cols-1 xl:grid-cols-2">
             {pageItems.map((note) => (
-              <HaloRow key={note.id} id={note.id} selected={false} onClick={() => undefined}>
+              <HaloRow key={note.id} id={note.id} selected={false} onClick={() => onOpen(note)}>
                 <div className="min-w-0">
-                  <p className="oa-clamp-1 font-medium">{note.title}</p>
+                  <div className="flex items-center justify-between gap-3"><p className="oa-clamp-1 font-medium">{note.title}</p><span className="shrink-0 text-[11px] font-medium text-[#E0BC63]">Open note</span></div>
                   <p className="mt-3 oa-clamp-3 text-sm leading-6 text-[#7c8a9c]">{note.preview}</p>
                   <p className="mt-4 oa-clamp-1 text-xs text-[#5b6879]">Updated {note.updated} · {mode === 'demo' ? 'Temporary demo storage' : 'Stored in Drive'}</p>
                 </div>
@@ -1399,7 +1462,7 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
         <>
           <div className="space-y-2">
             {pageItems.map((fact) => (
-              <HaloRow key={fact.id} id={fact.id} selected={false} onClick={() => undefined}>
+              <HaloRow key={fact.id} id={fact.id} selected={false}>
                 <div className="min-w-0">
                   <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#E0BC63]">{fact.category}</p>
                   <p className="mt-2 oa-wrap-anywhere text-sm leading-6 text-[#d6dfeb]">{fact.fact}</p>
@@ -1428,7 +1491,7 @@ function AccountsView({ mode, accounts }: { mode: Mode; accounts: DemoAccount[] 
       {accounts.length ? (
         <div className="space-y-3">
           {accounts.map((account, index) => (
-            <HaloRow key={account.id} id={account.id} selected={index === 0} onClick={() => undefined}>
+            <HaloRow key={account.id} id={account.id} selected={index === 0}>
               <div className="flex items-start justify-between gap-4 max-sm:flex-col max-sm:gap-3">
                 <div className="min-w-0 flex-1">
                   <p className="oa-clamp-1 font-medium">{account.label}</p>
@@ -1470,7 +1533,10 @@ function liveRows(view: WorkspaceView, source: unknown): Array<Record<string, un
   if (view === 'inbox') return arrayValue(objectValue(data.mail).results).map((item) => ({ ...item, _kind: 'Unread mail' }));
   if (view === 'tasks') return arrayValue(data.results).map((item) => ({ ...item, _kind: 'Task' }));
   if (view === 'calendar') return arrayValue(data.events).map((item) => ({ ...item, _kind: 'Calendar' }));
-  if (view === 'notes') return arrayValue(data.notes).map((item) => ({ ...item, _kind: 'Drive note' }));
+  if (view === 'notes') {
+    const account = displayText(data, ['account'], 'Main');
+    return arrayValue(data.notes).map((item) => ({ ...item, _kind: 'Drive note', _account: account }));
+  }
   if (view === 'memory') return arrayValue(data.facts ?? data.memories ?? data.results).map((item) => ({ ...item, _kind: 'Memory' }));
   if (view === 'accounts' || view === 'activity') return arrayValue(data.accounts).map((item) => ({ ...item, _kind: 'Account' }));
   return [];
@@ -1484,7 +1550,28 @@ function displayText(item: Record<string, unknown>, keys: string[], fallback: st
   return fallback;
 }
 
-function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, onReconnect }: { view: WorkspaceView; live: LiveState; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void }) {
+function noteRecord(value: unknown, depth = 0): Record<string, unknown> {
+  const record = objectValue(value);
+  if (depth >= 4) return record;
+  const hasReadableText = ['content', 'text', 'body', 'plainText', 'markdown'].some((key) => typeof record[key] === 'string');
+  if (hasReadableText) return record;
+  for (const key of ['note', 'document', 'result', 'data', 'file']) {
+    if (record[key] && typeof record[key] === 'object' && !Array.isArray(record[key])) return noteRecord(record[key], depth + 1);
+  }
+  return record;
+}
+
+function safeExternalUrl(value: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, onReconnect, onOpenNote }: { view: WorkspaceView; live: LiveState; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void; onOpenNote: (item: Record<string, unknown>) => void }) {
   const source = view === 'accounts' || view === 'activity' ? live.accounts : live.data[view];
   const rows = useMemo(() => liveRows(view, source), [source, view]);
   const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(rows, PAGE_SIZE, `${view}-${rows.length}`);
@@ -1519,14 +1606,14 @@ function LiveWorkspaceView({ view, live, ownerCode, onOwnerCode, onBootstrap, on
               const title = displayText(item, ['subject', 'title', 'summary', 'friendlyLabel', 'fact', 'name', 'email'], `${kind} ${rangeStart + index}`);
               const subtitle = displayText(item, ['sender', 'from', 'email', 'due', 'start', 'account', 'category', 'status'], 'Live Workspace item');
               return (
-                <HaloRow key={displayText(item, ['id', 'messageId', 'eventId', 'documentId'], `${view}-${rangeStart + index}`)} id={`live-${view}-${rangeStart + index}`} selected={false} onClick={() => undefined}>
+                <HaloRow key={displayText(item, ['id', 'messageId', 'eventId', 'documentId'], `${view}-${rangeStart + index}`)} id={`live-${view}-${rangeStart + index}`} selected={false} onClick={view === 'notes' ? () => onOpenNote(item) : undefined}>
                   <div className="flex items-start justify-between gap-4">
                     <div className="min-w-0 flex-1">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#E0BC63]">{kind}</p>
                       <p className="mt-1 oa-clamp-1 text-sm font-medium">{title}</p>
                       <p className="mt-1 oa-clamp-1 text-sm text-[#7c8a9c]">{subtitle}</p>
                     </div>
-                    <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[#E0BC63] shadow-[0_0_14px_rgba(224,188,99,0.45)]" />
+                    {view === 'notes' ? <span className="mt-1 shrink-0 text-[11px] font-medium text-[#E0BC63]">Open note</span> : <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[#E0BC63] shadow-[0_0_14px_rgba(224,188,99,0.45)]" />}
                   </div>
                 </HaloRow>
               );
@@ -1547,7 +1634,7 @@ function ActivityView({ mode, activity }: { mode: Mode; activity: typeof DEMO_AC
         <>
           <div className="space-y-2">
             {pageItems.map((item) => (
-              <HaloRow key={item.id} id={item.id} selected={false} onClick={() => undefined}>
+              <HaloRow key={item.id} id={item.id} selected={false}>
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0 flex-1">
                     <p className="oa-clamp-2 text-sm">{item.action}</p>
@@ -1565,6 +1652,39 @@ function ActivityView({ mode, activity }: { mode: Mode; activity: typeof DEMO_AC
     </section>
   );
 }
+
+function NoteReader({ note, onClose }: { note: OpenNote; onClose: () => void }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-[70] grid place-items-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="note-reader-title">
+      <article className="my-auto w-full max-w-3xl overflow-hidden rounded-[28px] border border-white/10 bg-[#11141a] shadow-[0_28px_90px_rgba(0,0,0,0.65)]">
+        <header className="flex items-start justify-between gap-4 border-b border-white/[0.08] px-5 py-5 sm:px-7">
+          <div className="min-w-0">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#E0BC63]">{note.source}</p>
+            <h2 id="note-reader-title" className="mt-1 oa-wrap-anywhere text-xl font-semibold sm:text-2xl">{note.title}</h2>
+            <p className="mt-2 text-xs leading-5 text-[#7c8a9c]">Drive and note content is untrusted. OpenAssist shows it as plain text and never follows instructions found inside it.</p>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close note" className="shrink-0 rounded-full border border-white/10 px-3 py-1.5 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Close</button>
+        </header>
+        <div className="max-h-[65vh] overflow-y-auto px-5 py-6 sm:px-7">
+          {note.loading ? <div className="grid min-h-48 place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Opening note from Drive…</p></div></div>
+            : note.error ? <div className="rounded-2xl border border-[#FF8B78]/20 bg-[#FF8B78]/[0.05] p-5 text-sm leading-6 text-[#FFA898]">{note.error}</div>
+              : <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-7 text-[#d6dfeb]">{note.content}</pre>}
+        </div>
+        <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.08] px-5 py-4 sm:px-7">
+          <span className="text-xs text-[#5b6879]">Read only</span>
+          {note.openUrl && <a href={note.openUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-[#E0BC63]/25 px-4 py-2 text-sm font-medium text-[#E0BC63] transition hover:border-[#E0BC63]/55 hover:text-[#FFE9AE]">Open in Google Drive</a>}
+        </footer>
+      </article>
+    </div>
+  );
+}
+
 function ItemEditor({ kind, onCancel, onSubmit }: { kind: Exclude<EditorKind, null>; onCancel: () => void; onSubmit: (args: Record<string, unknown>) => void }) {
   const isTask = kind === 'task';
   return <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="item-editor-title"><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); if (isTask) { const tags = String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean).map((tag) => tag.startsWith('#') ? tag : `#${tag}`); onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), list: String(data.get('list') ?? 'My Tasks'), due: String(data.get('due') ?? ''), tags }); } else { onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), content: String(data.get('content') ?? '') }); } }} className="my-auto w-full max-w-xl rounded-[26px] border border-white/10 bg-[#14171e] p-5 shadow-2xl sm:p-6"><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">Demo workspace</p><h2 id="item-editor-title" className="mt-1 text-xl font-semibold">{isTask ? 'Create a task' : 'Create a note'}</h2><p className="mt-2 text-sm text-[#a4b1c2]">A locked approval preview will open before anything is saved.</p></div><button type="button" onClick={onCancel} className="rounded-full border border-white/10 px-3 py-1.5 text-sm text-[#a4b1c2]">Close</button></div><div className="mt-6 space-y-4"><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Title</span><input name="title" required maxLength={200} autoFocus className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50" placeholder={isTask ? 'What needs to be done?' : 'Note title'} /></label>{isTask ? <><div className="grid grid-cols-2 gap-4 max-sm:grid-cols-1"><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">List</span><select name="list" className="w-full rounded-xl border border-white/10 bg-[#0d0f14] px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50"><option>My Tasks</option><option>Backlog</option></select></label><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Due date</span><input name="due" type="date" className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50" /></label></div><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Tags</span><input name="tags" maxLength={240} className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50" placeholder="Launch, Work" /></label></> : <label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Content</span><textarea name="content" required maxLength={20000} rows={9} className="w-full resize-y rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm leading-6 outline-none focus:border-[#E0BC63]/50" placeholder="Add useful reference material…" /></label>}</div><div className="mt-6 flex justify-end gap-3 max-sm:flex-col-reverse"><button type="button" onClick={onCancel} className="rounded-xl border border-white/10 px-4 py-2.5 text-sm transition hover:border-white/25">Cancel</button><button type="submit" className="rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a]">Review before saving</button></div></form></div>;
