@@ -4,12 +4,12 @@ import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../.
 import { getPublicJudgeVoicePolicy } from '../../../../../../lib/judge-voice-policy';
 import { activateJudgeVoiceSession, failJudgeVoiceEvent, reserveJudgeVoiceSession } from '../../../../../../lib/judge-voice-store';
 import { parseRealtimeVoice } from '../../../../../../lib/realtime-voices';
-import { requireSignedInUser } from '../../../../../../lib/server-auth';
+import { requireDemoAccess } from '../../../../../../lib/server-auth';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireSignedInUser();
+    await requireDemoAccess(request);
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request, 310_000);
@@ -24,7 +24,7 @@ export async function POST(request: Request): Promise<Response> {
       policy.sessionSeconds,
       policy.dailySessionLimit,
     );
-    if (!reservation) throw new Response('The funded judge voice daily limit has been reached. Use My ChatGPT instead.', { status: 429 });
+    if (!reservation) throw new Response('The funded judge voice daily limit has been reached.', { status: 429 });
     const response = await callVoiceGateway(
       request,
       demoVoiceUserId(session.workspaceId),

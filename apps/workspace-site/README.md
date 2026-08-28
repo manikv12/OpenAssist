@@ -2,13 +2,15 @@
 
 This ChatGPT Site provides a polished WebMCP dashboard for the existing OpenAssist Workspace MCP.
 
-## Demo and Live data
+## Judge and owner access
 
-- The public Site opens in **Demo mode without login**. This is the required judge path and is enough to test all 23 WebMCP tools.
-- **Demo mode** gives every visitor a separate synthetic workspace in Cloudflare D1. Judges can create and update demo tasks, calendar events, notes, and memory without touching Google.
-- If project-funded voice is enabled, judges can use **Funded judge demo** without signing in. The owner chooses the daily session allowance, session length, and tool-call limit.
-- **My ChatGPT** is an optional voice path where a judge can sign in with their own subscription and resume isolated saved conversations.
-- Judges never enter an API key. The optional project-funded key stays in the voice gateway Worker.
+- The Site opens on a private access screen. There is no anonymous workspace access.
+- **Judge access** uses a shared username and strong access code supplied privately with the submission. It creates an expiring, signed, HttpOnly session.
+- Failed judge logins are limited to five attempts per 15-minute window. Only a one-way request fingerprint and short-lived counter are stored.
+- **Demo mode** gives every judge a separate synthetic workspace in Cloudflare D1. Judges can create and update demo tasks, calendar events, notes, and memory without touching Google.
+- Judges can use only **Funded judge demo** voice. They never enter or see an API key and cannot access ChatGPT subscription voice, owner controls, or Live Workspace.
+- **Owner access** uses the exact ChatGPT account bound to the Site. The owner can switch between Demo and Live, manage the funded key, and monitor safe usage metadata.
+- The project-funded key stays encrypted in the voice gateway R2 bucket.
 - The demo workspace expires after 24 hours. **Reset demo** immediately deletes it and creates a clean copy.
 - **Live mode** is owner-only and continues to use the existing Workspace MCP and Composio-managed Google connections.
 - Demo and Live routes are separate. Private Google content is never copied into the demo database.
@@ -34,6 +36,10 @@ npm run dev
 - `TOKEN_ENCRYPTION_KEY`
 - `ACTION_SIGNING_KEY`
 - `OWNER_BOOTSTRAP_CODE`
+- `OWNER_ACCOUNT_USER_ID`
+- `JUDGE_ACCESS_USERNAME`
+- `JUDGE_ACCESS_CODE` (use at least 20 random characters)
+- Optional `JUDGE_ACCESS_EXPIRES_AT` (ISO date/time; rotate the code after judging)
 - `WORKSPACE_MCP_URL`
 - `WORKSPACE_OAUTH_ISSUER`
 - `WORKSPACE_OAUTH_CLIENT_ID`
@@ -51,7 +57,7 @@ https://YOUR_SITE_ORIGIN/api/workspace/callback
 
 After signing in with the intended ChatGPT account, send the one-time bootstrap code to `/api/owner/bootstrap`. The first successful bootstrap permanently binds the owner role. A second user cannot replace it.
 
-Before sharing the Site, verify synthetic demo isolation and owner binding in a private stage. Public visitors should open in Demo mode and must never be able to enter owner Live mode.
+Before sharing the Site, verify judge isolation and owner binding in a private stage. Anonymous visitors should see only the access screen. Judge sessions must never be able to enter owner Live mode.
 
 ## Owner judge voice controls
 

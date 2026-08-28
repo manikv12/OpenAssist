@@ -29,7 +29,7 @@ import {
   type WorkspaceToolName,
 } from '../../lib/tool-registry';
 
-type SiteUser = { id: string; email: string; name: string; owner: boolean } | null;
+type SiteUser = { id: string; email: string; name: string; owner: boolean; access: 'owner' | 'judge' } | null;
 type Mode = 'demo' | 'live';
 type DemoVoiceAccess = 'capped' | 'subscription';
 type ActiveVoiceKind = 'live_subscription' | 'demo_subscription' | 'demo_capped';
@@ -239,6 +239,7 @@ async function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
 
 export function WorkspaceApp({ user }: { user: SiteUser }) {
   const router = useRouter();
+  const ownerAccess = user?.access === 'owner';
   const [mode, setMode] = useState<Mode>('demo');
   const [view, setView] = useState<WorkspaceView>('today');
   const [search, setSearch] = useState('');
@@ -329,11 +330,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         setJudgeVoicePolicy(policy);
         cappedToolLimitRef.current = policy.maxToolCalls;
         setCappedVoiceAvailable(available);
-        if (!available && demoVoiceAccessRef.current === 'capped') {
-          demoVoiceAccessRef.current = 'subscription';
-          setDemoVoiceAccess('subscription');
-          setVoiceStatus('Quick demo voice is not enabled. My ChatGPT remains available.');
-        }
+        if (!available && demoVoiceAccessRef.current === 'capped') setVoiceStatus('Funded judge voice is not enabled in this deployment.');
       })
       .catch(() => setCappedVoiceAvailable(false));
     return controller;
@@ -1004,8 +1001,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   }, [invokeTool]);
 
   const selectMode = useCallback((nextMode: Mode) => {
-    if (nextMode === 'live' && !user) {
-      router.push('/signin-with-chatgpt?return_to=%2F');
+    if (nextMode === 'live' && !ownerAccess) {
+      setToast('Live Workspace is available only through the owner ChatGPT login.');
       return;
     }
     if (nextMode !== modeRef.current && voiceConnected) stopVoice('Voice stopped because the workspace mode changed.');
@@ -1017,7 +1014,17 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       setSelectedVoiceThreadId(null);
     }
     setToast(nextMode === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.');
-  }, [refreshVoiceThreads, router, stopVoice, user, voiceConnected]);
+  }, [ownerAccess, refreshVoiceThreads, stopVoice, voiceConnected]);
+
+  const signOut = useCallback(async () => {
+    if (voiceConnected) stopVoice('Voice stopped before signing out.');
+    if (user?.access === 'owner') {
+      router.push('/signout-with-chatgpt?return_to=%2F');
+      return;
+    }
+    await fetch('/api/judge/logout', { method: 'POST' }).catch(() => undefined);
+    router.refresh();
+  }, [router, stopVoice, user?.access, voiceConnected]);
 
   const completeOwnerSetup = useCallback(async () => {
     const code = ownerSetupCode.trim();
@@ -1050,7 +1057,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_38%_-14%,rgba(224,188,99,0.07),transparent_34%),radial-gradient(circle_at_88%_8%,rgba(224,188,99,0.035),transparent_24%),#08090d] text-[#e8eef7]">
       <div className="mx-auto grid min-h-screen w-full max-w-[1800px] grid-cols-[238px_minmax(0,1fr)_minmax(300px,340px)] max-xl:grid-cols-[84px_minmax(0,1fr)] max-md:grid-cols-1">
-        <Sidebar mode={mode} view={view} user={user} onMode={selectMode} onView={focusView} onToast={setToast} onSignIn={() => router.push('/signin-with-chatgpt?return_to=%2F')} />
+        <Sidebar mode={mode} view={view} user={user} onMode={selectMode} onView={focusView} onToast={setToast} onSignOut={() => void signOut()} />
         <section id={`view-${view}`} className="min-w-0 pb-[calc(88px+env(safe-area-inset-bottom))] md:pb-10">
           <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] px-5 py-3.5 md:hidden">
             <div className="flex min-w-0 items-center gap-2.5">
@@ -1060,7 +1067,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 <p className="truncate text-[11px] leading-tight text-[#7c8a9c]">Daily Workspace</p>
               </div>
             </div>
-            <span className="shrink-0 rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#E0BC63]">{mode}</span>
+            <div className="flex shrink-0 items-center gap-2"><span className="rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#E0BC63]">{user?.access === 'judge' ? 'Judge' : mode}</span><button onClick={() => void signOut()} className="text-[10px] font-medium text-[#7c8a9c]">Sign out</button></div>
           </div>
 
           <div className="px-5 pt-5 sm:px-8 sm:pt-6 lg:px-12">
@@ -1081,15 +1088,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                   <span className="sr-only">Search current view</span>
                   <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search workspace" className="w-full min-w-0 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm outline-none transition placeholder:text-[#5b6879] focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10" />
                 </label>
-                <div aria-label="Workspace mode" className="grid shrink-0 grid-cols-2 rounded-xl border border-white/[0.08] bg-white/[0.04] p-1 xl:hidden">
-                  {(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => selectMode(item)} aria-pressed={mode === item} className={`rounded-lg px-3 py-1.5 text-xs font-semibold capitalize transition ${mode === item ? 'bg-[#E0BC63] text-[#17130a] shadow-[0_4px_16px_rgba(224,188,99,0.12)]' : 'text-[#7c8a9c] hover:bg-white/[0.05] hover:text-white'}`}>{item}</button>)}
-                </div>
+                {ownerAccess && <div aria-label="Workspace mode" className="grid shrink-0 grid-cols-2 rounded-xl border border-white/[0.08] bg-white/[0.04] p-1 xl:hidden">{(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => selectMode(item)} aria-pressed={mode === item} className={`rounded-lg px-3 py-1.5 text-xs font-semibold capitalize transition ${mode === item ? 'bg-[#E0BC63] text-[#17130a] shadow-[0_4px_16px_rgba(224,188,99,0.12)]' : 'text-[#7c8a9c] hover:bg-white/[0.05] hover:text-white'}`}>{item}</button>)}</div>}
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Reset demo</button>}
               </div>
             </header>
             {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div><div className="mt-3 xl:hidden"><DemoVoiceChoice value={demoVoiceAccess} connected={voiceConnected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={selectDemoVoiceAccess} /></div></div>}
             <div className="mt-4 xl:hidden"><VoicePicker value={selectedVoice} connected={voiceConnected} onChange={selectVoice} /></div>
-            {(mode === 'live' || (mode === 'demo' && demoVoiceAccess === 'subscription')) && <div className="mt-3 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
+            {mode === 'live' && <div className="mt-3 xl:hidden"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={setSelectedVoiceThreadId} onRefresh={() => void refreshVoiceThreads()} /></div>}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
@@ -1184,8 +1189,9 @@ function MobileNavigation({ view, onView }: { view: WorkspaceView; onView: (view
   );
 }
 
-function Sidebar({ mode, view, user, onMode, onView, onToast, onSignIn }: { mode: Mode; view: WorkspaceView; user: SiteUser; onMode: (mode: Mode) => void; onView: (view: WorkspaceView) => void; onToast: (message: string) => void; onSignIn: () => void }) {
-  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{NAVIGATION.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Mode</p><div className="mt-3 grid grid-cols-2 rounded-xl bg-white/[0.04] p-1">{(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => { if (item === 'live' && !user) { onSignIn(); return; } onMode(item); onToast(item === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.'); }} className={`rounded-lg px-2 py-2 text-xs font-semibold capitalize ${mode === item ? 'bg-[#E0BC63] text-[#17130a]' : 'text-[#7c8a9c]'}`}>{item}</button>)}</div><p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{mode === 'demo' ? 'Public synthetic judge data. No private content.' : user ? `Signed in as ${user.email}` : 'ChatGPT sign-in is required.'}</p></div></aside>;
+function Sidebar({ mode, view, user, onMode, onView, onToast, onSignOut }: { mode: Mode; view: WorkspaceView; user: SiteUser; onMode: (mode: Mode) => void; onView: (view: WorkspaceView) => void; onToast: (message: string) => void; onSignOut: () => void }) {
+  const owner = user?.access === 'owner';
+  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{NAVIGATION.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Access</p>{owner && <div className="mt-3 grid grid-cols-2 rounded-xl bg-white/[0.04] p-1">{(['demo', 'live'] as const).map((item) => <button key={item} onClick={() => { onMode(item); onToast(item === 'demo' ? 'Safe synthetic data is active.' : 'Owner mode selected. Connect Workspace to continue.'); }} className={`rounded-lg px-2 py-2 text-xs font-semibold capitalize ${mode === item ? 'bg-[#E0BC63] text-[#17130a]' : 'text-[#7c8a9c]'}`}>{item}</button>)}</div>}<p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-[#E0BC63] transition hover:text-[#F2D783]">Sign out</button></div></aside>;
 }
 
 function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, onRefresh }: { threads: VoiceThread[]; selectedId: string | null; loading: boolean; connected: boolean; onSelect: (threadId: string | null) => void; onRefresh: () => void }) {
@@ -1227,8 +1233,7 @@ function VoicePicker({ value, connected, onChange }: { value: RealtimeVoice; con
 
 function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; policy: JudgeVoicePolicy; onChange: (access: DemoVoiceAccess) => void }) {
   const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
-    { id: 'capped', title: 'Funded judge demo', detail: `No sign-in · ${Math.ceil(policy.sessionSeconds / 60)} min · ${policy.maxToolCalls} tools` },
-    { id: 'subscription', title: 'My ChatGPT', detail: 'Private isolated sign-in · saved chats' },
+    { id: 'capped', title: 'Funded judge demo', detail: `Included access · ${Math.ceil(policy.sessionSeconds / 60)} min · ${policy.maxToolCalls} tools` },
   ];
   return (
     <div role="radiogroup" aria-label="Demo voice access" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
@@ -1278,7 +1283,7 @@ function ActivityRail({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoiceP
         </button>
         {voiceConnected && <button onClick={onMute} className="mt-2 w-full rounded-xl border border-white/[0.08] px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/40 hover:text-white">{voiceMuted ? 'Unmute microphone' : 'Mute microphone'}</button>}
         <div className="mt-3"><VoicePicker value={selectedVoice} connected={voiceConnected} onChange={onVoiceChange} /></div>
-        {(mode === 'live' || demoVoiceAccess === 'subscription') && <div className="mt-3"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={onSelectVoiceThread} onRefresh={onRefreshVoiceThreads} /></div>}
+        {mode === 'live' && <div className="mt-3"><VoiceThreadPicker threads={voiceThreads} selectedId={selectedVoiceThreadId} loading={voiceThreadsLoading} connected={voiceConnected} onSelect={onSelectVoiceThread} onRefresh={onRefreshVoiceThreads} /></div>}
         {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2.5 text-[11px] leading-4 text-[#7c8a9c]">Uses only synthetic data. The server key is never sent to this browser.</p>}
         {voicePrompt && (
           <div className="mt-3 rounded-2xl border border-[#E0BC63]/20 bg-[#E0BC63]/[0.06] p-4">

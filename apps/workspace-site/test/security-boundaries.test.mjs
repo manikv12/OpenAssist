@@ -102,12 +102,13 @@ test('demo routes never call the Live Workspace MCP', async () => {
   }
 });
 
-test('the page and every demo API require ChatGPT sign-in', async () => {
+test('the page is gated and demo APIs require owner or signed judge access', async () => {
   const page = await read('app/page.tsx');
   assert.match(page, /export const dynamic = 'force-dynamic'/);
-  assert.match(page, /requireChatGPTUser\('\/'\)/);
+  assert.match(page, /getSiteAccess\(request\)/);
+  assert.match(page, /<AccessGate/);
 
-  const demoRoutes = [
+  const sharedDemoRoutes = [
     'app/api/demo/workspace/route.ts',
     'app/api/demo/tool/route.ts',
     'app/api/demo/actions/propose/route.ts',
@@ -115,6 +116,10 @@ test('the page and every demo API require ChatGPT sign-in', async () => {
     'app/api/demo/voice/status/route.ts',
     'app/api/demo/voice/capped/session/route.ts',
     'app/api/demo/voice/capped/stop/route.ts',
+  ];
+  for (const route of sharedDemoRoutes) assert.match(await read(route), /await requireDemoAccess\(request\)/, route);
+
+  const ownerOnlySubscriptionRoutes = [
     'app/api/demo/voice/subscription/auth/start/route.ts',
     'app/api/demo/voice/subscription/auth/status/route.ts',
     'app/api/demo/voice/subscription/auth/disconnect/route.ts',
@@ -122,7 +127,27 @@ test('the page and every demo API require ChatGPT sign-in', async () => {
     'app/api/demo/voice/subscription/session/stop/route.ts',
     'app/api/demo/voice/subscription/threads/route.ts',
   ];
-  for (const route of demoRoutes) assert.match(await read(route), /await requireSignedInUser\(\)/, route);
+  for (const route of ownerOnlySubscriptionRoutes) assert.match(await read(route), /await requireOwner\(\)/, route);
+});
+
+test('judge access uses a signed expiring cookie and database-backed brute-force limits', async () => {
+  const access = await read('lib/judge-access.ts');
+  const login = await read('app/api/judge/login/route.ts');
+  const logout = await read('app/api/judge/logout/route.ts');
+  const migrations = (await Promise.all((await readdir(path.join(root, 'drizzle')))
+    .filter((file) => file.endsWith('.sql'))
+    .map((file) => read(`drizzle/${file}`)))).join('\n');
+
+  assert.match(access, /signJudgeAccessToken/);
+  assert.match(access, /verifyJudgeAccessToken/);
+  assert.match(access, /SESSION_LIFETIME_MS = 12 \* 60 \* 60 \* 1000/);
+  assert.match(access, /MAX_ATTEMPTS = 5/);
+  assert.match(access, /constantTimeTextEqual/);
+  assert.match(access, /credentialRevision/);
+  assert.match(login, /assertSameOrigin\(request\)/);
+  assert.match(logout, /clearJudgeAccessCookie/);
+  assert.match(migrations, /CREATE TABLE `judge_login_limits`/);
+  assert.doesNotMatch(migrations, /judge_access_code|judge_username/);
 });
 
 test('server code does not log private Workspace content', async () => {
@@ -207,7 +232,7 @@ test('voice selection and visible audio states are wired through every session p
   }
 });
 
-test('demo judges can use an isolated ChatGPT subscription or the server-funded realtime fallback', async () => {
+test('demo judges use only the server-funded route while subscription routes remain owner-only', async () => {
   const app = await read('app/components/workspace-app.tsx');
   const gatewayClient = await read('lib/voice-gateway.ts');
   const cappedSession = await read('app/api/demo/voice/capped/session/route.ts');
@@ -216,16 +241,18 @@ test('demo judges can use an isolated ChatGPT subscription or the server-funded 
   const demoStore = await read('lib/demo-store.ts');
 
   assert.match(app, /Funded judge demo/);
-  assert.match(app, /My ChatGPT/);
+  assert.match(app, /Included access/);
   assert.match(app, /response\.function_call_arguments\.done/);
   assert.match(app, /voiceToolCountRef\.current > toolLimit/);
   assert.match(app, /Funded demo voice session ended/);
   assert.match(gatewayClient, /access: 'owner' \| 'demo'/);
+  assert.match(cappedSession, /requireDemoAccess\(request\)/);
+  for (const source of [subscriptionSession, subscriptionAuth]) assert.match(source, /requireOwner\(\)/);
   for (const source of [cappedSession, subscriptionSession, subscriptionAuth]) {
     assert.match(source, /getOrCreateDemoSession/);
     assert.match(source, /demoVoiceUserId/);
     assert.match(source, /'demo'/);
-    assert.doesNotMatch(source, /requireOwner|executeLiveWorkspaceTool|mcp-client/);
+    assert.doesNotMatch(source, /executeLiveWorkspaceTool|mcp-client/);
   }
   assert.match(demoStore, /recordDemoVoiceSession/);
   assert.doesNotMatch(demoStore, /FUNDED_VOICE_(WORKSPACE|GLOBAL)_LIMIT/);

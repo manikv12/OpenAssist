@@ -1,5 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { getChatGPTUser, type ChatGPTUser } from '../app/chatgpt-auth';
+import { getJudgeAccess, type JudgeAccess } from './judge-access';
 import { bootstrapOwner, siteRole, upsertSiteUser } from './site-db';
 
 export async function requireSignedInUser(): Promise<ChatGPTUser> {
@@ -22,6 +23,28 @@ export async function requireOwner(): Promise<ChatGPTUser> {
   }
 
   throw new Response('Owner access is required.', { status: 403 });
+}
+
+export type SiteAccess =
+  | { kind: 'owner'; user: ChatGPTUser }
+  | JudgeAccess;
+
+export async function getSiteAccess(request: Request): Promise<SiteAccess | null> {
+  const user = await getChatGPTUser();
+  if (user) {
+    const role = await siteRole(user.userId).catch(() => null);
+    if (role === 'owner' || (env.OWNER_ACCOUNT_USER_ID && user.userId === env.OWNER_ACCOUNT_USER_ID)) {
+      await upsertSiteUser(user);
+      return { kind: 'owner', user };
+    }
+  }
+  return getJudgeAccess(request);
+}
+
+export async function requireDemoAccess(request: Request): Promise<SiteAccess> {
+  const access = await getSiteAccess(request);
+  if (!access) throw new Response('Judge or owner access is required.', { status: 401 });
+  return access;
 }
 
 export function requiredSecret(name: 'TOKEN_ENCRYPTION_KEY' | 'ACTION_SIGNING_KEY' | 'VOICE_GATEWAY_SHARED_SECRET'): string {

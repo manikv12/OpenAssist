@@ -57,6 +57,14 @@ export const judgeVoiceEvents = sqliteTable('judge_voice_events', {
   index('judge_voice_events_visitor_idx').on(table.visitorHash, table.startedAt),
 ]);
 
+// Brute-force protection for the shared judge gate. Only a keyed, one-way
+// request fingerprint and a short-lived count are retained.
+export const judgeLoginLimits = sqliteTable('judge_login_limits', {
+  attemptKey: text('attempt_key').primaryKey(),
+  attempts: integer('attempts').notNull().default(0),
+  expiresAt: integer('expires_at').notNull(),
+}, (table) => [index('judge_login_limits_expires_idx').on(table.expiresAt)]);
+
 // Only a one-way request hash is retained to prevent duplicate writes. The
 // original tool arguments and Google content are never placed in D1.
 export const actionReceipts = sqliteTable('action_receipts', {

@@ -3,13 +3,13 @@ import { executeDemoWrite, loadDemoWorkspace } from '../../../../../lib/demo-sto
 import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../../lib/http';
 import { validateToolArguments } from '../../../../../lib/input-validation';
 import { sha256, verifyActionPreview } from '../../../../../lib/security';
-import { requireSignedInUser, requiredSecret } from '../../../../../lib/server-auth';
+import { requireDemoAccess, requiredSecret } from '../../../../../lib/server-auth';
 import { claimIdempotency } from '../../../../../lib/site-db';
 import { WORKSPACE_TOOL_MAP, isWorkspaceToolName } from '../../../../../lib/tool-registry';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireSignedInUser();
+    await requireDemoAccess(request);
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request);

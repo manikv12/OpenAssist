@@ -31,7 +31,9 @@ test('WebMCP annotations and visible approval previews are always registered', a
 test('demo and owner Live mode remain separate', async () => {
   const component = await text('app/components/workspace-app.tsx');
   assert.match(component, /modeRef\.current === 'demo'/);
-  assert.match(component, /Public synthetic judge data\. No private content/);
+  assert.match(component, /Private synthetic judge workspace · no Google data/);
+  assert.match(component, /ownerAccess &&/);
+  assert.match(component, /Judge · isolated Demo only/);
   assert.match(component, /\/api\/demo\/tool/);
   assert.match(component, /\/api\/workspace\/tool/);
   assert.match(component, /\/api\/demo\/voice\/capped\/session/);

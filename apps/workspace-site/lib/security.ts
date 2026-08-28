@@ -130,6 +130,40 @@ export type DemoSessionTokenPayload = {
   expiresAt: number;
 };
 
+export type JudgeAccessTokenPayload = {
+  version: 1;
+  purpose: 'judge_access';
+  sessionId: string;
+  credentialRevision: string;
+  issuedAt: number;
+  expiresAt: number;
+};
+
+export async function signJudgeAccessToken(payload: JudgeAccessTokenPayload, secret: string): Promise<string> {
+  const encodedPayload = bytesToBase64Url(encoder.encode(canonicalJson(payload)));
+  const signature = await hmac(encodedPayload, secret);
+  return `${encodedPayload}.${bytesToBase64Url(signature)}`;
+}
+
+export async function verifyJudgeAccessToken(token: string, secret: string): Promise<JudgeAccessTokenPayload> {
+  const [encodedPayload, encodedSignature] = token.split('.');
+  if (!encodedPayload || !encodedSignature) throw new Error('Judge access session is invalid.');
+  const expected = await hmac(encodedPayload, secret);
+  if (!timingSafeEqual(expected, base64UrlToBytes(encodedSignature))) throw new Error('Judge access session is invalid.');
+  const payload = JSON.parse(decoder.decode(base64UrlToBytes(encodedPayload))) as JudgeAccessTokenPayload;
+  if (
+    payload.version !== 1 ||
+    payload.purpose !== 'judge_access' ||
+    !payload.sessionId ||
+    !payload.credentialRevision ||
+    !Number.isFinite(payload.issuedAt) ||
+    !Number.isFinite(payload.expiresAt)
+  ) {
+    throw new Error('Judge access session is invalid.');
+  }
+  return payload;
+}
+
 export async function signDemoSessionToken(payload: DemoSessionTokenPayload, secret: string): Promise<string> {
   const encodedPayload = bytesToBase64Url(encoder.encode(canonicalJson(payload)));
   const signature = await hmac(encodedPayload, secret);

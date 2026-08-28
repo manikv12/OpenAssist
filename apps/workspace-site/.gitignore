@@ -29,6 +29,7 @@ yarn-error.log*
 
 # local environment
 .env*
+.dev.vars
 
 # deployment and generated files
 .vercel

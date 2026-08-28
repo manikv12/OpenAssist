@@ -3,12 +3,12 @@ import { executeDemoRead } from '../../../../lib/demo-executor';
 import { loadDemoWorkspace, recordDemoRead } from '../../../../lib/demo-store';
 import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../lib/http';
 import { validateToolArguments } from '../../../../lib/input-validation';
-import { requireSignedInUser } from '../../../../lib/server-auth';
+import { requireDemoAccess } from '../../../../lib/server-auth';
 import { WORKSPACE_TOOL_MAP, isWorkspaceToolName } from '../../../../lib/tool-registry';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireSignedInUser();
+    await requireDemoAccess(request);
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request);

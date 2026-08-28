@@ -1,11 +1,11 @@
 import { attachDemoCookie, getOrCreateDemoSession } from '../../../../../../lib/demo-session';
 import { safeRoute } from '../../../../../../lib/http';
-import { requireSignedInUser } from '../../../../../../lib/server-auth';
+import { requireOwner } from '../../../../../../lib/server-auth';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function GET(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireSignedInUser();
+    await requireOwner();
     const session = await getOrCreateDemoSession(request);
     const response = await callVoiceGateway(
       request,

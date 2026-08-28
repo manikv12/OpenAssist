@@ -1,10 +1,10 @@
 import { json, safeRoute } from '../../../../../lib/http';
 import { getPublicJudgeVoicePolicy } from '../../../../../lib/judge-voice-policy';
-import { requireSignedInUser } from '../../../../../lib/server-auth';
+import { requireDemoAccess } from '../../../../../lib/server-auth';
 
-export async function GET(): Promise<Response> {
+export async function GET(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireSignedInUser();
+    await requireDemoAccess(request);
     return json(await getPublicJudgeVoicePolicy());
   });
 }
