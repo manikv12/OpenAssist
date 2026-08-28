@@ -1904,7 +1904,7 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">Owner only</p>
           <h2 className="mt-1 text-xl font-semibold">Judge voice controls</h2>
-          <p className="mt-1 max-w-2xl text-sm leading-6 text-[#7c8a9c]">Fund the quick demo, set app limits, or let judges use their own private ChatGPT sign-in.</p>
+          <p className="mt-1 max-w-2xl text-sm leading-6 text-[#7c8a9c]">Fund the judge demo with your protected API key, set strict limits, and monitor usage.</p>
         </div>
         <button type="button" onClick={() => void load()} disabled={loading || saving} className="rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white disabled:opacity-50">Refresh</button>
       </div>
@@ -1944,7 +1944,7 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
                 {[
                   ['Today', usage.todaySessions],
                   ['Funded', usage.fundedToday],
-                  ['My ChatGPT', usage.subscriptionToday],
+                  ['Owner ChatGPT', usage.subscriptionToday],
                   ['Active', usage.activeSessions],
                   ['Failures', usage.failures],
                   ['Minutes', usage.totalMinutes],
