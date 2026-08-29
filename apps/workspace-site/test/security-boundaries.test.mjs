@@ -57,6 +57,14 @@ test('OAuth uses PKCE, state, a short lifetime, and the exact callback URL', asy
   assert.match(callback, /600_000/);
 });
 
+test('safe attachment failures stay actionable without exposing private content', async () => {
+  const http = await read('lib/http.ts');
+  assert.match(http, /The selected attachment/);
+  assert.match(http, /Gmail did not return attachment data/);
+  assert.match(http, /The request could not be completed/);
+  assert.doesNotMatch(http, /subject|snippet|messageId|attachmentRef/);
+});
+
 test('rotating Workspace refresh tokens are serialized across concurrent Site requests', async () => {
   const schema = await read('db/schema.ts');
   const database = await read('lib/site-db.ts');
