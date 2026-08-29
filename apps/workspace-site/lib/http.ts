@@ -41,7 +41,7 @@ export async function safeRoute<T>(work: () => Promise<T | Response>): Promise<R
     const message = error instanceof Response
       ? await error.clone().text().catch(() => 'Request failed.')
       : error instanceof Error ? error.message : 'Request failed.';
-    const safe = /^(Invalid tool input:|Workspace is not connected|Workspace must be reconnected|Workspace authorization expired|No connected Google account|Owner access|ChatGPT sign-in|Judge |An owner is already bound|Approval preview|Demo session|The demo|The capped demo|The funded judge|The judge|This demo|At least one demo|This tool|Google Tasks list|Voice is)/.test(message)
+    const safe = /^(Invalid tool input:|Workspace is not connected|Workspace must be reconnected|Workspace authorization expired|Workspace refresh|No connected Google account|Owner access|ChatGPT sign-in|Judge |An owner is already bound|Approval preview|Demo session|The demo|The capped demo|The funded judge|The judge|This demo|At least one demo|This tool|Google Tasks list|Voice is)/.test(message)
       ? message
       : 'The request could not be completed.';
     return json({ error: safe }, { status });

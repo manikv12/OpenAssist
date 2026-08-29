@@ -18,7 +18,7 @@ assert.doesNotMatch(server, /session\.model/);
 assert.doesNotMatch(server, /thread\/realtime\/start[\s\S]{0,500}\bmodel\s*:/);
 assert.match(dockerfile, /ARG CODEX_VERSION=0\.150\.1/);
 assert.equal(packageJson.dependencies.ws, '8.21.0');
-assert.equal(toolNames.length, 23);
+assert.equal(toolNames.length, 29);
 assert.ok(realtimeVoices.some((voice) => voice.id === 'marin'));
 assert.ok(realtimeVoices.some((voice) => voice.id === 'cedar'));
 

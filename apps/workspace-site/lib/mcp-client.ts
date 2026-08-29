@@ -1,6 +1,11 @@
 import { env } from 'cloudflare:workers';
 import { decryptSecret, encryptSecret } from './security';
-import { getWorkspaceLink, saveWorkspaceLink } from './site-db';
+import {
+  acquireWorkspaceRefreshLease,
+  getWorkspaceLink,
+  releaseWorkspaceRefreshLease,
+  saveWorkspaceLink,
+} from './site-db';
 import { requiredSecret } from './server-auth';
 import type { WorkspaceToolName } from './tool-registry';
 
@@ -57,7 +62,9 @@ async function refreshWorkspaceToken(userId: string, encryptedRefreshToken: stri
     scope?: string;
     error_description?: string;
   };
-  if (!response.ok || !token.access_token) throw new Error(token.error_description ?? 'Workspace must be reconnected.');
+  if (!response.ok || !token.access_token) {
+    throw new Error('Workspace must be reconnected. The saved connection could not be renewed.');
+  }
   const secret = requiredSecret('TOKEN_ENCRYPTION_KEY');
   await saveWorkspaceLink(userId, {
     accessTokenCiphertext: await encryptSecret(token.access_token, secret),
@@ -69,13 +76,45 @@ async function refreshWorkspaceToken(userId: string, encryptedRefreshToken: stri
 }
 
 export async function workspaceAccessToken(userId: string): Promise<string> {
-  const link = await getWorkspaceLink(userId);
+  let link = await getWorkspaceLink(userId);
   if (!link) throw new Error('Workspace is not connected.');
-  if (link.expiresAt && link.expiresAt < Date.now() + 60_000) {
-    if (!link.refreshTokenCiphertext) throw new Error('Workspace must be reconnected.');
-    return refreshWorkspaceToken(userId, link.refreshTokenCiphertext);
+  if (!link.expiresAt || link.expiresAt >= Date.now() + 60_000) {
+    return decryptSecret(link.accessTokenCiphertext, requiredSecret('TOKEN_ENCRYPTION_KEY'));
   }
-  return decryptSecret(link.accessTokenCiphertext, requiredSecret('TOKEN_ENCRYPTION_KEY'));
+
+  // OAuth refresh tokens rotate. A database-backed lease keeps concurrent Site
+  // requests from refreshing the same token and then saving responses out of
+  // order. Waiters reuse the newly saved token instead of starting another
+  // refresh. The lease expires automatically if a request is interrupted.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const leaseId = await acquireWorkspaceRefreshLease(userId);
+    if (leaseId) {
+      try {
+        link = await getWorkspaceLink(userId);
+        if (!link) throw new Error('Workspace is not connected.');
+        if (!link.expiresAt || link.expiresAt >= Date.now() + 60_000) {
+          return decryptSecret(link.accessTokenCiphertext, requiredSecret('TOKEN_ENCRYPTION_KEY'));
+        }
+        if (!link.refreshTokenCiphertext) throw new Error('Workspace must be reconnected.');
+        return await refreshWorkspaceToken(userId, link.refreshTokenCiphertext);
+      } finally {
+        await releaseWorkspaceRefreshLease(userId, leaseId);
+      }
+    }
+
+    const observedRevision = link.revision;
+    for (let poll = 0; poll < 20; poll += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const refreshed = await getWorkspaceLink(userId);
+      if (!refreshed) throw new Error('Workspace is not connected.');
+      if (refreshed.revision > observedRevision && (!refreshed.expiresAt || refreshed.expiresAt >= Date.now() + 60_000)) {
+        return decryptSecret(refreshed.accessTokenCiphertext, requiredSecret('TOKEN_ENCRYPTION_KEY'));
+      }
+      link = refreshed;
+    }
+  }
+
+  throw new Error('Workspace refresh is still in progress. Try again.');
 }
 
 export async function callWorkspaceMcp(accessToken: string, toolName: string, args: JsonObject): Promise<unknown> {

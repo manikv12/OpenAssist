@@ -57,6 +57,21 @@ test('OAuth uses PKCE, state, a short lifetime, and the exact callback URL', asy
   assert.match(callback, /600_000/);
 });
 
+test('rotating Workspace refresh tokens are serialized across concurrent Site requests', async () => {
+  const schema = await read('db/schema.ts');
+  const database = await read('lib/site-db.ts');
+  const client = await read('lib/mcp-client.ts');
+  const app = await read('app/components/workspace-app.tsx');
+
+  assert.match(schema, /workspace_refresh_locks/);
+  assert.match(database, /INSERT OR IGNORE INTO workspace_refresh_locks/);
+  assert.match(database, /lease_id = \?/);
+  assert.match(client, /acquireWorkspaceRefreshLease/);
+  assert.match(client, /finally \{[\s\S]*releaseWorkspaceRefreshLease/);
+  assert.match(client, /refreshed\.revision > observedRevision/);
+  assert.doesNotMatch(app, /Promise\.all\(\[\s*live\.accounts \?\? invokeTool\('workspace_list_accounts'/);
+});
+
 test('approved writes are exact, short-lived, idempotent, and never silently retried', async () => {
   const propose = await read('app/api/actions/propose/route.ts');
   const execute = await read('app/api/actions/execute/route.ts');

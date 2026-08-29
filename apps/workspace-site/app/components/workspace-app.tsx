@@ -565,10 +565,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         activity: ['workspace_list_accounts', {}],
       };
       const [toolName, args] = requestForView[view];
-      void Promise.all([
-        live.accounts ?? invokeTool('workspace_list_accounts', {}, controller.signal),
-        invokeTool(toolName, args, controller.signal),
-      ]).then(([accountsResult, viewResult]) => {
+      void (async () => {
+        const accountsResult = live.accounts ?? await invokeTool('workspace_list_accounts', {}, controller.signal);
+        const viewResult = toolName === 'workspace_list_accounts'
+          ? accountsResult
+          : await invokeTool(toolName, args, controller.signal);
+        return [accountsResult, viewResult] as const;
+      })().then(([accountsResult, viewResult]) => {
         setLive((current) => ({
           loading: false,
           error: null,

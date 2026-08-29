@@ -81,6 +81,23 @@ export async function saveWorkspaceLink(userId: string, input: Omit<WorkspaceLin
   ).run();
 }
 
+export async function acquireWorkspaceRefreshLease(userId: string, lifetimeMs = 15_000): Promise<string | null> {
+  const now = Date.now();
+  const leaseId = crypto.randomUUID();
+  await database().prepare('DELETE FROM workspace_refresh_locks WHERE expires_at <= ?').bind(now).run();
+  const result = await database().prepare(
+    `INSERT OR IGNORE INTO workspace_refresh_locks (user_id, lease_id, expires_at)
+     VALUES (?, ?, ?)`,
+  ).bind(userId, leaseId, now + lifetimeMs).run();
+  return Number(result.meta.changes ?? 0) === 1 ? leaseId : null;
+}
+
+export async function releaseWorkspaceRefreshLease(userId: string, leaseId: string): Promise<void> {
+  await database().prepare(
+    'DELETE FROM workspace_refresh_locks WHERE user_id = ? AND lease_id = ?',
+  ).bind(userId, leaseId).run();
+}
+
 export async function claimIdempotency(hash: string, userId: string, toolName: string): Promise<boolean> {
   const now = Date.now();
   await database().prepare('DELETE FROM action_receipts WHERE expires_at < ?').bind(now).run();

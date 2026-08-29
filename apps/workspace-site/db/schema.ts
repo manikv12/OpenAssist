@@ -20,6 +20,15 @@ export const workspaceLinks = sqliteTable('workspace_links', {
   updatedAt: integer('updated_at').notNull(),
 });
 
+// Short-lived coordination only. This prevents two Site requests from rotating
+// the same OAuth refresh token at the same time. It never stores Google data or
+// token material, and the lease owner is an opaque random UUID.
+export const workspaceRefreshLocks = sqliteTable('workspace_refresh_locks', {
+  userId: text('user_id').primaryKey(),
+  leaseId: text('lease_id').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+});
+
 export const sitePreferences = sqliteTable('site_preferences', {
   userId: text('user_id').primaryKey(),
   defaultView: text('default_view').notNull().default('today'),
