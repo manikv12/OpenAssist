@@ -126,7 +126,11 @@ export const WORKSPACE_TOOLS: readonly WorkspaceToolDefinition[] = [
       {
         account,
         messageId: id('Gmail message identifier.'),
-        attachmentId: id('Attachment identifier from message metadata.'),
+        attachmentId: string(
+          'Opaque attachment reference from message metadata.',
+          undefined,
+          4_096,
+        ),
         filename: string('Attachment filename.'),
       },
       ['account', 'messageId', 'attachmentId'],

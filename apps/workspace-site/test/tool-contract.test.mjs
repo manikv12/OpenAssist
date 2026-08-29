@@ -28,6 +28,30 @@ test('WebMCP annotations and visible approval previews are always registered', a
   assert.match(component, /Voice confirmation cannot approve it/);
 });
 
+test('mail attachment tools accept the opaque references returned by message reads', async () => {
+  const registry = await text('lib/tool-registry.ts');
+  const attachmentTool = registry.slice(
+    registry.indexOf("name: 'workspace_read_mail_attachment'"),
+    registry.indexOf("name: 'workspace_set_mail_read_state'"),
+  );
+
+  assert.match(attachmentTool, /Opaque attachment reference from message metadata/);
+  assert.match(attachmentTool, /4_096/);
+  assert.doesNotMatch(attachmentTool, /attachmentId: id\(/);
+});
+
+test('calendar reads use the saved calendar-default account when none is supplied', async () => {
+  const client = await text('lib/mcp-client.ts');
+  const calendarRead = client.slice(
+    client.indexOf("if (name === 'workspace_list_calendar')"),
+    client.indexOf("if (name === 'workspace_create_calendar_event')"),
+  );
+
+  assert.match(calendarRead, /resolveAccount\(accessToken, args\.account, 'calendar'\)/);
+  assert.match(calendarRead, /accounts: \[account\]/);
+  assert.doesNotMatch(calendarRead, /args\.account \? \[args\.account\]/);
+});
+
 test('demo and owner Live mode remain separate', async () => {
   const component = await text('app/components/workspace-app.tsx');
   assert.match(component, /modeRef\.current === 'demo'/);

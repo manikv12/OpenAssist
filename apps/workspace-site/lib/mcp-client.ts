@@ -375,8 +375,9 @@ export async function executeLiveWorkspaceTool(
   if (name === 'workspace_delete_task') return callWorkspaceMcp(accessToken, 'delete_google_task', args);
 
   if (name === 'workspace_list_calendar') {
+    const account = await resolveAccount(accessToken, args.account, 'calendar');
     return callWorkspaceMcp(accessToken, 'list_google_calendar_events', withDefined({
-      accounts: args.account ? [args.account] : undefined,
+      accounts: [account],
       calendarId: 'primary',
       timeMin: args.timeMin,
       timeMax: args.timeMax,

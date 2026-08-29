@@ -121,8 +121,8 @@
         },
         "attachmentId": {
           "type": "string",
-          "description": "Attachment identifier from message metadata.",
-          "maxLength": 180
+          "description": "Opaque attachment reference from message metadata.",
+          "maxLength": 4096
         },
         "filename": {
           "type": "string",
