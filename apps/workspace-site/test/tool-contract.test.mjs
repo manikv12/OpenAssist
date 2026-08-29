@@ -9,12 +9,12 @@ async function text(relativePath) {
   return readFile(path.join(root, relativePath), 'utf8');
 }
 
-test('the website registers the complete 23-tool Workspace contract', async () => {
+test('the website registers the complete 29-tool Workspace contract', async () => {
   const contract = JSON.parse(await text('test/tool-names.json'));
   const registry = await text('lib/tool-registry.ts');
   const registered = [...registry.matchAll(/name: '(workspace_[a-z_]+)'/g)].map((match) => match[1]);
 
-  assert.equal(contract.length, 23);
+  assert.equal(contract.length, 29);
   assert.deepEqual(registered, contract);
   assert.equal(new Set(contract).size, contract.length);
 });
@@ -43,4 +43,19 @@ test('demo and owner Live mode remain separate', async () => {
   assert.match(component, /ItemEditor/);
   assert.match(component, /workspace_create_task/);
   assert.match(component, /workspace_save_note/);
+  assert.match(component, /workspace_search_supplies/);
+  assert.match(component, /workspace_update_supply_cart/);
+});
+
+test('Shopify results render real images and show the two separate demo paths', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  const demoData = await text('lib/demo-data.ts');
+  const storefront = await text('lib/shopify-storefront.ts');
+
+  assert.match(component, /Demo video · fixed story/);
+  assert.match(component, /Judge test · free sandbox/);
+  assert.match(component, /product\.imageUrl/);
+  assert.match(component, /alt=\{`\$\{product\.title\} product`\}/);
+  assert.equal([...demoData.matchAll(/imageUrl: '\/catalog\/[a-z0-9-]+\.webp'/g)].length, 6);
+  assert.match(storefront, /imageUrl: textValue\(image\.url \?\? image\.src\) \|\| curated\?\.imageUrl/);
 });

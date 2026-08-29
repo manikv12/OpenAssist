@@ -168,3 +168,10 @@ export const demoActivity = sqliteTable('demo_activity', {
   primaryKey({ columns: [table.workspaceId, table.activityId] }),
   index('demo_activity_workspace_created_idx').on(table.workspaceId, table.createdAt),
 ]);
+
+// Pointer only: Shopify remains the source of truth for cart contents.
+export const demoSupplyCarts = sqliteTable('demo_supply_carts', {
+  workspaceId: text('workspace_id').primaryKey().references(() => demoWorkspaces.workspaceId, { onDelete: 'cascade' }),
+  cartId: text('cart_id'),
+  updatedAt: integer('updated_at').notNull(),
+});

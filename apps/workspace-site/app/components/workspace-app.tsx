@@ -17,8 +17,12 @@ import {
   DEMO_MEMORY,
   DEMO_NOTES,
   DEMO_TASKS,
+  DEMO_SUPPLIES,
+  EMPTY_DEMO_SUPPLY_CART,
   type DemoAccount,
   type DemoWorkspaceState,
+  type DemoSupplyCart,
+  type DemoSupplyProduct,
   type WorkspaceView,
 } from '../../lib/demo-data';
 import {
@@ -121,6 +125,7 @@ const NAVIGATION: { view: WorkspaceView; label: string; key: string }[] = [
   { view: 'inbox', label: 'Inbox', key: 'I' },
   { view: 'tasks', label: 'Tasks', key: 'K' },
   { view: 'calendar', label: 'Calendar', key: 'C' },
+  { view: 'supplies', label: 'Supplies', key: 'S' },
   { view: 'notes', label: 'Notes', key: 'N' },
   { view: 'memory', label: 'Memory', key: 'M' },
   { view: 'accounts', label: 'Accounts', key: 'A' },
@@ -132,6 +137,7 @@ const VIEW_COPY: Record<WorkspaceView, { eyebrow: string; title: string; subtitl
   inbox: { eyebrow: 'Three demo accounts', title: 'Inbox', subtitle: 'Search every connected account without mixing identities.' },
   tasks: { eyebrow: 'My Tasks · Upcoming · Backlog', title: 'Tasks', subtitle: 'Clear next actions with short notes and useful tags.' },
   calendar: { eyebrow: 'Agenda and week', title: 'Calendar', subtitle: 'Exact local times, account context, and visible reminders.' },
+  supplies: { eyebrow: 'Shopify · Synthetic store', title: 'Supplies', subtitle: 'Let the agent search a real dev-store catalog and prepare a cart—never checkout.' },
   notes: { eyebrow: 'Google Drive', title: 'Notes', subtitle: 'Long reference material lives here, not inside task details.' },
   memory: { eyebrow: 'Private Drive memory', title: 'Memory', subtitle: 'Only durable, user-approved facts—never raw email text.' },
   accounts: { eyebrow: 'Routing and defaults', title: 'Accounts', subtitle: 'Friendly labels tell agents where new work belongs.' },
@@ -252,13 +258,15 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const router = useRouter();
   const ownerAccess = user?.access === 'owner';
   const mode: Mode = ownerAccess ? 'live' : 'demo';
+  const visibleNavigation = useMemo(() => ownerAccess ? NAVIGATION.filter((item) => item.view !== 'supplies') : NAVIGATION, [ownerAccess]);
+  const webMcpTools = useMemo(() => ownerAccess ? WORKSPACE_TOOLS.filter((tool) => !tool.demoOnly) : WORKSPACE_TOOLS, [ownerAccess]);
   const [view, setView] = useState<WorkspaceView>('today');
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>('mail-security-review');
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [toast, setToast] = useState(() => ownerAccess
     ? 'Private Live Workspace ready.'
-    : 'Judge Demo ready · 23 WebMCP tools available.');
+    : `Judge Demo ready · ${WORKSPACE_TOOLS.length} WebMCP tools available.`);
   const [voiceStatus, setVoiceStatus] = useState('Ready to check compatibility');
   const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
   const [activeVoice, setActiveVoice] = useState<RealtimeVoice | null>(null);
@@ -291,6 +299,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [notes, setNotes] = useState(DEMO_NOTES);
   const [memory, setMemory] = useState(DEMO_MEMORY);
   const [activity, setActivity] = useState(DEMO_ACTIVITY);
+  const [supplies, setSupplies] = useState<DemoSupplyProduct[]>(DEMO_SUPPLIES);
+  const [supplyCart, setSupplyCart] = useState<DemoSupplyCart>(EMPTY_DEMO_SUPPLY_CART);
   const [live, setLive] = useState<LiveState>({ loading: false, data: {}, accounts: null, error: null, warning: null });
   const [liveRefreshKey, setLiveRefreshKey] = useState(0);
   const liveRef = useRef(live);
@@ -377,6 +387,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setNotes(workspace.notes);
     setMemory(workspace.memory);
     setActivity(workspace.activity);
+    setSupplies(workspace.supplies);
+    setSupplyCart(workspace.supplyCart);
     if (expiresAt) setDemoExpiresAt(expiresAt);
     setDemoLoading(false);
   }, []);
@@ -439,6 +451,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const invokeTool = useCallback(async (name: WorkspaceToolName, args: Record<string, unknown> = {}, signal?: AbortSignal) => {
     const tool = WORKSPACE_TOOL_MAP.get(name);
     if (!tool) throw new Error(`Unknown workspace tool: ${name}`);
+    if (tool.demoOnly && modeRef.current !== 'demo') throw new Error('This Shopify showcase tool is available only in the isolated judge demo.');
 
     if (name === 'workspace_focus_view') {
       const nextView = String(args.view ?? 'today') as WorkspaceView;
@@ -479,6 +492,9 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       if (name === 'workspace_find_tasks') {
         const first = liveRows('tasks', body.result)[0];
         if (first) lastFocusedItemRef.current.tasks = liveItemId(first, 'task-result-1');
+      }
+      if (name === 'workspace_search_supplies' && body.result && typeof body.result === 'object' && 'products' in body.result && Array.isArray(body.result.products)) {
+        setSupplies(body.result.products as DemoSupplyProduct[]);
       }
       setToast(`${tool.title} completed with synthetic data.`);
       return body.result;
@@ -542,6 +558,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         inbox: ['workspace_get_daily_brief', { date: localDateString(now, timeZone), timeZone }],
         tasks: ['workspace_find_tasks', { status: 'all' }],
         calendar: ['workspace_list_calendar', { timeMin: now.toISOString(), timeMax: weekLater.toISOString() }],
+        supplies: ['workspace_list_accounts', {}],
         notes: ['workspace_list_notes', {}],
         memory: ['workspace_get_memory', {}],
         accounts: ['workspace_list_accounts', {}],
@@ -585,8 +602,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       return () => window.clearTimeout(timeout);
     }
 
-    const controllers = WORKSPACE_TOOLS.map(() => new AbortController());
-    Promise.all(WORKSPACE_TOOLS.map((tool, index) => document.modelContext!.registerTool({
+    const controllers = webMcpTools.map(() => new AbortController());
+    Promise.all(webMcpTools.map((tool, index) => document.modelContext!.registerTool({
       name: tool.name,
       title: tool.title,
       description: tool.description,
@@ -594,7 +611,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       annotations: { readOnlyHint: tool.readOnly, untrustedContentHint: tool.untrustedContent },
       execute: (input, options) => invokeTool(tool.name, input, options.signal),
     }, { signal: controllers[index].signal })))
-      .then(() => setToast(`${WORKSPACE_TOOLS.length} WebMCP tools registered in this tab.`))
+      .then(() => setToast(`${webMcpTools.length} WebMCP tools registered in this tab.`))
       .catch((error: unknown) => setToast(error instanceof Error ? error.message : 'WebMCP registration failed.'));
 
     const siteToolHandler = (event: Event) => {
@@ -608,7 +625,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       controllers.forEach((controller) => controller.abort());
       window.removeEventListener('openassist:use-site-tool', siteToolHandler);
     };
-  }, [invokeTool]);
+  }, [invokeTool, webMcpTools]);
 
   const approve = useCallback(async (confirmationMethod: 'tap' | 'voice' = 'tap', expectedPreviewId?: string): Promise<Record<string, unknown>> => {
     const action = pendingRef.current;
@@ -638,6 +655,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       if (action.tool.includes('calendar')) focusView('calendar', typeof body.result === 'object' && body.result && 'itemId' in body.result ? String(body.result.itemId) : undefined);
       if (action.tool.includes('note')) focusView('notes', typeof body.result === 'object' && body.result && 'itemId' in body.result ? String(body.result.itemId) : undefined);
       if (action.tool.includes('memory') || action.tool.includes('fact')) focusView('memory');
+      if (action.tool.includes('supply_cart')) focusView('supplies', typeof body.result === 'object' && body.result && 'itemId' in body.result ? String(body.result.itemId) : undefined);
       return (body.result && typeof body.result === 'object' ? body.result : { status: 'completed', verified: true, mode: 'synthetic_demo' }) as Record<string, unknown>;
     }
 
@@ -1132,7 +1150,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_38%_-14%,rgba(224,188,99,0.07),transparent_34%),radial-gradient(circle_at_88%_8%,rgba(224,188,99,0.035),transparent_24%),#08090d] text-[#e8eef7]">
       <div className="mx-auto grid min-h-screen w-full max-w-[1800px] grid-cols-[238px_minmax(0,1fr)_minmax(300px,340px)] max-xl:grid-cols-[84px_minmax(0,1fr)] max-md:grid-cols-1">
-        <Sidebar view={view} user={user} onView={focusView} onSignOut={() => void signOut()} />
+        <Sidebar view={view} user={user} items={visibleNavigation} onView={focusView} onSignOut={() => void signOut()} />
         <section id={`view-${view}`} className="min-w-0 pb-[calc(88px+env(safe-area-inset-bottom))] md:pb-10">
           <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] px-5 py-3.5 md:hidden">
             <div className="flex min-w-0 items-center gap-2.5">
@@ -1178,6 +1196,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
               {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
               {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); const task = tasks.find((candidate) => candidate.id === id); if (task) setOpenLiveItem({ id, view: 'tasks', item: { ...task, _kind: 'Demo task' } }); }} onCreate={() => setEditor('task')} />}
               {view === 'calendar' && <CalendarView events={events} selectedId={selectedId} onSelect={setSelectedId} onCreate={() => void invokeTool('workspace_create_calendar_event', { account: 'Main', summary: 'WebMCP demo review', start: '2026-08-28T11:00:00-05:00', end: '2026-08-28T11:30:00-05:00', timeZone: 'America/Chicago', reminderMinutes: [10] })} />}
+              {view === 'supplies' && <SuppliesView products={supplies} cart={supplyCart} selectedId={selectedId} onSelect={setSelectedId} onSearch={(query) => void invokeTool('workspace_search_supplies', { query, limit: 12 })} onAdd={(product) => void invokeTool('workspace_update_supply_cart', { productId: product.id, variantId: product.variantId, title: product.title, quantity: 1 })} onClear={() => void invokeTool('workspace_clear_supply_cart', {})} />}
               {view === 'notes' && <NotesView mode={mode} notes={notes} onCreate={() => setEditor('note')} onOpen={openDemoNote} />}
               {view === 'memory' && <MemoryView mode={mode} memory={memory} onRemember={() => void invokeTool('workspace_remember_fact', { category: 'Preferences', fact: 'Use the Main account for personal reminders.' })} />}
               {view === 'accounts' && <AccountsView mode={mode} accounts={accounts} />}
@@ -1193,7 +1212,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
       {openNote && <NoteReader note={openNote} onClose={() => setOpenNote(null)} />}
       {openLiveItem && <LiveItemReader value={openLiveItem} onClose={() => setOpenLiveItem(null)} />}
-      <MobileNavigation view={view} onView={focusView} />
+      <MobileNavigation view={view} items={visibleNavigation} onView={focusView} />
     </main>
   );
 }
@@ -1203,6 +1222,7 @@ const VIEW_ICONS: Record<WorkspaceView, React.ReactNode> = {
   inbox: <path d="M3 12h4l2 3h6l2-3h4M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" />,
   tasks: <path d="m4 12 3.5 3.5L20 6M4 19h10" />,
   calendar: <path d="M8 3v3m8-3v3M4 10h16M5 6h14a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z" />,
+  supplies: <><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5Z" /><path d="m4 7.5 8 4.5 8-4.5M12 12v9" /></>,
   notes: <path d="M8 4h8l4 4v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm7 0v5h5M8 13h8M8 17h5" />,
   memory: <path d="M12 3a4 4 0 0 0-4 4v1a3 3 0 0 0 0 6v2a4 4 0 0 0 8 0v-2a3 3 0 0 0 0-6V7a4 4 0 0 0-4-4Zm0 0v18" />,
   accounts: <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-8 8a8 8 0 0 1 16 0" />,
@@ -1217,10 +1237,10 @@ function ViewIcon({ view, className = 'h-[18px] w-[18px]' }: { view: WorkspaceVi
   );
 }
 
-function MobileNavigation({ view, onView }: { view: WorkspaceView; onView: (view: WorkspaceView) => void }) {
+function MobileNavigation({ view, items, onView }: { view: WorkspaceView; items: typeof NAVIGATION; onView: (view: WorkspaceView) => void }) {
   const [moreOpen, setMoreOpen] = useState(false);
-  const primary = NAVIGATION.slice(0, 4);
-  const overflow = NAVIGATION.slice(4);
+  const primary = items.slice(0, 4);
+  const overflow = items.slice(4);
   const overflowActive = overflow.some((item) => item.view === view);
 
   return (
@@ -1264,9 +1284,9 @@ function MobileNavigation({ view, onView }: { view: WorkspaceView; onView: (view
   );
 }
 
-function Sidebar({ view, user, onView, onSignOut }: { view: WorkspaceView; user: SiteUser; onView: (view: WorkspaceView) => void; onSignOut: () => void }) {
+function Sidebar({ view, user, items, onView, onSignOut }: { view: WorkspaceView; user: SiteUser; items: typeof NAVIGATION; onView: (view: WorkspaceView) => void; onSignOut: () => void }) {
   const owner = user?.access === 'owner';
-  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{NAVIGATION.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Access</p><span className="mt-3 inline-flex rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#E0BC63]">{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-[#E0BC63] transition hover:text-[#F2D783]">Sign out</button></div></aside>;
+  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Access</p><span className="mt-3 inline-flex rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#E0BC63]">{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-[#E0BC63] transition hover:text-[#F2D783]">Sign out</button></div></aside>;
 }
 
 function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, onRefresh }: { threads: VoiceThread[]; selectedId: string | null; loading: boolean; connected: boolean; onSelect: (threadId: string | null) => void; onRefresh: () => void }) {
@@ -1684,6 +1704,79 @@ function CalendarView({ events, selectedId, onSelect, onCreate }: { events: type
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="events" onPage={setPage} />
         </>
       ) : <EmptyState title="No events scheduled." hint="Your calendar is clear for this range." />}
+    </section>
+  );
+}
+
+function SuppliesView({ products, cart, selectedId, onSelect, onSearch, onAdd, onClear }: {
+  products: DemoSupplyProduct[];
+  cart: DemoSupplyCart;
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onSearch: (query: string) => void;
+  onAdd: (product: DemoSupplyProduct) => void;
+  onClear: () => void;
+}) {
+  const [query, setQuery] = useState('travel security supplies');
+  const count = cart.lines.reduce((sum, line) => sum + line.quantity, 0);
+  return (
+    <section className="min-w-0">
+      <div className="mb-6 overflow-hidden rounded-[24px] border border-[#E0BC63]/20 bg-[linear-gradient(120deg,rgba(224,188,99,0.10),rgba(123,92,196,0.08)_55%,rgba(255,255,255,0.02))] p-5 sm:p-6">
+        <div className="flex flex-wrap items-start justify-between gap-5">
+          <div className="max-w-2xl">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">Guided video story</p>
+            <h2 className="mt-2 text-xl font-semibold tracking-[-0.02em]">Prepare the Northstar Friday security kit</h2>
+            <p className="mt-2 text-sm leading-6 text-[#a4b1c2]">The agent connects an urgent email and open task to a real Shopify dev-store search, then prepares a synthetic cart only after approval.</p>
+          </div>
+          <div className="min-w-[180px] rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">Prepared cart</p>
+            <p className="mt-1 text-2xl font-semibold tabular-nums">{count}</p>
+            <p className="text-xs text-[#7c8a9c]">{count === 1 ? 'item' : 'items'} · {cart.currency} {cart.total.toFixed(2)}</p>
+          </div>
+        </div>
+        <div className="mt-5 grid gap-3 border-t border-white/[0.08] pt-5 md:grid-cols-2">
+          <div className="rounded-2xl border border-[#E0BC63]/20 bg-black/20 p-4">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">Demo video · fixed story</p>
+            <p className="mt-2 text-sm text-[#d7dde4]">Find the urgent security work, search for a USB-C Security Key, preview the cart change, approve it, and show the verified result.</p>
+          </div>
+          <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#9ba8ba]">Judge test · free sandbox</p>
+            <p className="mt-2 text-sm text-[#d7dde4]">Search any of the six products, prepare a separate cart, clear it, and reset the full workspace without touching another judge.</p>
+          </div>
+        </div>
+      </div>
+
+      <form onSubmit={(event) => { event.preventDefault(); onSearch(query); }} className="mb-6 flex gap-2 max-sm:flex-col">
+        <label className="min-w-0 flex-1"><span className="sr-only">Search Shopify supplies</span><input value={query} onChange={(event) => setQuery(event.target.value)} maxLength={300} className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm outline-none transition focus:border-[#E0BC63]/50" placeholder="Search the synthetic Shopify catalog" /></label>
+        <button type="submit" className="rounded-xl bg-[#E0BC63] px-5 py-3 text-sm font-semibold text-[#17130a] transition hover:bg-[#e8cb82]">Search store</button>
+      </form>
+
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-sm text-[#7c8a9c]">{products.length} Shopify {products.length === 1 ? 'result' : 'results'}</p>
+        <span className="rounded-full bg-[#FFC178]/10 px-3 py-1 text-[11px] text-[#FFC178]">Catalog text is untrusted</span>
+      </div>
+      {products.length ? <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1 2xl:grid-cols-3">
+        {products.map((product, index) => (
+          <article key={product.id} id={`workspace-item-${product.id}`} onClick={() => onSelect(product.id)} className={`group flex min-h-[230px] cursor-pointer flex-col overflow-hidden rounded-[20px] border bg-[#0d1016] transition duration-200 hover:-translate-y-0.5 hover:border-[#E0BC63]/45 hover:shadow-[0_18px_55px_rgba(0,0,0,0.28),0_0_0_1px_rgba(224,188,99,0.10)] ${selectedId === product.id ? 'border-[#E0BC63]/70 shadow-[0_0_0_1px_rgba(224,188,99,0.16),0_18px_55px_rgba(0,0,0,0.3)]' : 'border-white/[0.08]'}`}>
+            <div className={`relative h-40 overflow-hidden border-b border-white/[0.07] ${index % 2 ? 'bg-[radial-gradient(circle_at_78%_22%,rgba(224,188,99,0.32),transparent_28%),linear-gradient(130deg,rgba(224,188,99,0.12),rgba(79,70,130,0.22))]' : 'bg-[radial-gradient(circle_at_78%_22%,rgba(224,188,99,0.32),transparent_28%),linear-gradient(130deg,rgba(224,188,99,0.12),rgba(39,74,91,0.22))]'}`}>
+              {/* Shopify returns its own CDN URLs at runtime, so this intentionally stays an unoptimized remote image. */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              {product.imageUrl && <img src={product.imageUrl} alt={`${product.title} product`} loading="lazy" className="h-full w-full bg-[#d8d1c8] object-contain transition duration-300 group-hover:scale-[1.025]" />}
+              <span className="absolute left-3 top-3 inline-flex rounded-full border border-white/15 bg-[#080a0f]/75 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#f0d98f] backdrop-blur-md">{product.category}</span>
+            </div>
+            <div className="flex flex-1 flex-col p-4">
+              <div className="flex items-start justify-between gap-3"><h3 className="oa-clamp-2 font-medium leading-5">{product.title}</h3><span className="shrink-0 text-sm font-semibold text-[#E0BC63]">${product.price.toFixed(2)}</span></div>
+              <p className="mt-2 oa-clamp-3 text-sm leading-5 text-[#7c8a9c]">{product.description}</p>
+              <div className="mt-auto flex items-center justify-between gap-3 pt-4"><span className="text-[11px] text-[#5b6879]">{product.available ? 'Available in demo store' : 'Unavailable'}</span><button type="button" disabled={!product.available} onClick={(event) => { event.stopPropagation(); onAdd(product); }} className="rounded-lg border border-[#E0BC63]/30 bg-[#E0BC63]/[0.08] px-3 py-2 text-xs font-semibold text-[#FFE9AE] transition hover:border-[#E0BC63]/60 hover:bg-[#E0BC63]/[0.14] disabled:opacity-40">Prepare cart</button></div>
+            </div>
+          </article>
+        ))}
+      </div> : <EmptyState title="No supplies found." hint="Try a broader search, or reset the judge demo." />}
+
+      <div className="mt-7 rounded-[22px] border border-white/[0.08] bg-white/[0.025] p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="font-medium">Judge-isolated cart</p><p className="mt-1 text-xs text-[#7c8a9c]">Each judge gets a separate Shopify cart pointer. Checkout and payment tools are never exposed.</p></div>{cart.lines.length > 0 && <button onClick={onClear} className="rounded-xl border border-[#FF8B78]/25 px-3 py-2 text-xs text-[#FF9D8E] transition hover:border-[#FF8B78]/50">Clear cart</button>}</div>
+        {cart.lines.length ? <div className="mt-4 space-y-2">{cart.lines.map((line) => <div key={line.id} className="flex items-center justify-between gap-4 rounded-xl border border-white/[0.06] bg-black/15 px-4 py-3"><div className="min-w-0"><p className="truncate text-sm">{line.title}</p><p className="mt-0.5 text-xs text-[#7c8a9c]">Quantity {line.quantity}</p></div><p className="shrink-0 text-sm font-medium text-[#E0BC63]">{line.currency} {(line.price * line.quantity).toFixed(2)}</p></div>)}</div> : <p className="mt-4 text-sm text-[#7c8a9c]">Nothing prepared yet. Ask the agent to find a security key or travel kit.</p>}
+      </div>
     </section>
   );
 }

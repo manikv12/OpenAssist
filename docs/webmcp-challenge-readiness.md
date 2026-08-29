@@ -5,10 +5,10 @@ This file maps OpenAssist Daily Workspace to the [official Devpost rules](https:
 ## Judge path
 
 1. Open <https://openassist-daily-workspace.developingadventures.chatgpt.site/> in ChatGPT's in-app browser or Chrome 149+ with WebMCP enabled.
-2. Stay in **Demo** mode. No account, credential, API key, or Google connection is required.
-3. Ask the browser agent to get the daily brief, focus an urgent message, open a synthetic note or attachment, or propose a task.
+2. Sign in with the private judge username and access code provided in the submission. No API key or Google connection is required.
+3. Ask the browser agent to get the daily brief, focus an urgent message, open a synthetic note or attachment, search the live synthetic Shopify catalog, or prepare a cart.
 4. Read actions run immediately. A write opens a locked two-minute preview. Delete, trash, and forget always need an on-screen tap.
-5. Each visitor receives separate synthetic data that expires after 24 hours.
+5. Each judge receives separate synthetic data and a separate Shopify cart pointer that expire after 24 hours.
 
 The owner-only **Live** mode is not part of judge access and contains no judge credentials.
 
@@ -19,7 +19,7 @@ OpenAssist existed before the challenge. The Daily Workspace/WebMCP layer is a m
 | Commit | Date | New challenge work |
 | --- | --- | --- |
 | `a175cfa` | Aug 10 | Pre-challenge OpenAssist baseline |
-| `aff7044` | Aug 27 | Daily Workspace, 23 WebMCP tools, Sites app, and voice gateway |
+| `aff7044` | Aug 27 | Daily Workspace, initial WebMCP tools, Sites app, and voice gateway |
 | `a553ef3` | Aug 27 | Isolated, persistent, expiring synthetic judge workspaces |
 | `0816031` | Aug 27 | Secure subscription voice gateway |
 | `a699ff3` | Aug 27 | Voice-to-visible-Workspace tool bridge |
@@ -31,7 +31,7 @@ The implementation uses `document.modelContext.registerTool` directly in `apps/w
 
 ## Rule mapping
 
-- **Live URL:** public Site above, free and unrestricted for judges.
+- **Live URL:** hosted Site above, available to judges through private review credentials supplied with the submission.
 - **Public source and license:** <https://github.com/manikv12/OpenAssist>, MIT license.
 - **WebMCP source:** the public repository contains all tool definitions, schemas, annotations, executors, UI, and setup instructions.
 - **Existing-app extension:** the dated commit table clearly separates the earlier app from the post-start WebMCP work.
@@ -48,11 +48,11 @@ OpenAssist Daily Workspace is a visual daily organizer for mail attention, tasks
 
 ### How it improves the experience
 
-The agent can gather a daily brief, focus the exact card it is discussing, read synthetic attachments and notes, and prepare a task or event while the person stays oriented in the visible workspace. Every change is previewed before saving, and destructive actions need a screen tap.
+The agent can gather a daily brief, focus the exact card it is discussing, read synthetic attachments and notes, search a live synthetic Shopify catalog with product images, and prepare a task, event, or cart while the person stays oriented in the visible workspace. Every change is previewed before saving, and destructive actions need a screen tap.
 
 ### What people and agents do together
 
-People browse, search, inspect, approve, and organize. Agents can call 23 WebMCP tools for the same workspace. The same registry also powers the optional voice agent, so a spoken request highlights or updates the same visible interface.
+People browse, search, inspect, approve, and organize. Agents can call 29 WebMCP tools for the same workspace. The same registry also powers the optional voice agent, so a spoken request highlights or updates the same visible interface.
 
 ### How it was built
 

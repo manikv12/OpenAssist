@@ -30,7 +30,7 @@ test('voice has the same Workspace tool contract as the Site', async () => {
   assert.deepEqual(voiceManifest, sharedManifest);
   assert.deepEqual(voiceManifest, siteManifest);
   assert.deepEqual(voiceManifest.map((tool) => tool.name), voice);
-  assert.equal(voice.length, 23);
+  assert.equal(voice.length, 29);
 });
 
 test('subscription containers remove API-key variables and force ChatGPT sign-in', async () => {

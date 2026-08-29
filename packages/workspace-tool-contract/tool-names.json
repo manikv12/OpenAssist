@@ -21,5 +21,11 @@
   "workspace_remember_fact",
   "workspace_update_memory",
   "workspace_forget_fact",
+  "workspace_search_supplies",
+  "workspace_get_supply_product",
+  "workspace_search_store_policies",
+  "workspace_get_supply_cart",
+  "workspace_update_supply_cart",
+  "workspace_clear_supply_cart",
   "workspace_focus_view"
 ]

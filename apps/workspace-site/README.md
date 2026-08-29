@@ -8,6 +8,7 @@ This ChatGPT Site provides a polished WebMCP dashboard for the existing OpenAssi
 - **Judge access** uses a shared username and strong access code supplied privately with the submission. It creates an expiring, signed, HttpOnly session.
 - Failed judge logins are limited to five attempts per 15-minute window. Only a one-way request fingerprint and short-lived counter are stored.
 - **Demo mode** gives every judge a separate synthetic workspace in Cloudflare D1. Judges can create and update demo tasks, calendar events, notes, and memory without touching Google.
+- Demo mode also exposes a live synthetic Shopify dev-store catalog. Each judge gets a separate cart pointer; checkout, payment, and order tools do not exist.
 - Judges can use only **Funded judge demo** voice. They never enter or see an API key and cannot access ChatGPT subscription voice, owner controls, or Live Workspace.
 - **Owner access** uses the exact ChatGPT account bound to the Site. The owner can switch between Demo and Live, manage the funded key, and monitor safe usage metadata.
 - The project-funded key stays encrypted in the voice gateway R2 bucket.
@@ -69,6 +70,11 @@ In owner **Live mode**, open **Activity → Judge Voice** to:
 - monitor anonymous starts, active sessions, failures, minutes, and tool-call counts.
 
 The key is verified server-side, encrypted with AES-GCM, and stored only in the private voice R2 bucket. It is never returned to the Site or a judge. Monitoring stores only one-way visitor hashes and session metadata—never audio, transcripts, prompts, tool arguments, or Workspace content.
+
+## Two challenge scenarios
+
+- **Video:** one fixed story connects the urgent Northstar security item to a Shopify search for a USB-C Security Key, then shows the exact approval and verified cart result.
+- **Judge test:** an isolated sandbox lets each judge search any of six imaged products, prepare and clear their own cart, and reset the workspace.
 
 ## Challenge links
 

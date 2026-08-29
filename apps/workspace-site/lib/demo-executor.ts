@@ -1,4 +1,5 @@
-import { loadDemoWorkspace } from './demo-store';
+import { getDemoSupplyCartId, loadDemoWorkspace } from './demo-store';
+import { getShopifySupplyCart, getShopifySupplyProduct, searchShopifyPolicies, searchShopifySupplies } from './shopify-storefront';
 import type { WorkspaceToolName } from './tool-registry';
 
 type Arguments = Record<string, unknown>;
@@ -95,6 +96,14 @@ export async function executeDemoRead(
         facts: state.memory.filter((fact) => !query || `${fact.category} ${fact.fact}`.toLowerCase().includes(query)),
       };
     }
+    case 'workspace_search_supplies':
+      return { mode: 'demo', ...(await searchShopifySupplies(String(args.query ?? ''), Number(args.limit ?? 12))) };
+    case 'workspace_get_supply_product':
+      return { mode: 'demo', ...(await getShopifySupplyProduct(String(args.productId ?? ''))) };
+    case 'workspace_search_store_policies':
+      return { mode: 'demo', ...(await searchShopifyPolicies(String(args.query ?? ''))) };
+    case 'workspace_get_supply_cart':
+      return { mode: 'demo', warning: untrustedWarning, cart: await getShopifySupplyCart(await getDemoSupplyCartId(workspaceId)) };
     case 'workspace_focus_view':
       return { focused: args.view, itemId: args.itemId ?? null };
     default:

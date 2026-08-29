@@ -1,19 +1,29 @@
 # WebMCP Challenge Demo
 
-## What the judges should see
+## Scenario 1: fixed demo video
 
-The public URL opens in **Demo** mode with clearly labelled synthetic data. Each judge gets a separate temporary workspace, so no private Google content is present and one judge cannot change another judge's demo.
+Use one short, repeatable story for the public recording:
 
-1. Open the workspace in ChatGPT's in-app browser.
+1. Sign in with the private judge credentials and open the workspace in ChatGPT's in-app browser.
 2. Ask ChatGPT: “Show my daily brief and focus the most urgent unread message.”
 3. The site exposes its WebMCP tools, displays the brief, and highlights the complete urgent email card.
-4. Ask ChatGPT to read the attached synthetic claim document. The attachment appears as untrusted content and cannot trigger an action.
-5. Ask ChatGPT to create a demo task or note. The exact proposed change appears in a locked preview.
-6. Approve it on screen. The change is saved once, read back, highlighted, and recorded in Activity.
-7. Show that delete, trash, and forget still require a screen tap.
-8. If **Funded judge demo** is shown as available, speak a request and show the same WebMCP tool updating the visible synthetic workspace.
-9. Optionally select **My ChatGPT** to show isolated subscription sign-in and saved conversation resume. Voice is an enhancement; judges can test the complete WebMCP experience without it.
-10. Do not use owner-only Live mode in the public recording. It contains private data and is not required for judging.
+4. Ask: “Find a USB-C Security Key for the Northstar Friday security kit and prepare one in the cart.”
+5. Show the live Shopify result with its image and price. The exact cart change appears in a locked preview.
+6. Approve it on screen. The separate synthetic cart is updated once, read back, highlighted, and recorded in Activity.
+7. If **Funded judge demo** is available, repeat the request by voice and show voice calling the same visible WebMCP tools.
+8. Do not show checkout, payment, owner Live mode, or private Google data.
+
+## Scenario 2: judge test sandbox
+
+Each judge receives a separate temporary workspace and Shopify cart pointer. Judges can:
+
+- search any of the six synthetic Shopify products and receive matching product images;
+- inspect product details and store policies;
+- prepare or remove cart items through the same visible approval flow;
+- test mail, tasks, calendar, notes, memory, and view navigation tools; and
+- use **Reset demo** to return to a clean workspace.
+
+No judge can see or change another judge's data. Checkout, payment, and order tools are intentionally not registered.
 
 ## Recording rules
 

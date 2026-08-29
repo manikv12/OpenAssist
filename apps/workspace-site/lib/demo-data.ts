@@ -3,6 +3,7 @@ export type WorkspaceView =
   | 'inbox'
   | 'tasks'
   | 'calendar'
+  | 'supplies'
   | 'notes'
   | 'memory'
   | 'accounts'
@@ -68,6 +69,35 @@ export type DemoActivityItem = {
   type: 'read' | 'write';
 };
 
+export type DemoSupplyProduct = {
+  id: string;
+  variantId: string;
+  title: string;
+  description: string;
+  category: string;
+  price: number;
+  currency: string;
+  available: boolean;
+  imageUrl?: string;
+  productUrl?: string;
+};
+
+export type DemoSupplyCartLine = {
+  id: string;
+  variantId: string;
+  title: string;
+  quantity: number;
+  price: number;
+  currency: string;
+};
+
+export type DemoSupplyCart = {
+  id: string | null;
+  lines: DemoSupplyCartLine[];
+  total: number;
+  currency: string;
+};
+
 export type DemoWorkspaceState = {
   accounts: DemoAccount[];
   messages: DemoMessage[];
@@ -76,7 +106,23 @@ export type DemoWorkspaceState = {
   notes: DemoNote[];
   memory: DemoMemoryFact[];
   activity: DemoActivityItem[];
+  supplies: DemoSupplyProduct[];
+  supplyCart: DemoSupplyCart;
 };
+
+// A local, synthetic fallback keeps development and tests deterministic. The
+// deployed judge experience replaces this list with the real Shopify dev-store
+// catalog through Storefront UCP MCP.
+export const DEMO_SUPPLIES: DemoSupplyProduct[] = [
+  { id: 'supply-travel-kit', variantId: 'variant-travel-kit', title: 'Compact Travel Tech Kit', description: 'USB-C cable, compact charger, and cable organizer for the Friday trip.', category: 'Travel', price: 39, currency: 'USD', available: true, imageUrl: '/catalog/compact-travel-tech-kit.webp' },
+  { id: 'supply-security-key', variantId: 'variant-security-key', title: 'USB-C Security Key', description: 'A hardware security key for the Northstar access review.', category: 'Security', price: 29, currency: 'USD', available: true, imageUrl: '/catalog/usb-c-security-key.webp' },
+  { id: 'supply-desk-pad', variantId: 'variant-desk-pad', title: 'Recycled Felt Desk Pad', description: 'A calm, durable work surface made from recycled felt.', category: 'Workspace', price: 48, currency: 'USD', available: true, imageUrl: '/catalog/recycled-felt-desk-pad.webp' },
+  { id: 'supply-notebook', variantId: 'variant-notebook', title: 'Project Field Notebook', description: 'Numbered pages for meeting notes and launch checklists.', category: 'Workspace', price: 16, currency: 'USD', available: true, imageUrl: '/catalog/project-field-notebook.webp' },
+  { id: 'supply-bottle', variantId: 'variant-bottle', title: 'Insulated Travel Bottle', description: 'A leak-resistant bottle sized for carry-on bags.', category: 'Travel', price: 32, currency: 'USD', available: true, imageUrl: '/catalog/insulated-travel-bottle.webp' },
+  { id: 'supply-labels', variantId: 'variant-labels', title: 'Cable Label Set', description: 'Reusable labels for chargers, adapters, and demo equipment.', category: 'Organization', price: 12, currency: 'USD', available: true, imageUrl: '/catalog/cable-label-set.webp' },
+];
+
+export const EMPTY_DEMO_SUPPLY_CART: DemoSupplyCart = { id: null, lines: [], total: 0, currency: 'USD' };
 
 export const DEMO_ACCOUNTS: DemoAccount[] = [
   { id: 'demo-main', label: 'Main', email: 'alex@example.test', type: 'main' },

@@ -32,7 +32,7 @@ test('Live D1 tables contain pointers, preferences, encrypted tokens, and hashes
 test('judge data exists only in explicit expiring demo tables', async () => {
   const migrationFiles = (await readdir(path.join(root, 'drizzle'))).filter((file) => file.endsWith('.sql')).sort();
   const migrations = (await Promise.all(migrationFiles.map((file) => read(`drizzle/${file}`)))).join('\n').toLowerCase();
-  for (const table of ['demo_workspaces', 'demo_messages', 'demo_tasks', 'demo_events', 'demo_notes', 'demo_memory', 'demo_activity']) {
+  for (const table of ['demo_workspaces', 'demo_messages', 'demo_tasks', 'demo_events', 'demo_notes', 'demo_memory', 'demo_activity', 'demo_supply_carts']) {
     assert.match(migrations, new RegExp('create table `' + table + '`'));
   }
   assert.match(migrations, /demo_workspaces[\s\S]*expires_at/);
@@ -42,6 +42,9 @@ test('judge data exists only in explicit expiring demo tables', async () => {
   assert.match(store, /const DEMO_LIFETIME_MS = 24 \* 60 \* 60 \* 1000/);
   assert.doesNotMatch(store, /mcp-client|Composio|executeLiveWorkspaceTool/);
   assert.doesNotMatch(store, /console\.(log|info|debug)\s*\(/);
+  const shopify = await read('lib/shopify-storefront.ts');
+  assert.match(shopify, /api\/ucp\/mcp/);
+  assert.doesNotMatch(shopify, /checkout|payment/i, 'Shopify adapter must not expose checkout or payment flows');
 });
 
 test('OAuth uses PKCE, state, a short lifetime, and the exact callback URL', async () => {

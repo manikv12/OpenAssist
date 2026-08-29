@@ -7,6 +7,7 @@ import {
   DEMO_MEMORY,
   DEMO_NOTES,
   DEMO_TASKS,
+  EMPTY_DEMO_SUPPLY_CART,
   type DemoActivityItem,
   type DemoEvent,
   type DemoMemoryFact,
@@ -15,6 +16,12 @@ import {
   type DemoTask,
   type DemoWorkspaceState,
 } from './demo-data';
+import {
+  clearShopifySupplyCart,
+  getShopifySupplyCart,
+  searchShopifySupplies,
+  updateShopifySupplyCart,
+} from './shopify-storefront';
 import { randomBase64Url } from './security';
 import type { WorkspaceToolName } from './tool-registry';
 
@@ -118,6 +125,7 @@ async function seedDemoWorkspace(workspaceId: string, expiresAt: number): Promis
     db.prepare(
       'INSERT INTO demo_workspaces (workspace_id, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?)',
     ).bind(workspaceId, now, now, expiresAt),
+    db.prepare('INSERT INTO demo_supply_carts (workspace_id, cart_id, updated_at) VALUES (?, NULL, ?)').bind(workspaceId, now),
   ];
 
   DEMO_MAIL.forEach((message, index) => {
@@ -242,7 +250,10 @@ export async function ensureDemoWorkspace(workspaceId: string, expiresAt: number
   const row = await database().prepare(
     'SELECT workspace_id, expires_at FROM demo_workspaces WHERE workspace_id = ?',
   ).bind(workspaceId).first<DemoWorkspaceRow>();
-  if (row && row.expires_at > now) return true;
+  if (row && row.expires_at > now) {
+    await database().prepare('INSERT OR IGNORE INTO demo_supply_carts (workspace_id, cart_id, updated_at) VALUES (?, NULL, ?)').bind(workspaceId, now).run();
+    return true;
+  }
   if (expiresAt <= now) return false;
   await seedDemoWorkspace(workspaceId, expiresAt);
   return true;
@@ -254,7 +265,7 @@ export async function destroyDemoWorkspace(workspaceId: string): Promise<void> {
 
 export async function loadDemoWorkspace(workspaceId: string): Promise<DemoWorkspaceState> {
   const db = database();
-  const [messageResult, taskResult, eventResult, noteResult, memoryResult, activityResult] = await Promise.all([
+  const [messageResult, taskResult, eventResult, noteResult, memoryResult, activityResult, cartPointer] = await Promise.all([
     db.prepare(
       `SELECT message_id, account, sender, subject, snippet, time_label, unread, urgent, has_attachment
        FROM demo_messages WHERE workspace_id = ? ORDER BY updated_at DESC`,
@@ -319,6 +330,7 @@ export async function loadDemoWorkspace(workspaceId: string): Promise<DemoWorksp
       time_label: string;
       type: 'read' | 'write';
     }>(),
+    db.prepare('SELECT cart_id FROM demo_supply_carts WHERE workspace_id = ?').bind(workspaceId).first<{ cart_id: string | null }>(),
   ]);
 
   const messages: DemoMessage[] = messageResult.results.map((row) => ({
@@ -369,7 +381,21 @@ export async function loadDemoWorkspace(workspaceId: string): Promise<DemoWorksp
     type: row.type,
   }));
 
-  return { accounts: DEMO_ACCOUNTS, messages, tasks, events, notes, memory, activity };
+  const [catalog, supplyCart] = await Promise.all([
+    searchShopifySupplies('workspace travel security supplies', 12).catch(() => ({ products: [] })),
+    getShopifySupplyCart(cartPointer?.cart_id ?? null).catch(() => EMPTY_DEMO_SUPPLY_CART),
+  ]);
+
+  return { accounts: DEMO_ACCOUNTS, messages, tasks, events, notes, memory, activity, supplies: catalog.products, supplyCart };
+}
+
+export async function getDemoSupplyCartId(workspaceId: string): Promise<string | null> {
+  const row = await database().prepare('SELECT cart_id FROM demo_supply_carts WHERE workspace_id = ?').bind(workspaceId).first<{ cart_id: string | null }>();
+  return row?.cart_id ?? null;
+}
+
+async function setDemoSupplyCartId(workspaceId: string, cartId: string | null): Promise<void> {
+  await database().prepare('INSERT INTO demo_supply_carts (workspace_id, cart_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(workspace_id) DO UPDATE SET cart_id = excluded.cart_id, updated_at = excluded.updated_at').bind(workspaceId, cartId, Date.now()).run();
 }
 
 async function itemCount(workspaceId: string, table: 'demo_tasks' | 'demo_events' | 'demo_notes' | 'demo_memory'): Promise<number> {
@@ -610,6 +636,22 @@ export async function executeDemoWrite(
     case 'workspace_forget_fact': {
       itemId = safeIdentifier(args.factId, 'Memory fact ID');
       await db.prepare('DELETE FROM demo_memory WHERE workspace_id = ? AND fact_id = ?').bind(workspaceId, itemId).run();
+      break;
+    }
+    case 'workspace_update_supply_cart': {
+      const variantId = clippedText(args.variantId, '', 220);
+      if (!variantId) throw new Error('A Shopify variant is required.');
+      const quantity = Math.max(0, Math.min(20, Math.floor(Number(args.quantity ?? 1))));
+      const currentCartId = await getDemoSupplyCartId(workspaceId);
+      const cart = await updateShopifySupplyCart(currentCartId, variantId, quantity, optionalText(args.lineId, 220) ?? undefined);
+      await setDemoSupplyCartId(workspaceId, cart.id);
+      itemId = optionalText(args.productId, 220) ?? variantId;
+      break;
+    }
+    case 'workspace_clear_supply_cart': {
+      const currentCartId = await getDemoSupplyCartId(workspaceId);
+      await clearShopifySupplyCart(currentCartId);
+      await setDemoSupplyCartId(workspaceId, null);
       break;
     }
     default:

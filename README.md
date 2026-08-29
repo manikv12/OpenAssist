@@ -8,9 +8,9 @@ OpenAssist is a voice-first personal AI assistant for macOS and iPhone. It keeps
 
 **Public source:** [github.com/manikv12/OpenAssist](https://github.com/manikv12/OpenAssist)
 
-The new [`apps/workspace-site`](apps/workspace-site) is a professional browser workspace for Gmail, Tasks, Calendar, notes, memory, accounts, and activity. Its public demo gives each visitor a separate 24-hour synthetic Cloudflare workspace that judges can safely edit through the UI or WebMCP. Owner-only Live mode remains connected to the existing OpenAssist Workspace MCP and Composio; private Google data is never copied into Demo mode.
+The new [`apps/workspace-site`](apps/workspace-site) is a professional browser workspace for Gmail, Tasks, Calendar, notes, memory, accounts, activity, and a synthetic Shopify supply catalog. Its private judge demo gives each judge a separate 24-hour synthetic Cloudflare workspace and cart pointer that they can safely edit through the UI or WebMCP. Owner-only Live mode remains connected to the existing OpenAssist Workspace MCP and Composio; private Google data is never copied into Demo mode.
 
-It exposes 23 structured WebMCP tools that ChatGPT's in-app browser and the same-page voice agent can use. Every write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database.
+It exposes 29 structured WebMCP tools that ChatGPT's in-app browser and the same-page voice agent can use. Every write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database. The Shopify showcase can search products, return their images, inspect policies, and prepare a judge-isolated cart, but it never exposes checkout, payment, or order tools.
 
 The voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). The public WebMCP demo itself needs no login and no voice setup. When enabled, a judge may use a short project-funded synthetic voice session or sign in with their own ChatGPT subscription inside a separate Cloudflare Container. Live mode remains owner-only. The server API key never enters the browser or a Container.
 
@@ -18,7 +18,7 @@ See [the architecture and security boundaries](docs/workspace-architecture.md), 
 
 ### What was added for the WebMCP Challenge
 
-OpenAssist existed before the challenge. The Daily Workspace is a new extension built after the August 25, 2026 challenge start. Starting with commit [`aff7044`](https://github.com/manikv12/OpenAssist/commit/aff7044), it added the ChatGPT Site, 23 real `document.modelContext.registerTool` tools, a separate synthetic judge workspace, visible approval previews, the live Workspace bridge, and same-page voice-to-WebMCP control. The earlier desktop and Google Workspace features remain separate and unchanged.
+OpenAssist existed before the challenge. The Daily Workspace is a new extension built after the August 25, 2026 challenge start. Starting with commit [`aff7044`](https://github.com/manikv12/OpenAssist/commit/aff7044), it added the ChatGPT Site, 29 real `document.modelContext.registerTool` tools, a separate synthetic judge workspace, visible approval previews, the live Workspace bridge, a safe Shopify catalog/cart showcase, and same-page voice-to-WebMCP control. The earlier desktop and Google Workspace features remain separate and unchanged.
 
 > **Primary app:** The supported desktop app is now the React + Electron app in [`apps/desktop`](apps/desktop). The old Swift app is archived in [`legacy/swift`](legacy/swift).
 
