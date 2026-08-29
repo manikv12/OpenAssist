@@ -315,11 +315,12 @@ export async function executeLiveWorkspaceTool(
     return callWorkspaceMcp(accessToken, 'get_google_mail_message', { account: args.account, messageId: args.messageId });
   }
   if (name === 'workspace_read_mail_attachment') {
-    return callWorkspaceMcp(accessToken, 'read_google_mail_attachment', {
+    return callWorkspaceMcp(accessToken, 'read_google_mail_attachment', withDefined({
       account: args.account,
       messageId: args.messageId,
       attachmentRef: args.attachmentId,
-    });
+      filename: args.filename,
+    }));
   }
   if (name === 'workspace_set_mail_read_state') {
     return callWorkspaceMcp(accessToken, 'set_google_mail_read_state', withDefined({

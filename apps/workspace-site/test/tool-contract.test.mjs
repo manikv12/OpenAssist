@@ -30,6 +30,7 @@ test('WebMCP annotations and visible approval previews are always registered', a
 
 test('mail attachment tools accept the opaque references returned by message reads', async () => {
   const registry = await text('lib/tool-registry.ts');
+  const client = await text('lib/mcp-client.ts');
   const attachmentTool = registry.slice(
     registry.indexOf("name: 'workspace_read_mail_attachment'"),
     registry.indexOf("name: 'workspace_set_mail_read_state'"),
@@ -38,6 +39,7 @@ test('mail attachment tools accept the opaque references returned by message rea
   assert.match(attachmentTool, /Opaque attachment reference from message metadata/);
   assert.match(attachmentTool, /4_096/);
   assert.doesNotMatch(attachmentTool, /attachmentId: id\(/);
+  assert.match(client, /attachmentRef: args\.attachmentId,[\s\S]*filename: args\.filename/);
 });
 
 test('calendar reads use the saved calendar-default account when none is supplied', async () => {
