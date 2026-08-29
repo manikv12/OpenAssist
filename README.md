@@ -14,7 +14,7 @@ It exposes 29 structured WebMCP tools that ChatGPT's in-app browser and the same
 
 The voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). The Site opens on a private access screen; judge credentials are supplied only in the Devpost review instructions. A judge never needs Google access or an API key. When the owner enables it, judges can use a short project-funded synthetic voice session. ChatGPT subscription voice and Live mode remain owner-only. The server API key never enters the browser or a Container.
 
-See [the architecture and security boundaries](docs/workspace-architecture.md), [the judge testing guide](docs/webmcp-judge-guide.md), [the complete under-three-minute video script](docs/webmcp-challenge-demo.md), [the validation report](docs/webmcp-test-report.md), and [the official-requirements readiness map](docs/webmcp-challenge-readiness.md).
+See [the architecture and security boundaries](docs/workspace-architecture.md), [the judge testing guide](docs/webmcp-judge-guide.md), [the complete under-three-minute video script](docs/webmcp-challenge-demo.md), [the Devpost submission draft](docs/webmcp-devpost-submission.md), [the validation report](docs/webmcp-test-report.md), and [the official-requirements readiness map](docs/webmcp-challenge-readiness.md).
 
 ### What was added for the WebMCP Challenge
 
