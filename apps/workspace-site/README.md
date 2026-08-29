@@ -82,3 +82,4 @@ The key is verified server-side, encrypted with AES-GCM, and stored only in the 
 - Public repository: <https://github.com/manikv12/OpenAssist>
 - Official rules: <https://webmcp.devpost.com/rules>
 - Submission readiness: [`../../docs/webmcp-challenge-readiness.md`](../../docs/webmcp-challenge-readiness.md)
+- Private judge testing guide: [`../../docs/webmcp-judge-guide.md`](../../docs/webmcp-judge-guide.md)

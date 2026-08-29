@@ -1189,6 +1189,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
               </div>
             </header>
             {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div></div>}
+            {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} />}
             <div className="py-7">
               {mode === 'live' ? (
               view === 'activity'
@@ -1217,6 +1218,35 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       {openLiveItem && <LiveItemReader value={openLiveItem} onClose={() => setOpenLiveItem(null)} />}
       <MobileNavigation view={view} items={visibleNavigation} onView={focusView} />
     </main>
+  );
+}
+
+function JudgeQuickStart({ onNavigate }: { onNavigate: (view: WorkspaceView) => void }) {
+  return (
+    <section aria-labelledby="judge-quick-start" className="mt-4 overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.025]">
+      <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3.5 sm:px-5">
+        <div className="min-w-0">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#E0BC63]">Judge quick start</p>
+          <h2 id="judge-quick-start" className="mt-1 text-sm font-semibold text-[#e8eef7]">Ask ChatGPT to work with this visible workspace</h2>
+          <p className="mt-1 max-w-2xl text-xs leading-5 text-[#7c8a9c]">Reads happen immediately. Any change opens an exact preview here and waits for your approval.</p>
+        </div>
+        <span className="shrink-0 rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold text-[#E0BC63]">29 WebMCP tools</span>
+      </div>
+      <div className="grid border-t border-white/[0.07] md:grid-cols-3">
+        <button type="button" onClick={() => onNavigate('inbox')} className="group px-4 py-3 text-left transition hover:bg-[#E0BC63]/[0.045] focus-visible:bg-[#E0BC63]/[0.045] focus-visible:outline-none sm:px-5 md:border-r md:border-white/[0.07]">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#7c8a9c] group-hover:text-[#E0BC63]">1 · Understand</span>
+          <span className="mt-1 block text-xs leading-5 text-[#cbd4db]">“Show my daily brief and focus the most urgent unread message.”</span>
+        </button>
+        <button type="button" onClick={() => onNavigate('supplies')} className="group border-t border-white/[0.07] px-4 py-3 text-left transition hover:bg-[#E0BC63]/[0.045] focus-visible:bg-[#E0BC63]/[0.045] focus-visible:outline-none sm:px-5 md:border-r md:border-t-0 md:border-white/[0.07]">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#7c8a9c] group-hover:text-[#E0BC63]">2 · Find</span>
+          <span className="mt-1 block text-xs leading-5 text-[#cbd4db]">“Find a USB-C Security Key and prepare one in the cart.”</span>
+        </button>
+        <button type="button" onClick={() => onNavigate('activity')} className="group border-t border-white/[0.07] px-4 py-3 text-left transition hover:bg-[#E0BC63]/[0.045] focus-visible:bg-[#E0BC63]/[0.045] focus-visible:outline-none sm:px-5 md:border-t-0">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#7c8a9c] group-hover:text-[#E0BC63]">3 · Verify</span>
+          <span className="mt-1 block text-xs leading-5 text-[#cbd4db]">Approve the preview, then see the verified result in Activity.</span>
+        </button>
+      </div>
+    </section>
   );
 }
 

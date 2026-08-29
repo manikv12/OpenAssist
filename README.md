@@ -12,9 +12,9 @@ The new [`apps/workspace-site`](apps/workspace-site) is a professional browser w
 
 It exposes 29 structured WebMCP tools that ChatGPT's in-app browser and the same-page voice agent can use. Every write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database. The Shopify showcase can search products, return their images, inspect policies, and prepare a judge-isolated cart, but it never exposes checkout, payment, or order tools.
 
-The voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). The public WebMCP demo itself needs no login and no voice setup. When enabled, a judge may use a short project-funded synthetic voice session or sign in with their own ChatGPT subscription inside a separate Cloudflare Container. Live mode remains owner-only. The server API key never enters the browser or a Container.
+The voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). The Site opens on a private access screen; judge credentials are supplied only in the Devpost review instructions. A judge never needs Google access or an API key. When the owner enables it, judges can use a short project-funded synthetic voice session. ChatGPT subscription voice and Live mode remain owner-only. The server API key never enters the browser or a Container.
 
-See [the architecture and security boundaries](docs/workspace-architecture.md), [the focused challenge demo plan](docs/webmcp-challenge-demo.md), and [the official-requirements readiness map](docs/webmcp-challenge-readiness.md).
+See [the architecture and security boundaries](docs/workspace-architecture.md), [the judge testing guide](docs/webmcp-judge-guide.md), [the complete under-three-minute video script](docs/webmcp-challenge-demo.md), [the validation report](docs/webmcp-test-report.md), and [the official-requirements readiness map](docs/webmcp-challenge-readiness.md).
 
 ### What was added for the WebMCP Challenge
 
