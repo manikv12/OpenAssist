@@ -387,7 +387,7 @@ function demoRealtimeInstructions(): string {
 }
 
 function demoRealtimeTools() {
-  return toolManifest.map((tool) => ({
+  return toolManifest.filter((tool) => !tool.ownerOnly).map((tool) => ({
     type: 'function',
     name: tool.name,
     description: tool.description,
@@ -577,7 +577,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
     JSON.parse(authJson);
     await restoreThreadState(container, env, payload.userHash);
-    const result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId, voice });
+    const result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId, voice, access: payload.access });
     const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
     const answerSdp = typeof result.sdp === 'string' ? result.sdp : '';
     if (!sessionId || !answerSdp) throw new Response('The subscription realtime compatibility check did not return audio.', { status: 503 });

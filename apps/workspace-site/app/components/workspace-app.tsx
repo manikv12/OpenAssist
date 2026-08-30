@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { VoiceOrb, type OrbPhase } from './voice-orb';
+import { SecondBrainWorkspace } from './second-brain-workspace';
 import { VoiceLevelMeter } from '../../lib/voice-levels';
 import {
   DEFAULT_REALTIME_VOICE,
@@ -120,12 +121,13 @@ function voiceLabel(voice: RealtimeVoice): string {
   return REALTIME_VOICES.find((item) => item.id === voice)?.label ?? voice;
 }
 
-const NAVIGATION: { view: WorkspaceView; label: string; key: string }[] = [
+const NAVIGATION: { view: WorkspaceView; label: string; key: string; ownerOnly?: boolean; demoOnly?: boolean }[] = [
   { view: 'today', label: 'Today', key: 'T' },
   { view: 'inbox', label: 'Inbox', key: 'I' },
   { view: 'tasks', label: 'Tasks', key: 'K' },
+  { view: 'work', label: 'Work', key: 'W', ownerOnly: true },
   { view: 'calendar', label: 'Calendar', key: 'C' },
-  { view: 'supplies', label: 'Supplies', key: 'S' },
+  { view: 'supplies', label: 'Supplies', key: 'S', demoOnly: true },
   { view: 'notes', label: 'Notes', key: 'N' },
   { view: 'memory', label: 'Memory', key: 'M' },
   { view: 'accounts', label: 'Accounts', key: 'A' },
@@ -136,6 +138,7 @@ const VIEW_COPY: Record<WorkspaceView, { eyebrow: string; title: string; subtitl
   today: { eyebrow: 'Thursday · August 27', title: 'Today', subtitle: 'Mail, tasks, and calendar in one calm view.' },
   inbox: { eyebrow: 'Three demo accounts', title: 'Inbox', subtitle: 'Search every connected account without mixing identities.' },
   tasks: { eyebrow: 'My Tasks · Upcoming · Backlog', title: 'Tasks', subtitle: 'Clear next actions with short notes and useful tags.' },
+  work: { eyebrow: 'Second brain · Agent queue', title: 'Work', subtitle: 'Capture ideas, shape projects, and let agents carry routine work forward.' },
   calendar: { eyebrow: 'Agenda and week', title: 'Calendar', subtitle: 'Exact local times, account context, and visible reminders.' },
   supplies: { eyebrow: 'Shopify · Synthetic store', title: 'Supplies', subtitle: 'Let the agent search a real dev-store catalog and prepare a cart—never checkout.' },
   notes: { eyebrow: 'Google Drive', title: 'Notes', subtitle: 'Long reference material lives here, not inside task details.' },
@@ -258,15 +261,15 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const router = useRouter();
   const ownerAccess = user?.access === 'owner';
   const mode: Mode = ownerAccess ? 'live' : 'demo';
-  const visibleNavigation = useMemo(() => ownerAccess ? NAVIGATION.filter((item) => item.view !== 'supplies') : NAVIGATION, [ownerAccess]);
-  const webMcpTools = useMemo(() => ownerAccess ? WORKSPACE_TOOLS.filter((tool) => !tool.demoOnly) : WORKSPACE_TOOLS, [ownerAccess]);
+  const visibleNavigation = useMemo(() => ownerAccess ? NAVIGATION.filter((item) => !item.demoOnly) : NAVIGATION.filter((item) => !item.ownerOnly), [ownerAccess]);
+  const webMcpTools = useMemo(() => ownerAccess ? WORKSPACE_TOOLS.filter((tool) => !tool.demoOnly) : WORKSPACE_TOOLS.filter((tool) => !tool.ownerOnly), [ownerAccess]);
   const [view, setView] = useState<WorkspaceView>('today');
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>('mail-security-review');
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [toast, setToast] = useState(() => ownerAccess
     ? 'Private Live Workspace ready.'
-    : `Judge Demo ready · ${WORKSPACE_TOOLS.length} WebMCP tools available.`);
+    : `Judge Demo ready · ${webMcpTools.length} WebMCP tools available.`);
   const [voiceStatus, setVoiceStatus] = useState('Ready to check compatibility');
   const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
   const [activeVoice, setActiveVoice] = useState<RealtimeVoice | null>(null);
@@ -452,9 +455,11 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     const tool = WORKSPACE_TOOL_MAP.get(name);
     if (!tool) throw new Error(`Unknown workspace tool: ${name}`);
     if (tool.demoOnly && modeRef.current !== 'demo') throw new Error('This Shopify showcase tool is available only in the isolated judge demo.');
+    if (tool.ownerOnly && modeRef.current !== 'live') throw new Error('This private owner tool is not available in Judge Demo.');
 
     if (name === 'workspace_focus_view') {
       const nextView = String(args.view ?? 'today') as WorkspaceView;
+      if (nextView === 'work' && modeRef.current !== 'live') throw new Error('The private Work view is available only to the owner.');
       const requestedItemId = typeof args.itemId === 'string' ? args.itemId : undefined;
       const resolvedItemId = requestedItemId ?? lastFocusedItemRef.current[nextView];
       if (!requestedItemId && resolvedItemId) delete lastFocusedItemRef.current[nextView];
@@ -474,7 +479,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       return { status: 'focused', view: nextView, itemId: resolvedItemId ?? null, opened: Boolean(resolvedItemId) };
     }
 
-    if (!tool.readOnly) {
+    if (!tool.readOnly && tool.approval !== 'policy') {
       const action = await propose(tool, args);
       return { status: 'approval_required', previewId: action.id, expiresAt: new Date(action.expiresAt).toISOString(), requiresScreenTap: action.destructive, message: 'A visible preview is open. External content cannot approve it. The user must approve this exact change.' };
     }
@@ -512,7 +517,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const first = liveRows('tasks', result)[0];
       if (first) lastFocusedItemRef.current.tasks = liveItemId(first, 'task-result-1');
     }
-    setActivity((current) => [{ id: randomId('activity'), actor: 'Workspace', action: `Read: ${tool.title}`, time: 'Just now', type: 'read' as const }, ...current].slice(0, 40));
+    if (tool.approval === 'policy') setLiveRefreshKey((current) => current + 1);
+    setActivity((current) => [{ id: randomId('activity'), actor: 'Workspace', action: `${tool.readOnly ? 'Read' : 'Policy action'}: ${tool.title}`, time: 'Just now', type: tool.readOnly ? 'read' as const : 'write' as const }, ...current].slice(0, 40));
     setToast(`${tool.title} completed.`);
     return result;
   }, [focusView, hydrateDemoWorkspace, propose]);
@@ -561,6 +567,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         supplies: ['workspace_list_accounts', {}],
         notes: ['workspace_list_notes', {}],
         memory: ['workspace_get_memory', {}],
+        work: ['workspace_get_work_dashboard', { includeCompleted: false }],
         accounts: ['workspace_list_accounts', {}],
         activity: ['workspace_list_accounts', {}],
       };
@@ -674,6 +681,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     }
     setPending(null);
     setActivity((current) => [{ id: randomId('activity'), actor: confirmationMethod === 'voice' ? 'Voice + You' : 'You', action: `Approved: ${action.title}`, time: 'Just now', type: 'write' as const }, ...current].slice(0, 40));
+    if (action.tool.includes('project') || action.tool.includes('work_item')) {
+      focusView('work');
+      setLiveRefreshKey((current) => current + 1);
+    }
     setToast('Change saved and verified by reading it back.');
     return body;
   }, [focusView, hydrateDemoWorkspace]);
@@ -1194,6 +1205,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
               {mode === 'live' ? (
               view === 'activity'
                 ? <ActivityView mode={mode} activity={activity} owner={Boolean(user?.owner)} onVoicePolicyChanged={refreshJudgeVoicePolicy} />
+                : view === 'work' && live.accounts && !live.error
+                  ? <SecondBrainWorkspace source={live.data.work} loading={live.loading} warning={live.warning} onRefresh={() => setLiveRefreshKey((current) => current + 1)} onInvoke={invokeTool} />
                 : <LiveWorkspaceView view={view} live={live} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => { setSelectedId(id); setOpenLiveItem({ id, view, item }); }} />
             ) : demoLoading ? <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Preparing your private demo workspace…</p></div></div> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
@@ -1254,6 +1267,7 @@ const VIEW_ICONS: Record<WorkspaceView, React.ReactNode> = {
   today: <path d="M3 9h18M7 3v3m10-3v3M5 5h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" />,
   inbox: <path d="M3 12h4l2 3h6l2-3h4M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" />,
   tasks: <path d="m4 12 3.5 3.5L20 6M4 19h10" />,
+  work: <><path d="M4 7h6l2 2h8v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M8 3h8v4H8zM8 14h8m-8 3h5" /></>,
   calendar: <path d="M8 3v3m8-3v3M4 10h16M5 6h14a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z" />,
   supplies: <><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5Z" /><path d="m4 7.5 8 4.5 8-4.5M12 12v9" /></>,
   notes: <path d="M8 4h8l4 4v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm7 0v5h5M8 13h8M8 17h5" />,
@@ -1931,6 +1945,14 @@ function liveRows(view: WorkspaceView, source: unknown): Array<Record<string, un
     return arrayValue(data.notes).map((item) => ({ ...item, _kind: 'Drive note', _account: account }));
   }
   if (view === 'memory') return arrayValue(data.facts ?? data.memories ?? data.results).map((item) => ({ ...item, _kind: 'Memory' }));
+  if (view === 'work') {
+    return [
+      ...arrayValue(data.projects).map((item) => ({ ...item, _kind: 'Second Brain project' })),
+      ...arrayValue(data.workItems).map((item) => ({ ...item, _kind: 'Second Brain work item' })),
+      ...arrayValue(data.runs).map((item) => ({ ...item, _kind: 'Agent run' })),
+      ...arrayValue(data.memorySources).map((item) => ({ ...item, _kind: 'Memory source' })),
+    ];
+  }
   if (view === 'accounts' || view === 'activity') return arrayValue(data.accounts).map((item) => ({ ...item, _kind: 'Account' }));
   return [];
 }
@@ -1944,7 +1966,7 @@ function displayText(item: Record<string, unknown>, keys: string[], fallback: st
 }
 
 function liveItemId(item: Record<string, unknown>, fallback: string): string {
-  return displayText(item, ['id', 'taskId', 'messageId', 'eventId', 'documentId', 'noteId', 'factId'], fallback);
+  return displayText(item, ['id', 'projectId', 'workItemId', 'runId', 'sourceId', 'taskId', 'messageId', 'eventId', 'documentId', 'noteId', 'factId'], fallback);
 }
 
 function noteRecord(value: unknown, depth = 0): Record<string, unknown> {

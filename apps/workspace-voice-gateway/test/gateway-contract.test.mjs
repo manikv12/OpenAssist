@@ -25,12 +25,37 @@ test('voice has the same Workspace tool contract as the Site', async () => {
     readOnly: Boolean(tool.readOnly),
     untrustedContent: Boolean(tool.untrustedContent),
     destructive: Boolean(tool.destructive),
+    demoOnly: Boolean(tool.demoOnly),
+    ownerOnly: Boolean(tool.ownerOnly),
+    approval: tool.approval ?? 'always',
   }));
   assert.deepEqual(voice, shared);
   assert.deepEqual(voiceManifest, sharedManifest);
   assert.deepEqual(voiceManifest, siteManifest);
   assert.deepEqual(voiceManifest.map((tool) => tool.name), voice);
-  assert.equal(voice.length, 29);
+  assert.equal(voice.length, 43);
+
+  const ownerTools = voiceManifest.filter((tool) => !tool.demoOnly).map((tool) => tool.name);
+  const demoTools = voiceManifest.filter((tool) => !tool.ownerOnly).map((tool) => tool.name);
+  const secondBrainTools = voiceManifest.filter((tool) => tool.ownerOnly).map((tool) => tool.name);
+  assert.deepEqual(secondBrainTools, [
+    'workspace_get_work_dashboard',
+    'workspace_search_second_brain',
+    'workspace_list_agent_assignments',
+    'workspace_create_project',
+    'workspace_capture_work_item',
+    'workspace_organize_inbox_item',
+    'workspace_promote_work_item_to_task',
+    'workspace_assign_work_item',
+    'workspace_claim_agent_work',
+    'workspace_claim_next_agent_work',
+    'workspace_renew_agent_work',
+    'workspace_report_agent_progress',
+    'workspace_resume_agent_work',
+    'workspace_submit_agent_result',
+  ]);
+  assert.ok(secondBrainTools.every((name) => ownerTools.includes(name)));
+  assert.ok(secondBrainTools.every((name) => !demoTools.includes(name)));
 });
 
 test('subscription containers remove API-key variables and force ChatGPT sign-in', async () => {
@@ -54,7 +79,8 @@ test('voice is isolated and directly exposes only visible Site tools', async () 
   const config = await read('container/config.toml');
   assert.match(server, /sandbox: 'read-only'/);
   assert.match(server, /selectedCapabilityRoots: \[\]/);
-  assert.match(server, /\.\.\.toolManifest\.map/);
+  assert.match(server, /this\.session\.toolManifest\.map/);
+  assert.match(server, /toolManifest\.filter\(\(tool\) => this\.access === 'owner' \? !tool\.demoOnly : !tool\.ownerOnly\)/);
   assert.match(server, /name: 'assistant_confirm_site_preview'/);
   assert.match(server, /Only the registered visible Workspace tools are allowed/);
   assert.match(server, /includeStartupContext: true/);
@@ -125,7 +151,7 @@ test('the funded demo fallback is server-side, synthetic-only, and uses the exac
   assert.match(worker, /OPENAI_API_KEY\?: string/);
   assert.match(worker, /payload\.access !== 'demo'/);
   assert.match(worker, /env\.DEMO_REALTIME_MODEL \|\| 'gpt-realtime-2\.1-mini'/);
-  assert.match(worker, /toolManifest\.map/);
+  assert.match(worker, /toolManifest\.filter\(\(tool\) => !tool\.ownerOnly\)\.map/);
   assert.match(worker, /parallel_tool_calls: false/);
   assert.match(worker, /max_output_tokens: 512/);
   assert.match(worker, /OpenAI-Safety-Identifier/);

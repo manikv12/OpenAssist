@@ -16,6 +16,20 @@ This ChatGPT Site provides a polished WebMCP dashboard for the existing OpenAssi
 - **Live mode** is owner-only and continues to use the existing Workspace MCP and Composio-managed Google connections.
 - Demo and Live routes are separate. Private Google content is never copied into the demo database.
 
+## Owner Second Brain
+
+Owner Live mode adds a private **Work** view with Capture, Projects, Knowledge, Agent work, and Memory sources. It uses 14 owner-only WebMCP tools; judges continue to see the original 29 synthetic tools and cannot discover or call the owner tools.
+
+- Projects, work items, progress, and results are real Markdown files under `OpenAssist/Second Brain` in the selected Drive.
+- Unprojected captures stay in Inbox until the owner approves moving them into a same-account project. That move creates a new Markdown revision and preserves the original Inbox file as history.
+- Cloudflare stores only Drive pointers, content hashes, policy metadata, short leases, and sync status—not the Markdown text.
+- Unsorted ideas may enter the general Inbox. Project work stays in the project folder.
+- Google Tasks remains for active personal actions, not the full research backlog.
+- The current owner runner performs one isolated, tool-free analysis pass with bounded Second Brain search. It can analyze, draft, and organize, but cannot edit a repository or browse yet.
+- Knowledge search returns untrusted excerpts with source pointers across projects, work items, and curated memory.
+- Adding a work item to Google Tasks requires a real task-list selection and an exact approval; the Drive Markdown source remains unchanged.
+- Memory-source status uses a stable device ID, so renaming a Mac does not create a new machine identity.
+
 ## Local checks
 
 ```bash

@@ -30,6 +30,9 @@ const manifest = tools.map((tool) => ({
   readOnly: Boolean(tool.readOnly),
   untrustedContent: Boolean(tool.untrustedContent),
   destructive: Boolean(tool.destructive),
+  demoOnly: Boolean(tool.demoOnly),
+  ownerOnly: Boolean(tool.ownerOnly),
+  approval: tool.approval ?? 'always',
 }));
 const names = manifest.map((tool) => tool.name);
 
@@ -44,6 +47,7 @@ const outputs = [
   [path.join(appRoot, 'container/tool-names.json'), names],
   [path.join(repoRoot, 'packages/workspace-tool-contract/tool-manifest.json'), manifest],
   [path.join(repoRoot, 'packages/workspace-tool-contract/tool-names.json'), names],
+  [path.join(repoRoot, 'apps/workspace-site/test/tool-names.json'), names],
 ];
 
 for (const [outputPath, value] of outputs) {

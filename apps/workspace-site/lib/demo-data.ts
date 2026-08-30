@@ -6,6 +6,7 @@ export type WorkspaceView =
   | 'supplies'
   | 'notes'
   | 'memory'
+  | 'work'
   | 'accounts'
   | 'activity';
 

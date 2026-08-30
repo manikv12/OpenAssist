@@ -12,7 +12,7 @@ export async function POST(request: Request): Promise<Response> {
     const name = typeof body.tool === 'string' ? body.tool : '';
     if (!isWorkspaceToolName(name)) throw new Error('This tool is not available.');
     const tool = WORKSPACE_TOOL_MAP.get(name)!;
-    if (!tool.readOnly || name === 'workspace_focus_view') throw new Error('This tool cannot run through the read route.');
+    if (tool.demoOnly || (!tool.readOnly && tool.approval !== 'policy') || name === 'workspace_focus_view') throw new Error('This tool cannot run through the policy route.');
     const args = validateToolArguments(body.args ?? {}, tool.inputSchema);
     return executeLiveWorkspaceTool(await workspaceAccessToken(user.userId), name, args);
   });
