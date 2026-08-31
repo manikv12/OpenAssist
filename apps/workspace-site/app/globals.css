@@ -3,10 +3,10 @@
 :root {
   /* Ink: a cool blue-black instead of neutral grey, so the gold reads warm
      against it rather than sitting on flat charcoal. */
-  --background: #08090d;
-  --surface: #0d0f14;
-  --surface-raised: #14171e;
-  --surface-hover: #191d26;
+  --background: #10131a;
+  --surface: #161a23;
+  --surface-raised: #1d222d;
+  --surface-hover: #242a37;
 
   /* Text: a soft blue-white, stepped down through three clear levels. */
   --foreground: #e8eef7;
@@ -26,8 +26,25 @@
   --warning: #FFC178;
   --success: #5FD3A3;
 
-  --hairline: rgba(255, 255, 255, 0.075);
-  --hairline-strong: rgba(255, 255, 255, 0.13);
+  /* Readable text variants of the accents and statuses. These flip to deeper
+     tones in light mode so small text keeps AA contrast. */
+  --brand-ink: #17130a;
+  --accent-violet-strong: #B9B0FF;
+  --accent-teal-strong: #76D5DE;
+  --danger-strong: #FFA898;
+  --warning-strong: #FFC178;
+  --success-strong: #8BE7AE;
+
+  --hairline: rgba(255, 255, 255, 0.09);
+  --hairline-strong: rgba(255, 255, 255, 0.16);
+
+  /* Neutral fills: wash for resting cards and hovers, field for inputs. */
+  --wash: rgba(255, 255, 255, 0.055);
+  --wash-strong: rgba(255, 255, 255, 0.095);
+  --field: rgba(0, 0, 0, 0.2);
+
+  /* Selected-row halo ring, themed so it survives light backgrounds. */
+  --ring-selected: rgba(224, 188, 99, 0.34);
 
   --shell-gutter: 1.25rem;
   --bottom-nav-space: 0px;
@@ -36,6 +53,30 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-ink: var(--foreground);
+  --color-text-2: var(--text-secondary);
+  --color-text-3: var(--text-muted);
+  --color-text-4: var(--text-faint);
+  --color-surface: var(--surface);
+  --color-raised: var(--surface-raised);
+  --color-brand: var(--brand);
+  --color-brand-strong: var(--brand-strong);
+  --color-brand-ink: var(--brand-ink);
+  --color-accent: var(--accent-violet);
+  --color-accent-strong: var(--accent-violet-strong);
+  --color-teal: var(--accent-teal);
+  --color-teal-strong: var(--accent-teal-strong);
+  --color-danger: var(--danger);
+  --color-danger-strong: var(--danger-strong);
+  --color-warning: var(--warning);
+  --color-warning-strong: var(--warning-strong);
+  --color-success: var(--success);
+  --color-success-strong: var(--success-strong);
+  --color-hairline: var(--hairline);
+  --color-hairline-strong: var(--hairline-strong);
+  --color-wash: var(--wash);
+  --color-wash-strong: var(--wash-strong);
+  --color-field: var(--field);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -45,12 +86,10 @@ html {
 }
 
 body {
-  /* Three light sources: warm gold overhead, a cool violet counter-light on the
-     right, and a faint teal lift at the bottom. Keeps a dark UI from going flat. */
+  /* One faint warm lift at the top so the flat ink does not read as a void.
+     Deliberately subtle: the workspace surfaces carry the interest, not the page. */
   background:
-    radial-gradient(ellipse 90% 55% at 38% -12%, rgba(224, 188, 99, 0.10), transparent 62%),
-    radial-gradient(ellipse 70% 50% at 96% 6%, rgba(124, 107, 240, 0.09), transparent 58%),
-    radial-gradient(ellipse 80% 45% at 12% 102%, rgba(63, 185, 198, 0.055), transparent 60%),
+    radial-gradient(ellipse 120% 60% at 50% -20%, rgba(224, 188, 99, 0.045), transparent 70%),
     var(--background);
   background-attachment: fixed;
   color: var(--foreground);
@@ -59,18 +98,166 @@ body {
   overflow-x: hidden;
 }
 
+.oa-app-shell {
+  background:
+    radial-gradient(ellipse 120% 58% at 50% -18%, rgba(224, 188, 99, 0.04), transparent 68%),
+    var(--background);
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  --background: #f5f3ee;
+  --surface: #fbfaf7;
+  --surface-raised: #ffffff;
+  --surface-hover: #f0ede5;
+  --foreground: #192029;
+  --text-secondary: #4d5968;
+  --text-muted: #5f6b7c;
+  --text-faint: #7b8592;
+
+  /* Gold must deepen on paper or it reads as pale yellow and fails contrast. */
+  --brand: #8a6b22;
+  --brand-strong: #6b5316;
+  --brand-deep: #57430f;
+  --brand-ink: #fffaf0;
+
+  --accent-violet-strong: #5646c8;
+  --accent-teal-strong: #0d6d79;
+  --danger: #d4553f;
+  --danger-strong: #b3402e;
+  --warning-strong: #8a5a1a;
+  --success: #1e7d55;
+  --success-strong: #1e7d55;
+
+  --hairline: rgba(24, 31, 41, 0.10);
+  --hairline-strong: rgba(24, 31, 41, 0.16);
+  --wash: rgba(22, 28, 38, 0.045);
+  --wash-strong: rgba(22, 28, 38, 0.08);
+  --field: rgba(22, 28, 38, 0.05);
+  --ring-selected: rgba(138, 107, 34, 0.5);
+  background: var(--background);
+  color: var(--foreground) !important;
+}
+
+/* The dashboard predates theme tokens in a few leaf components. These scoped
+   compatibility rules keep the complete product readable while those leaves
+   are gradually moved to variables. They never affect the login page. */
+[data-theme='light'] [class*='text-[#e8eef7]'],
+[data-theme='light'] [class*='text-[#eef3f8]'],
+[data-theme='light'] [class*='text-[#dce4ea]'],
+[data-theme='light'] [class*='text-[#d6dfeb]'],
+[data-theme='light'] [class*='text-[#cbd4db]'] {
+  color: #202832 !important;
+}
+
+[data-theme='light'] [class*='text-[#a4b1c2]'],
+[data-theme='light'] [class*='text-[#8997a8]'] {
+  color: #4d5968 !important;
+}
+
+[data-theme='light'] [class*='text-[#7c8a9c]'],
+[data-theme='light'] [class*='text-[#6f7d8e]'],
+[data-theme='light'] [class*='text-[#687687]'],
+[data-theme='light'] [class*='text-[#667480]'],
+[data-theme='light'] [class*='text-[#5f6d7d]'],
+[data-theme='light'] [class*='text-[#5b6879]'],
+[data-theme='light'] [class*='text-[#596778]'],
+[data-theme='light'] [class*='text-[#536071]'],
+[data-theme='light'] [class*='text-[#4f5c6c]'] {
+  color: #6a7481 !important;
+}
+
+[data-theme='light'] [class*='border-white/'] {
+  border-color: rgba(24, 31, 41, 0.11) !important;
+}
+
+[data-theme='light'] [class*='bg-white/'] {
+  background-color: rgba(255, 255, 255, 0.66) !important;
+}
+
+[data-theme='light'] [class*='bg-black/'],
+[data-theme='light'] [class*='bg-[#08090d]'],
+[data-theme='light'] [class*='bg-[#0d0f14]'],
+[data-theme='light'] [class*='bg-[#101215]'],
+[data-theme='light'] [class*='bg-[#10131a]'] {
+  background-color: rgba(255, 255, 255, 0.76) !important;
+}
+
+/* The floating voice and approval docks keep their glassy panels readable on
+   paper backgrounds. */
+[data-theme='light'] .oa-voice-dock__panel {
+  border-color: var(--hairline-strong);
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 20px 56px rgba(31, 26, 12, 0.16);
+}
+
+[data-theme='light'] .oa-approval-dock__panel {
+  border-color: rgba(170, 116, 34, 0.34);
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 20px 56px rgba(31, 26, 12, 0.16);
+}
+
+/* ---------------------------------------------------------------------------
+   Polish layer: motion, the primary action, and signature details.
+   --------------------------------------------------------------------------- */
+
+html {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--foreground) 22%, transparent) transparent;
+}
+
+/* Views glide in instead of popping. The reduced-motion rule disables this. */
+@keyframes oa-view-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* A short cross-fade only. Content should feel settled, not animated. */
+.oa-view-in {
+  animation: oa-view-in 140ms ease-out both;
+}
+
+/* A plain hairline. The eyebrow and title carry the hierarchy, not the rule. */
+.oa-header-divider {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  height: 1px;
+  background: var(--hairline-strong);
+}
+
+/* One primary-action treatment: flat brand gold, no bevel or glow. Weight
+   comes from the fill being the only saturated surface on the page. */
+.oa-btn-primary {
+  color: var(--brand-ink);
+  background: var(--brand);
+  transition: background-color 130ms ease;
+}
+
+.oa-btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--brand) 88%, #fff);
+}
+
+.oa-btn-primary:active:not(:disabled) {
+  background: color-mix(in srgb, var(--brand) 92%, #000);
+}
+
 button {
   cursor: pointer;
 }
 
 ::selection {
-  background: rgba(224, 188, 99, 0.30);
+  background: color-mix(in srgb, var(--brand) 30%, transparent);
   color: var(--brand-strong);
 }
 
 /* Focus ring: one consistent, visible treatment everywhere. */
 :focus-visible {
-  outline: 2px solid rgba(224, 188, 99, 0.75);
+  outline: 2px solid color-mix(in srgb, var(--brand) 78%, transparent);
   outline-offset: 2px;
   border-radius: 8px;
 }
@@ -123,16 +310,11 @@ button {
   max-height: min(72svh, 680px);
   overflow-y: auto;
   pointer-events: auto;
-  border: 1px solid rgba(224, 188, 99, 0.24);
-  border-radius: 1.35rem;
-  background:
-    radial-gradient(circle at 17% 0%, rgba(224, 188, 99, 0.11), transparent 34%),
-    rgba(11, 13, 18, 0.965);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 1.1rem;
+  background: rgba(23, 27, 36, 0.97);
   padding: 1rem;
-  box-shadow:
-    0 24px 72px rgba(0, 0, 0, 0.68),
-    0 0 40px rgba(224, 188, 99, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(22px) saturate(1.08);
   scrollbar-width: thin;
   scrollbar-color: rgba(224, 188, 99, 0.32) transparent;
@@ -164,8 +346,8 @@ button {
 }
 
 @keyframes oa-agent-dock-in {
-  from { opacity: 0; transform: translateY(12px) scale(0.985); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 /* Action previews stay visible without freezing the workspace underneath. */
@@ -183,11 +365,11 @@ button {
   max-height: 62svh;
   overflow-y: auto;
   pointer-events: auto;
-  border: 1px solid rgba(255, 193, 120, 0.26);
-  border-radius: 1.2rem;
-  background: rgba(20, 23, 30, 0.97);
+  border: 1px solid rgba(255, 193, 120, 0.3);
+  border-radius: 1.1rem;
+  background: rgba(26, 30, 40, 0.97);
   padding: 1rem;
-  box-shadow: 0 22px 68px rgba(0, 0, 0, 0.58), 0 0 34px rgba(255, 193, 120, 0.055);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(20px) saturate(1.08);
   animation: oa-agent-dock-in 160ms ease-out both;
 }

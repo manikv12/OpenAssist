@@ -36,6 +36,7 @@ import {
 
 type SiteUser = { id: string; email: string; name: string; owner: boolean; access: 'owner' | 'judge' } | null;
 type Mode = 'demo' | 'live';
+type ThemePreference = 'system' | 'light' | 'dark';
 type DemoVoiceAccess = 'capped' | 'subscription';
 type ActiveVoiceKind = 'live_subscription' | 'demo_subscription' | 'demo_capped';
 type PendingAction = {
@@ -135,7 +136,7 @@ const NAVIGATION: { view: WorkspaceView; label: string; key: string; ownerOnly?:
 ];
 
 const VIEW_COPY: Record<WorkspaceView, { eyebrow: string; title: string; subtitle: string }> = {
-  today: { eyebrow: 'Thursday · August 27', title: 'Today', subtitle: 'Mail, tasks, and calendar in one calm view.' },
+  today: { eyebrow: 'Today', title: 'Today', subtitle: 'Mail, tasks, and calendar in one calm view.' },
   inbox: { eyebrow: 'Three demo accounts', title: 'Inbox', subtitle: 'Search every connected account without mixing identities.' },
   tasks: { eyebrow: 'My Tasks · Upcoming · Backlog', title: 'Tasks', subtitle: 'Clear next actions with short notes and useful tags.' },
   work: { eyebrow: 'Second brain · Agent queue', title: 'Work', subtitle: 'Capture ideas, shape projects, and let agents carry routine work forward.' },
@@ -198,20 +199,20 @@ function Pagination({ page, pageCount, rangeStart, rangeEnd, total, unit, onPage
   if (total === 0) return null;
   const window = pageWindow(page, pageCount);
   return (
-    <nav aria-label={`${unit} pagination`} className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.07] pt-4">
-      <p className="text-xs text-[#7c8a9c]" aria-live="polite">
-        Showing <span className="text-[#d6dfeb]">{rangeStart}–{rangeEnd}</span> of {total} {unit}
+    <nav aria-label={`${unit} pagination`} className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-hairline pt-4">
+      <p className="text-xs text-text-3" aria-live="polite">
+        Showing <span className="text-ink/90">{rangeStart}–{rangeEnd}</span> of {total} {unit}
       </p>
       {pageCount > 1 && (
         <div className="flex items-center gap-1">
-          <button type="button" onClick={() => onPage(page - 1)} disabled={page <= 1} aria-label={`Previous page of ${unit}`} className="grid h-8 w-8 place-items-center rounded-lg border border-white/10 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-white/10">‹</button>
+          <button type="button" onClick={() => onPage(page - 1)} disabled={page <= 1} aria-label={`Previous page of ${unit}`} className="grid h-8 w-8 place-items-center rounded-lg border border-hairline-strong text-sm text-text-2 transition hover:border-hairline-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-hairline-strong">‹</button>
           <div className="flex items-center gap-1 max-sm:hidden">
             {window.map((entry, index) => entry === 'gap'
-              ? <span key={`gap-${index}`} aria-hidden="true" className="px-1 text-xs text-[#5b6879]">…</span>
-              : <button key={entry} type="button" onClick={() => onPage(entry)} aria-label={`Page ${entry}`} aria-current={entry === page ? 'page' : undefined} className={`h-8 min-w-8 rounded-lg px-2 text-xs font-semibold tabular-nums transition ${entry === page ? 'bg-[#E0BC63] text-[#17130a]' : 'border border-white/10 text-[#a4b1c2] hover:border-[#E0BC63]/40 hover:text-white'}`}>{entry}</button>)}
+              ? <span key={`gap-${index}`} aria-hidden="true" className="px-1 text-xs text-text-4">…</span>
+              : <button key={entry} type="button" onClick={() => onPage(entry)} aria-label={`Page ${entry}`} aria-current={entry === page ? 'page' : undefined} className={`h-8 min-w-8 rounded-lg px-2 text-xs font-semibold tabular-nums transition ${entry === page ? 'bg-brand text-brand-ink' : 'border border-hairline-strong text-text-2 hover:border-hairline-strong hover:text-ink'}`}>{entry}</button>)}
           </div>
-          <span className="px-2 text-xs tabular-nums text-[#a4b1c2] sm:hidden">{page} / {pageCount}</span>
-          <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pageCount} aria-label={`Next page of ${unit}`} className="grid h-8 w-8 place-items-center rounded-lg border border-white/10 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-white/10">›</button>
+          <span className="px-2 text-xs tabular-nums text-text-2 sm:hidden">{page} / {pageCount}</span>
+          <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pageCount} aria-label={`Next page of ${unit}`} className="grid h-8 w-8 place-items-center rounded-lg border border-hairline-strong text-sm text-text-2 transition hover:border-hairline-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-hairline-strong">›</button>
         </div>
       )}
     </nav>
@@ -229,6 +230,18 @@ function compactArgs(args: Record<string, unknown>) {
     .map(([key, value]) => ({ key, value: Array.isArray(value) ? value.join(', ') : String(value) }));
 }
 
+/**
+ * Derive a status tone from the toast copy so success, error, and neutral
+ * updates read differently without threading a second state value through
+ * every call site.
+ */
+function toastSeverity(text: string): 'error' | 'success' | 'info' {
+  const value = text.toLowerCase();
+  if (/(fail|error|could not|unavailable|expired|not enabled|invalid|denied|no longer|not compatible|reached its)/.test(value)) return 'error';
+  if (/(ready|saved|applied|completed|registered|verified|reset to|is enabled)/.test(value)) return 'success';
+  return 'info';
+}
+
 function localDateString(date: Date, timeZone: string): string {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
@@ -238,6 +251,30 @@ function localDateString(date: Date, timeZone: string): string {
   }).formatToParts(date);
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${value.year}-${value.month}-${value.day}`;
+}
+
+function viewForTool(tool: WorkspaceToolName): WorkspaceView | null {
+  if (tool === 'workspace_get_daily_brief') return 'today';
+  if (tool.includes('second_brain') || tool.includes('agent_assignment') || tool.includes('agent_run')) return 'work';
+  if (tool === 'workspace_set_mail_read_state' || tool.includes('mail')) return 'inbox';
+  if (tool.includes('task')) return 'tasks';
+  if (tool.includes('calendar')) return 'calendar';
+  if (tool.includes('note')) return 'notes';
+  if (tool.includes('memory') || tool.includes('fact')) return 'memory';
+  if (tool.includes('supply')) return 'supplies';
+  if (tool.includes('project') || tool.includes('work_item') || tool.includes('work_dashboard') || tool.includes('agent_')) return 'work';
+  if (tool === 'workspace_list_accounts') return 'accounts';
+  return null;
+}
+
+function rowsForToolResult(tool: WorkspaceToolName, result: unknown): Array<Record<string, unknown>> {
+  const view = viewForTool(tool);
+  if (!view) return [];
+  const record = objectValue(result);
+  if (tool === 'workspace_search_mail') return arrayValue(record.results).map((item) => ({ ...item, _kind: 'Mail' }));
+  if (tool === 'workspace_search_supplies') return arrayValue(record.products).map((item) => ({ ...item, _kind: 'Supply' }));
+  if (tool === 'workspace_search_second_brain') return arrayValue(record.results).map((item) => ({ ...item, _kind: 'Second Brain result' }));
+  return liveRows(view, result);
 }
 
 async function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
@@ -301,13 +338,22 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [messages, setMessages] = useState(DEMO_MAIL);
   const [notes, setNotes] = useState(DEMO_NOTES);
   const [memory, setMemory] = useState(DEMO_MEMORY);
-  const [activity, setActivity] = useState(DEMO_ACTIVITY);
+  const [activity, setActivity] = useState<typeof DEMO_ACTIVITY>(ownerAccess ? [] : DEMO_ACTIVITY);
   const [supplies, setSupplies] = useState<DemoSupplyProduct[]>(DEMO_SUPPLIES);
   const [supplyCart, setSupplyCart] = useState<DemoSupplyCart>(EMPTY_DEMO_SUPPLY_CART);
-  const [live, setLive] = useState<LiveState>({ loading: false, data: {}, accounts: null, error: null, warning: null });
+  const [live, setLive] = useState<LiveState>({ loading: ownerAccess, data: {}, accounts: null, error: null, warning: null });
   const [liveRefreshKey, setLiveRefreshKey] = useState(0);
+  const [todayEyebrow, setTodayEyebrow] = useState('Today');
+  const [themePreference, setThemePreference] = useState<ThemePreference>('system');
+  const [systemDark, setSystemDark] = useState(true);
   const liveRef = useRef(live);
   const tasksRef = useRef(tasks);
+  const messagesRef = useRef(messages);
+  const eventsRef = useRef(events);
+  const notesRef = useRef(notes);
+  const memoryRef = useRef(memory);
+  const accountsRef = useRef(accounts);
+  const suppliesRef = useRef(supplies);
   const modeRef = useRef(mode);
   const demoVoiceAccessRef = useRef(demoVoiceAccess);
   const pendingRef = useRef(pending);
@@ -325,6 +371,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const voiceMeterRef = useRef<VoiceLevelMeter | null>(null);
   const selectedVoiceRef = useRef<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
   const lastFocusedItemRef = useRef<Partial<Record<WorkspaceView, string>>>({});
+  const toolRowsRef = useRef<Partial<Record<WorkspaceView, Array<Record<string, unknown>>>>>({});
   const [voiceMeter, setVoiceMeter] = useState<VoiceLevelMeter | null>(null);
   const [voiceHearing, setVoiceHearing] = useState(false);
   const [voiceThinking, setVoiceThinking] = useState(false);
@@ -335,6 +382,54 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   useEffect(() => { pendingRef.current = pending; }, [pending]);
   useEffect(() => { liveRef.current = live; }, [live]);
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { eventsRef.current = events; }, [events]);
+  useEffect(() => { notesRef.current = notes; }, [notes]);
+  useEffect(() => { memoryRef.current = memory; }, [memory]);
+  useEffect(() => { accountsRef.current = accounts; }, [accounts]);
+  useEffect(() => { suppliesRef.current = supplies; }, [supplies]);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      setTodayEyebrow(new Intl.DateTimeFormat('en-US', {
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+      }).format(new Date()));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+  useEffect(() => {
+    const saved = window.localStorage.getItem('openassist-theme');
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const update = () => setSystemDark(media.matches);
+    const frame = window.requestAnimationFrame(() => {
+      if (saved === 'system' || saved === 'light' || saved === 'dark') setThemePreference(saved);
+      update();
+    });
+    media.addEventListener('change', update);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      media.removeEventListener('change', update);
+    };
+  }, []);
+
+  const chooseTheme = useCallback((next: ThemePreference) => {
+    setThemePreference(next);
+    window.localStorage.setItem('openassist-theme', next);
+  }, []);
+  const [toastFaded, setToastFaded] = useState(false);
+  // Reset during render (the same idiom as usePagination) so a new toast is
+  // visible on its very first paint without a cascading effect render.
+  const [lastToast, setLastToast] = useState(toast);
+  if (lastToast !== toast) {
+    setLastToast(toast);
+    setToastFaded(false);
+  }
+  useEffect(() => {
+    if (toastSeverity(toast) === 'error') return;
+    const timeout = window.setTimeout(() => setToastFaded(true), 6_000);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
   useEffect(() => {
     const stored = window.localStorage.getItem('openassist-realtime-voice');
     if (!stored) return;
@@ -417,6 +512,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
 
   const focusView = useCallback((nextView: WorkspaceView, itemId?: string) => {
     setView(nextView);
+    setSearch('');
     if (itemId) setSelectedId(itemId);
     window.setTimeout(() => {
       document.getElementById(itemId ? `workspace-item-${itemId}` : `view-${nextView}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -464,19 +560,74 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const resolvedItemId = requestedItemId ?? lastFocusedItemRef.current[nextView];
       if (!requestedItemId && resolvedItemId) delete lastFocusedItemRef.current[nextView];
       focusView(nextView, resolvedItemId);
-      if (resolvedItemId && nextView !== 'notes' && nextView !== 'activity') {
-        if (modeRef.current === 'demo' && nextView === 'tasks') {
-          const task = tasksRef.current.find((candidate) => candidate.id === resolvedItemId);
-          if (task) setOpenLiveItem({ id: resolvedItemId, view: nextView, item: { ...task, _kind: 'Demo task' } });
+      let opened = false;
+      if (resolvedItemId && nextView !== 'activity') {
+        if (modeRef.current === 'demo') {
+          const demoRows = nextView === 'tasks'
+            ? tasksRef.current.map((item) => ({ ...item, _kind: 'Demo task' }))
+            : nextView === 'inbox' || nextView === 'today'
+              ? messagesRef.current.map((item) => ({ ...item, _kind: 'Demo mail' }))
+              : nextView === 'calendar'
+                ? eventsRef.current.map((item) => ({ ...item, _kind: 'Demo calendar event' }))
+                : nextView === 'notes'
+                  ? notesRef.current.map((item) => ({ ...item, _kind: 'Demo note' }))
+                  : nextView === 'memory'
+                    ? memoryRef.current.map((item) => ({ ...item, _kind: 'Demo memory' }))
+                    : nextView === 'accounts'
+                      ? accountsRef.current.map((item) => ({ ...item, _kind: 'Demo account' }))
+                      : nextView === 'supplies'
+                        ? suppliesRef.current.map((item) => ({ ...item, _kind: 'Demo supply' }))
+            : toolRowsRef.current[nextView] ?? [];
+          const item = demoRows.find((candidate, index) => liveItemId(candidate, `${nextView}-${index + 1}`) === resolvedItemId);
+          if (item) {
+            if (nextView === 'notes') {
+              setOpenNote({
+                id: resolvedItemId,
+                title: displayText(item, ['title', 'name'], 'Demo note'),
+                content: displayText(item, ['content', 'text', 'body', 'markdown'], 'This note is empty.'),
+                source: 'Temporary demo note',
+              });
+            } else {
+              setOpenLiveItem({ id: resolvedItemId, view: nextView, item });
+            }
+            opened = true;
+          }
         } else if (modeRef.current === 'live') {
           const current = liveRef.current;
           const source = nextView === 'accounts' ? current.accounts : current.data[nextView];
-          const item = liveRows(nextView, source).find((candidate, index) => liveItemId(candidate, `${nextView}-${index + 1}`) === resolvedItemId);
-          if (item) setOpenLiveItem({ id: resolvedItemId, view: nextView, item });
+          const rows = [...(toolRowsRef.current[nextView] ?? []), ...liveRows(nextView, source)];
+          const item = rows.find((candidate, index) => liveItemId(candidate, `${nextView}-${index + 1}`) === resolvedItemId);
+          if (item) {
+            if (nextView === 'notes') {
+              const noteId = displayText(item, ['documentId', 'noteId', 'id'], '');
+              const account = displayText(item, ['_account', 'account', 'email'], 'Main');
+              if (noteId) {
+                const response = await fetch('/api/workspace/tool', {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ tool: 'workspace_read_note', args: { account, noteId } }),
+                });
+                const result = await response.json() as Record<string, unknown> & { error?: string };
+                if (!response.ok) throw new Error(result.error ?? 'The note could not be opened.');
+                const note = noteRecord(result);
+                setOpenNote({
+                  id: noteId,
+                  title: displayText(note, ['title', 'name'], displayText(item, ['title', 'name'], 'Drive note')),
+                  content: displayText(note, ['content', 'text', 'body', 'plainText', 'markdown'], 'This note is empty.'),
+                  source: `${account} · Google Drive`,
+                  openUrl: safeExternalUrl(displayText(note, ['webViewLink', 'url', 'link'], '')),
+                });
+                opened = true;
+              }
+            } else {
+              setOpenLiveItem({ id: resolvedItemId, view: nextView, item });
+              opened = true;
+            }
+          }
         }
       }
       setToast(`Focused ${nextView}.`);
-      return { status: 'focused', view: nextView, itemId: resolvedItemId ?? null, opened: Boolean(resolvedItemId) };
+      return { status: 'focused', view: nextView, itemId: resolvedItemId ?? null, opened };
     }
 
     if (!tool.readOnly && tool.approval !== 'policy') {
@@ -494,9 +645,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const body = (await response.json()) as DemoApiResponse;
       if (!response.ok) throw new Error(body.error ?? 'The demo request failed.');
       if (body.workspace) hydrateDemoWorkspace(body.workspace, body.expiresAt);
-      if (name === 'workspace_find_tasks') {
-        const first = liveRows('tasks', body.result)[0];
-        if (first) lastFocusedItemRef.current.tasks = liveItemId(first, 'task-result-1');
+      const resultView = viewForTool(name);
+      if (resultView) {
+        const rows = rowsForToolResult(name, body.result);
+        if (rows.length > 0) toolRowsRef.current[resultView] = rows;
+        const first = rows[0];
+        if (first) lastFocusedItemRef.current[resultView] = liveItemId(first, `${resultView}-result-1`);
       }
       if (name === 'workspace_search_supplies' && body.result && typeof body.result === 'object' && 'products' in body.result && Array.isArray(body.result.products)) {
         setSupplies(body.result.products as DemoSupplyProduct[]);
@@ -513,9 +667,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     });
     const result = (await response.json()) as { error?: string };
     if (!response.ok) throw new Error(result.error ?? 'Workspace request failed.');
-    if (name === 'workspace_find_tasks') {
-      const first = liveRows('tasks', result)[0];
-      if (first) lastFocusedItemRef.current.tasks = liveItemId(first, 'task-result-1');
+    const resultView = viewForTool(name);
+    if (resultView) {
+      const rows = rowsForToolResult(name, result);
+      if (rows.length > 0) toolRowsRef.current[resultView] = rows;
+      const first = rows[0];
+      if (first) lastFocusedItemRef.current[resultView] = liveItemId(first, `${resultView}-result-1`);
     }
     if (tool.approval === 'policy') setLiveRefreshKey((current) => current + 1);
     setActivity((current) => [{ id: randomId('activity'), actor: 'Workspace', action: `${tool.readOnly ? 'Read' : 'Policy action'}: ${tool.title}`, time: 'Just now', type: tool.readOnly ? 'read' as const : 'write' as const }, ...current].slice(0, 40));
@@ -573,11 +730,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       };
       const [toolName, args] = requestForView[view];
       void (async () => {
-        const accountsResult = live.accounts ?? await invokeTool('workspace_list_accounts', {}, controller.signal);
-        const viewResult = toolName === 'workspace_list_accounts'
-          ? accountsResult
-          : await invokeTool(toolName, args, controller.signal);
-        return [accountsResult, viewResult] as const;
+        const accountsPromise = liveRef.current.accounts
+          ? Promise.resolve(liveRef.current.accounts)
+          : invokeTool('workspace_list_accounts', {}, controller.signal);
+        const viewPromise = toolName === 'workspace_list_accounts'
+          ? accountsPromise
+          : invokeTool(toolName, args, controller.signal);
+        return Promise.all([accountsPromise, viewPromise] as const);
       })().then(([accountsResult, viewResult]) => {
         setLive((current) => ({
           loading: false,
@@ -589,7 +748,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       }).catch((error: unknown) => {
         if (controller.signal.aborted) return;
         const message = error instanceof Error ? error.message : 'Workspace could not be loaded.';
-        const reconnectRequired = /Workspace (?:is not connected|must be reconnected|authorization expired)/i.test(message);
+        const reconnectRequired = /Workspace (?:is not connected|must be reconnected|authorization expired)|Google account .{1,320} must reconnect|No connected Google account|No Google account with connected|No connected Gmail account|Connect the required Google service|Gmail is disconnected/i.test(message);
         setLive((current) => ({
           ...current,
           loading: false,
@@ -602,7 +761,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [invokeTool, live.accounts, liveRefreshKey, mode, user, view]);
+  }, [invokeTool, liveRefreshKey, mode, user, view]);
 
   useEffect(() => {
     if (!document.modelContext) {
@@ -626,9 +785,14 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
 
     const siteToolHandler = (event: Event) => {
       const detail = (event as CustomEvent<{ tool: WorkspaceToolName; args: Record<string, unknown>; requestId: string }>).detail;
-      void invokeTool(detail.tool, detail.args).then((result) => {
-        window.dispatchEvent(new CustomEvent('openassist:site-tool-result', { detail: { requestId: detail.requestId, result } }));
-      });
+      void invokeTool(detail.tool, detail.args)
+        .then((result) => {
+          window.dispatchEvent(new CustomEvent('openassist:site-tool-result', { detail: { requestId: detail.requestId, result } }));
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : 'The workspace tool failed.';
+          window.dispatchEvent(new CustomEvent('openassist:site-tool-result', { detail: { requestId: detail.requestId, error: message } }));
+        });
     };
     window.addEventListener('openassist:use-site-tool', siteToolHandler);
     return () => {
@@ -681,8 +845,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     }
     setPending(null);
     setActivity((current) => [{ id: randomId('activity'), actor: confirmationMethod === 'voice' ? 'Voice + You' : 'You', action: `Approved: ${action.title}`, time: 'Just now', type: 'write' as const }, ...current].slice(0, 40));
-    if (action.tool.includes('project') || action.tool.includes('work_item')) {
-      focusView('work');
+    const updatedView = viewForTool(action.tool);
+    if (updatedView) {
+      const itemId = typeof body.itemId === 'string'
+        ? body.itemId
+        : typeof body.id === 'string' ? body.id : undefined;
+      focusView(updatedView, itemId);
       setLiveRefreshKey((current) => current + 1);
     }
     setToast('Change saved and verified by reading it back.');
@@ -1154,61 +1322,67 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     window.location.reload();
   }, [ownerSetupCode]);
 
-  const copy = mode === 'demo' && view === 'notes'
+  const copy = view === 'today'
+    ? { ...VIEW_COPY.today, eyebrow: todayEyebrow }
+    : mode === 'demo' && view === 'notes'
     ? { eyebrow: 'Temporary demo notes', title: 'Notes', subtitle: 'Judge-created notes stay isolated from Google and expire automatically.' }
     : mode === 'demo' && view === 'memory'
       ? { eyebrow: 'Temporary demo memory', title: 'Memory', subtitle: 'Safe synthetic preferences for testing agent decisions.' }
       : mode === 'live' && view === 'inbox'
         ? { ...VIEW_COPY.inbox, eyebrow: 'Connected Google accounts' }
-        : VIEW_COPY[view];
+      : VIEW_COPY[view];
+  const resolvedTheme = themePreference === 'system' ? (systemDark ? 'dark' : 'light') : themePreference;
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_38%_-14%,rgba(224,188,99,0.07),transparent_34%),radial-gradient(circle_at_88%_8%,rgba(224,188,99,0.035),transparent_24%),#08090d] text-[#e8eef7]">
+    <main data-theme={resolvedTheme} className="oa-app-shell min-h-screen text-ink">
       <div className="mx-auto grid min-h-screen w-full max-w-[1800px] grid-cols-[238px_minmax(0,1fr)_minmax(300px,340px)] max-xl:grid-cols-[84px_minmax(0,1fr)] max-md:grid-cols-1">
         <Sidebar view={view} user={user} items={visibleNavigation} onView={focusView} onSignOut={() => void signOut()} />
         <section id={`view-${view}`} className="min-w-0 pb-[calc(88px+env(safe-area-inset-bottom))] md:pb-10">
-          <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] px-5 py-3.5 md:hidden">
+          <div className="flex items-center justify-between gap-3 border-b border-hairline px-5 py-3.5 md:hidden">
             <div className="flex min-w-0 items-center gap-2.5">
               <BrandMark size="h-8 w-8" />
               <div className="min-w-0">
                 <p className="truncate text-sm font-semibold leading-tight">OpenAssist</p>
-                <p className="truncate text-[11px] leading-tight text-[#7c8a9c]">Daily Workspace</p>
+                <p className="truncate text-[11px] leading-tight text-text-3">Daily Workspace</p>
               </div>
             </div>
-            <div className="flex shrink-0 items-center gap-2"><span className="rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#E0BC63]">{user?.access === 'judge' ? 'Judge' : mode}</span><button onClick={() => void signOut()} className="text-[10px] font-medium text-[#7c8a9c]">Sign out</button></div>
+            <div className="flex shrink-0 items-center gap-2"><span className="rounded-full border border-brand/20 bg-brand/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">{user?.access === 'judge' ? 'Judge' : mode}</span><button onClick={() => void signOut()} className="text-[10px] font-medium text-text-3">Sign out</button></div>
           </div>
 
           <div className="px-5 pt-5 sm:px-8 sm:pt-6 lg:px-12">
-            <header className="border-b border-white/[0.08] pb-5">
+            <header className="relative pb-5"><div aria-hidden="true" className="oa-header-divider" />
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
-                  <p className="truncate text-[11px] font-semibold uppercase tracking-[0.15em] text-[#E0BC63] sm:text-xs">{copy.eyebrow}</p>
+                  <p className="truncate text-[11px] font-semibold uppercase tracking-[0.14em] text-text-3 sm:text-xs">{copy.eyebrow}</p>
                   <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">{copy.title}</h1>
-                  <p className="mt-1 max-w-prose text-sm leading-5 text-[#7c8a9c] max-sm:oa-clamp-2">{copy.subtitle}</p>
+                  <p className="mt-1 max-w-prose text-sm leading-5 text-text-3 max-sm:hidden">{copy.subtitle}</p>
                 </div>
-                <button onClick={() => setVoicePanelOpen(true)} aria-label={`Open voice · ${voiceStateLabel}`} title={`Open voice · ${voiceStateLabel}`} className="group grid shrink-0 place-items-center rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E0BC63]/50">
-                  <VoiceOrb phase={orbPhase} meter={voiceMeter} size={48} />
-                </button>
+                <div className="flex shrink-0 items-center gap-2">
+                  <ThemePicker value={themePreference} onChange={chooseTheme} />
+                  <button onClick={() => setVoicePanelOpen(true)} aria-label={`Open voice · ${voiceStateLabel}`} title={`Open voice · ${voiceStateLabel}`} className="group grid shrink-0 place-items-center rounded-full opacity-90 transition duration-150 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/50">
+                    <VoiceOrb phase={orbPhase} meter={voiceMeter} size={48} />
+                  </button>
+                </div>
               </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-2.5">
                 <label className="relative min-w-0 flex-1 basis-full sm:basis-auto sm:max-w-xs">
                   <span className="sr-only">Search current view</span>
-                  <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search workspace" className="w-full min-w-0 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm outline-none transition placeholder:text-[#5b6879] focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10" />
+                  <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={view === 'work' ? 'Use Knowledge search below' : 'Filter this view'} disabled={view === 'work'} className="w-full min-w-0 rounded-xl border border-hairline-strong bg-wash px-3 py-2 text-sm outline-none transition placeholder:text-text-4 focus:border-brand/50 focus:ring-2 focus:ring-brand/10 disabled:cursor-not-allowed disabled:opacity-45" />
                 </label>
-                {ownerAccess && <span className="shrink-0 rounded-xl border border-[#E0BC63]/20 bg-[#E0BC63]/[0.06] px-3 py-2 text-xs font-semibold text-[#FFE9AE] xl:hidden">Private Live</span>}
-                {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Reset demo</button>}
+                {ownerAccess && <span className="shrink-0 rounded-xl border border-teal/20 bg-teal/10 px-3 py-2 text-xs font-semibold text-teal-strong xl:hidden">Private Live</span>}
+                {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:border-brand/35 hover:text-ink">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="mt-4 rounded-xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.035] px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-[#7c8a9c]"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div></div>}
-            {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} />}
-            <div className="py-7">
+            {mode === 'demo' && <div className="mt-4 rounded-xl border border-hairline bg-wash/60 px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-text-3"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div></div>}
+            {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} toolCount={webMcpTools.length} />}
+            <div key={view} className="oa-view-in py-7">
               {mode === 'live' ? (
               view === 'activity'
                 ? <ActivityView mode={mode} activity={activity} owner={Boolean(user?.owner)} onVoicePolicyChanged={refreshJudgeVoicePolicy} />
                 : view === 'work' && live.accounts && !live.error
                   ? <SecondBrainWorkspace source={live.data.work} loading={live.loading} warning={live.warning} onRefresh={() => setLiveRefreshKey((current) => current + 1)} onInvoke={invokeTool} />
-                : <LiveWorkspaceView view={view} live={live} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => { setSelectedId(id); setOpenLiveItem({ id, view, item }); }} />
-            ) : demoLoading ? <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Preparing your private demo workspace…</p></div></div> : <>
+                : <LiveWorkspaceView view={view} live={live} query={search} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => { setSelectedId(id); setOpenLiveItem({ id, view, item }); }} />
+            ) : demoLoading ? <WorkspaceLoading title="Preparing your private demo workspace" detail="Loading isolated synthetic mail, tasks, and calendar…" /> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
               {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
               {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); const task = tasks.find((candidate) => candidate.id === id); if (task) setOpenLiveItem({ id, view: 'tasks', item: { ...task, _kind: 'Demo task' } }); }} onCreate={() => setEditor('task')} />}
@@ -1229,34 +1403,35 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
       {openNote && <NoteReader note={openNote} onClose={() => setOpenNote(null)} />}
       {openLiveItem && <LiveItemReader value={openLiveItem} onClose={() => setOpenLiveItem(null)} />}
+      <div aria-live="polite" className={`fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 z-30 w-[min(92vw,460px)] -translate-x-1/2 rounded-2xl border bg-surface/95 px-4 py-3 text-center text-xs leading-5 shadow-[0_18px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-opacity duration-500 xl:hidden md:bottom-5 ${toastFaded ? 'pointer-events-none opacity-0' : 'opacity-100'} ${toastSeverity(toast) === 'error' ? 'border-danger/30 text-danger-strong' : toastSeverity(toast) === 'success' ? 'border-success/25 text-text-2' : 'border-hairline-strong text-text-2'}`}>{toast}</div>
       <MobileNavigation view={view} items={visibleNavigation} onView={focusView} />
     </main>
   );
 }
 
-function JudgeQuickStart({ onNavigate }: { onNavigate: (view: WorkspaceView) => void }) {
+function JudgeQuickStart({ onNavigate, toolCount }: { onNavigate: (view: WorkspaceView) => void; toolCount: number }) {
   return (
-    <section aria-labelledby="judge-quick-start" className="mt-4 overflow-hidden rounded-2xl border border-white/[0.08] bg-white/[0.025]">
+    <section aria-labelledby="judge-quick-start" className="mt-4 overflow-hidden rounded-2xl border border-hairline bg-wash/60">
       <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3.5 sm:px-5">
         <div className="min-w-0">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#E0BC63]">Judge quick start</p>
-          <h2 id="judge-quick-start" className="mt-1 text-sm font-semibold text-[#e8eef7]">Ask ChatGPT to work with this visible workspace</h2>
-          <p className="mt-1 max-w-2xl text-xs leading-5 text-[#7c8a9c]">Reads happen immediately. Any change opens an exact preview here and waits for your approval.</p>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Judge quick start</p>
+          <h2 id="judge-quick-start" className="mt-1 text-sm font-semibold text-ink">Ask ChatGPT to work with this visible workspace</h2>
+          <p className="mt-1 max-w-2xl text-xs leading-5 text-text-3">Reads happen immediately. Any change opens an exact preview here and waits for your approval.</p>
         </div>
-        <span className="shrink-0 rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold text-[#E0BC63]">29 WebMCP tools</span>
+        <span className="shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">{toolCount} WebMCP tools</span>
       </div>
-      <div className="grid border-t border-white/[0.07] md:grid-cols-3">
-        <button type="button" onClick={() => onNavigate('inbox')} className="group px-4 py-3 text-left transition hover:bg-[#E0BC63]/[0.045] focus-visible:bg-[#E0BC63]/[0.045] focus-visible:outline-none sm:px-5 md:border-r md:border-white/[0.07]">
-          <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#7c8a9c] group-hover:text-[#E0BC63]">1 · Understand</span>
-          <span className="mt-1 block text-xs leading-5 text-[#cbd4db]">“Show my daily brief and focus the most urgent unread message.”</span>
+      <div className="grid border-t border-hairline md:grid-cols-3">
+        <button type="button" onClick={() => onNavigate('inbox')} className="group px-4 py-3 text-left transition hover:bg-brand/5 focus-visible:bg-brand/5 focus-visible:outline-none sm:px-5 md:border-r md:border-hairline">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3 group-hover:text-brand">1 · Understand</span>
+          <span className="mt-1 block text-xs leading-5 text-text-2">“Show my daily brief and focus the most urgent unread message.”</span>
         </button>
-        <button type="button" onClick={() => onNavigate('supplies')} className="group border-t border-white/[0.07] px-4 py-3 text-left transition hover:bg-[#E0BC63]/[0.045] focus-visible:bg-[#E0BC63]/[0.045] focus-visible:outline-none sm:px-5 md:border-r md:border-t-0 md:border-white/[0.07]">
-          <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#7c8a9c] group-hover:text-[#E0BC63]">2 · Find</span>
-          <span className="mt-1 block text-xs leading-5 text-[#cbd4db]">“Find a USB-C Security Key and prepare one in the cart.”</span>
+        <button type="button" onClick={() => onNavigate('supplies')} className="group border-t border-hairline px-4 py-3 text-left transition hover:bg-brand/5 focus-visible:bg-brand/5 focus-visible:outline-none sm:px-5 md:border-r md:border-t-0 md:border-hairline">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3 group-hover:text-brand">2 · Find</span>
+          <span className="mt-1 block text-xs leading-5 text-text-2">“Find a USB-C Security Key and prepare one in the cart.”</span>
         </button>
-        <button type="button" onClick={() => onNavigate('activity')} className="group border-t border-white/[0.07] px-4 py-3 text-left transition hover:bg-[#E0BC63]/[0.045] focus-visible:bg-[#E0BC63]/[0.045] focus-visible:outline-none sm:px-5 md:border-t-0">
-          <span className="block text-[10px] font-semibold uppercase tracking-[0.12em] text-[#7c8a9c] group-hover:text-[#E0BC63]">3 · Verify</span>
-          <span className="mt-1 block text-xs leading-5 text-[#cbd4db]">Approve the preview, then see the verified result in Activity.</span>
+        <button type="button" onClick={() => onNavigate('activity')} className="group border-t border-hairline px-4 py-3 text-left transition hover:bg-brand/5 focus-visible:bg-brand/5 focus-visible:outline-none sm:px-5 md:border-t-0">
+          <span className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3 group-hover:text-brand">3 · Verify</span>
+          <span className="mt-1 block text-xs leading-5 text-text-2">Approve the preview, then see the verified result in Activity.</span>
         </button>
       </div>
     </section>
@@ -1295,11 +1470,11 @@ function MobileNavigation({ view, items, onView }: { view: WorkspaceView; items:
       {moreOpen && (
         <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-[2px] md:hidden" onClick={() => setMoreOpen(false)} aria-hidden="true" />
       )}
-      <nav aria-label="Workspace views" className="fixed bottom-0 left-0 z-50 w-screen max-w-full border-t border-white/[0.08] bg-[#0d0f14]/95 pb-[env(safe-area-inset-bottom)] backdrop-blur-xl md:hidden">
+      <nav aria-label="Workspace views" className="fixed bottom-0 left-0 z-50 w-screen max-w-full border-t border-hairline bg-surface/95 pb-[env(safe-area-inset-bottom)] backdrop-blur-xl md:hidden">
         {moreOpen && (
-          <div className="grid grid-cols-4 gap-1 border-b border-white/[0.07] px-2 py-2">
+          <div className="grid grid-cols-4 gap-1 border-b border-hairline px-2 py-2">
             {overflow.map((item) => (
-              <button key={item.view} onClick={() => { onView(item.view); setMoreOpen(false); }} aria-current={view === item.view ? 'page' : undefined} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2.5 transition ${view === item.view ? 'bg-[#E0BC63]/[0.14] text-[#FFE9AE]' : 'text-[#a4b1c2] hover:bg-white/[0.05]'}`}>
+              <button key={item.view} onClick={() => { onView(item.view); setMoreOpen(false); }} aria-current={view === item.view ? 'page' : undefined} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2.5 transition ${view === item.view ? 'bg-brand/15 text-brand-strong' : 'text-text-2 hover:bg-wash'}`}>
                 <ViewIcon view={item.view} />
                 <span className="w-full truncate text-center text-[10px] leading-tight">{item.label}</span>
               </button>
@@ -1309,8 +1484,8 @@ function MobileNavigation({ view, items, onView }: { view: WorkspaceView; items:
         <ul className="grid grid-cols-5 gap-0.5 px-1.5 py-1.5">
           {primary.map((item) => (
             <li key={item.view} className="min-w-0">
-              <button onClick={() => { onView(item.view); setMoreOpen(false); }} aria-current={view === item.view ? 'page' : undefined} className={`flex w-full flex-col items-center gap-0.5 rounded-xl px-1 py-1.5 transition ${view === item.view ? 'text-[#FFE9AE]' : 'text-[#7c8a9c]'}`}>
-                <span className={`grid h-8 w-full max-w-[56px] place-items-center rounded-lg transition ${view === item.view ? 'bg-[#E0BC63]/[0.15]' : ''}`}>
+              <button onClick={() => { onView(item.view); setMoreOpen(false); }} aria-current={view === item.view ? 'page' : undefined} className={`flex w-full flex-col items-center gap-0.5 rounded-xl px-1 py-1.5 transition ${view === item.view ? 'text-brand-strong' : 'text-text-3'}`}>
+                <span className={`grid h-8 w-full max-w-[56px] place-items-center rounded-lg transition ${view === item.view ? 'bg-brand/15' : ''}`}>
                   <ViewIcon view={item.view} />
                 </span>
                 <span className="w-full truncate text-center text-[10px] font-medium leading-tight">{item.label}</span>
@@ -1318,8 +1493,8 @@ function MobileNavigation({ view, items, onView }: { view: WorkspaceView; items:
             </li>
           ))}
           <li className="min-w-0">
-            <button onClick={() => setMoreOpen((open) => !open)} aria-expanded={moreOpen} aria-label="More workspace views" className={`flex w-full flex-col items-center gap-0.5 rounded-xl px-1 py-1.5 transition ${moreOpen || overflowActive ? 'text-[#FFE9AE]' : 'text-[#7c8a9c]'}`}>
-              <span className={`grid h-8 w-full max-w-[56px] place-items-center rounded-lg transition ${moreOpen || overflowActive ? 'bg-[#E0BC63]/[0.15]' : ''}`}>
+            <button onClick={() => setMoreOpen((open) => !open)} aria-expanded={moreOpen} aria-label="More workspace views" className={`flex w-full flex-col items-center gap-0.5 rounded-xl px-1 py-1.5 transition ${moreOpen || overflowActive ? 'text-brand-strong' : 'text-text-3'}`}>
+              <span className={`grid h-8 w-full max-w-[56px] place-items-center rounded-lg transition ${moreOpen || overflowActive ? 'bg-brand/15' : ''}`}>
                 <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className="h-[18px] w-[18px]"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
               </span>
               <span className="w-full truncate text-center text-[10px] font-medium leading-tight">More</span>
@@ -1331,20 +1506,39 @@ function MobileNavigation({ view, items, onView }: { view: WorkspaceView; items:
   );
 }
 
+const THEME_OPTIONS: Array<{ id: ThemePreference; label: string; icon: React.ReactNode }> = [
+  { id: 'system', label: 'System theme', icon: <path d="M4 5h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm5 14h6m-3-3v3" /> },
+  { id: 'light', label: 'Light theme', icon: <path d="M12 4V2m0 20v-2m8-8h2M2 12h2m13.66-5.66 1.41-1.41M4.93 19.07l1.41-1.41m0-11.32L4.93 4.93m14.14 14.14-1.41-1.41M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z" /> },
+  { id: 'dark', label: 'Dark theme', icon: <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z" /> },
+];
+
+function ThemePicker({ value, onChange }: { value: ThemePreference; onChange: (value: ThemePreference) => void }) {
+  return (
+    <div role="radiogroup" aria-label="Color theme" className="flex h-9 shrink-0 items-center rounded-xl border border-hairline-strong bg-wash p-0.5">
+      {THEME_OPTIONS.map((option) => (
+        <button key={option.id} type="button" role="radio" aria-checked={value === option.id} title={option.label} onClick={() => onChange(option.id)} className={`grid h-full w-8 place-items-center rounded-[10px] transition ${value === option.id ? 'bg-wash-strong text-ink shadow-[inset_0_0_0_1px_var(--hairline-strong)]' : 'text-text-4 hover:text-text-2'}`}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="h-4 w-4">{option.icon}</svg>
+          <span className="sr-only">{option.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Sidebar({ view, user, items, onView, onSignOut }: { view: WorkspaceView; user: SiteUser; items: typeof NAVIGATION; onView: (view: WorkspaceView) => void; onSignOut: () => void }) {
   const owner = user?.access === 'owner';
-  return <aside className="min-w-0 border-r border-white/[0.08] px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-[#7c8a9c]">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-white/[0.09] text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]' : 'text-[#a4b1c2] hover:bg-white/[0.05] hover:text-white'}`}><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg border border-white/10"><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-white/[0.08] pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#5b6879]">Access</p><span className="mt-3 inline-flex rounded-full border border-[#E0BC63]/20 bg-[#E0BC63]/[0.07] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#E0BC63]">{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-[#7c8a9c]">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-[#E0BC63] transition hover:text-[#F2D783]">Sign out</button></div></aside>;
+  return <aside className="min-w-0 border-r border-hairline px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-text-3">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl border-l-2 px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'border-brand bg-wash-strong text-ink' : 'border-transparent text-text-2 hover:bg-wash hover:text-ink'}`}><span className={`grid h-7 w-7 shrink-0 place-items-center rounded-lg ${view === item.view ? 'text-brand' : 'text-text-3'}`}><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-hairline pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Access</p><span className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] ${owner ? 'border-teal/20 bg-teal/10 text-teal-strong' : 'border-brand/20 bg-brand/10 text-brand'}`}>{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-text-3">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-text-2 transition hover:text-ink">Sign out</button></div></aside>;
 }
 
 function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, onRefresh }: { threads: VoiceThread[]; selectedId: string | null; loading: boolean; connected: boolean; onSelect: (threadId: string | null) => void; onRefresh: () => void }) {
   const selectId = useId();
   return (
-    <div className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-3.5">
+    <div className="rounded-2xl border border-hairline bg-wash/60 p-3.5">
       <div className="flex items-center justify-between gap-3">
-        <label htmlFor={selectId} className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">Conversation</label>
-        <button type="button" onClick={onRefresh} disabled={loading || connected} className="text-[11px] font-medium text-[#E0BC63] transition hover:text-[#F2D783] disabled:cursor-not-allowed disabled:opacity-40">{loading ? 'Loading…' : 'Refresh'}</button>
+        <label htmlFor={selectId} className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">Conversation</label>
+        <button type="button" onClick={onRefresh} disabled={loading || connected} className="text-[11px] font-medium text-brand transition hover:text-brand-strong disabled:cursor-not-allowed disabled:opacity-40">{loading ? 'Loading…' : 'Refresh'}</button>
       </div>
-      <select id={selectId} value={selectedId ?? ''} onChange={(event) => onSelect(event.target.value || null)} disabled={loading || connected} className="mt-2 w-full rounded-xl border border-white/10 bg-[#101215] px-3 py-2.5 text-sm text-[#dce4ea] outline-none transition focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10 disabled:cursor-not-allowed disabled:opacity-60">
+      <select id={selectId} value={selectedId ?? ''} onChange={(event) => onSelect(event.target.value || null)} disabled={loading || connected} className="mt-2 w-full rounded-xl border border-hairline-strong bg-surface px-3 py-2.5 text-sm text-ink outline-none transition focus:border-brand/50 focus:ring-2 focus:ring-brand/10 disabled:cursor-not-allowed disabled:opacity-60">
         <option value="">New conversation</option>
         {threads.map((thread) => {
           const savedAt = thread.updatedAt || thread.createdAt;
@@ -1352,7 +1546,7 @@ function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, 
           return <option key={thread.id} value={thread.id}>{label.slice(0, 90)}</option>;
         })}
       </select>
-      <p className="mt-2 text-[11px] leading-4 text-[#7c8a9c]">{connected ? 'Stop voice before changing conversations.' : selectedId ? 'Voice will continue this saved conversation.' : 'Voice will start a new saved conversation.'}</p>
+      <p className="mt-2 text-[11px] leading-4 text-text-3">{connected ? 'Stop voice before changing conversations.' : selectedId ? 'Voice will continue this saved conversation.' : 'Voice will start a new saved conversation.'}</p>
     </div>
   );
 }
@@ -1361,12 +1555,12 @@ function VoicePicker({ value, connected, onChange }: { value: RealtimeVoice; con
   const selectId = useId();
   const selected = REALTIME_VOICES.find((voice) => voice.id === value) ?? REALTIME_VOICES[0];
   return (
-    <div className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-3.5">
+    <div className="rounded-2xl border border-hairline bg-wash/60 p-3.5">
       <div className="flex items-center justify-between gap-3">
-        <label htmlFor={selectId} className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">Voice</label>
-        <span className="text-[10px] text-[#5b6879]">{connected ? 'Stop to change' : selected.description}</span>
+        <label htmlFor={selectId} className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">Voice</label>
+        <span className="text-[10px] text-text-4">{connected ? 'Stop to change' : selected.description}</span>
       </div>
-      <select id={selectId} value={value} onChange={(event) => onChange(parseRealtimeVoice(event.target.value))} disabled={connected} className="mt-2 w-full rounded-xl border border-white/10 bg-[#101215] px-3 py-2.5 text-sm text-[#dce4ea] outline-none transition focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10 disabled:cursor-not-allowed disabled:opacity-60">
+      <select id={selectId} value={value} onChange={(event) => onChange(parseRealtimeVoice(event.target.value))} disabled={connected} className="mt-2 w-full rounded-xl border border-hairline-strong bg-surface px-3 py-2.5 text-sm text-ink outline-none transition focus:border-brand/50 focus:ring-2 focus:ring-brand/10 disabled:cursor-not-allowed disabled:opacity-60">
         {REALTIME_VOICES.map((voice) => <option key={voice.id} value={voice.id}>{voice.label} · {voice.description}</option>)}
       </select>
     </div>
@@ -1380,9 +1574,9 @@ function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }
   return (
     <div role="radiogroup" aria-label="Demo voice access" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
       {choices.map((choice) => (
-        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected || (choice.id === 'capped' && cappedAvailable === false)} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 ${value === choice.id ? 'border-[#E0BC63]/45 bg-[#E0BC63]/[0.09] shadow-[0_0_18px_rgba(224,188,99,0.06)]' : 'border-white/[0.08] bg-white/[0.025] hover:border-[#E0BC63]/25'}`}>
-          <span className={`block text-xs font-semibold ${value === choice.id ? 'text-[#F2D783]' : 'text-[#cbd4db]'}`}>{choice.title}</span>
-          <span className="mt-0.5 block text-[10px] leading-4 text-[#667480]">{choice.id === 'capped' && cappedAvailable === false ? 'Not enabled in this deployment' : choice.detail}</span>
+        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected || (choice.id === 'capped' && cappedAvailable === false)} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 ${value === choice.id ? 'border-brand/45 bg-brand/10 shadow-[0_0_18px_rgba(224,188,99,0.06)]' : 'border-hairline bg-wash/60 hover:border-brand/25'}`}>
+          <span className={`block text-xs font-semibold ${value === choice.id ? 'text-brand-strong' : 'text-text-2'}`}>{choice.title}</span>
+          <span className="mt-0.5 block text-[10px] leading-4 text-text-4">{choice.id === 'capped' && cappedAvailable === false ? 'Not enabled in this deployment' : choice.detail}</span>
         </button>
       ))}
     </div>
@@ -1391,34 +1585,37 @@ function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }
 
 function ActivityRail({ activity, toast, voiceStatus, voiceStateLabel, voiceConnected, orbPhase, voiceMeter, onOpenVoice, onOpenActivity }: { activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voiceStateLabel: string; voiceConnected: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; onOpenVoice: () => void; onOpenActivity: () => void }) {
   return (
-    <aside className="min-w-0 border-l border-white/[0.08] bg-[#08090d] px-5 py-7 max-xl:hidden">
+    <aside className="min-w-0 border-l border-hairline bg-transparent px-5 py-7 max-xl:hidden">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 className="truncate font-semibold">Workspace activity</h2>
-          <p className="mt-1 oa-clamp-1 text-xs text-[#7c8a9c]">Every action stays visible.</p>
+          <p className="mt-1 oa-clamp-1 text-xs text-text-3">Every action stays visible.</p>
         </div>
-        <span className="shrink-0 rounded-full bg-[#E0BC63]/10 px-2.5 py-1 text-[10px] font-semibold text-[#E0BC63]">WebMCP</span>
+        <span className="shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">WebMCP</span>
       </div>
       <div className="mt-6 space-y-1">
-        {activity.slice(0, 5).map((item) => (
-          <button key={item.id} onClick={onOpenActivity} className="block w-full rounded-xl border-l border-white/10 px-3 py-2.5 text-left transition hover:border-[#E0BC63] hover:bg-[#E0BC63]/[0.05]">
-            <p className="oa-clamp-2 text-sm leading-5 text-[#d6dfeb]">{item.action}</p>
-            <p className="mt-1 oa-clamp-1 text-xs text-[#5b6879]">{item.actor} · {item.time}</p>
+        {activity.length ? activity.slice(0, 5).map((item) => (
+          <button key={item.id} onClick={onOpenActivity} className="block w-full rounded-xl px-3 py-2.5 text-left transition hover:bg-wash hover:shadow-[inset_0_0_0_1px_var(--hairline-strong)]">
+            <p className="oa-clamp-2 text-sm leading-5 text-ink/90">{item.action}</p>
+            <p className="mt-1 oa-clamp-1 text-xs text-text-4">{item.actor} · {item.time}</p>
           </button>
-        ))}
+        )) : <div className="rounded-2xl border border-dashed border-hairline px-4 py-5 text-center"><p className="text-xs font-medium text-text-2">No session activity yet</p><p className="mt-1 text-[11px] leading-4 text-text-4">Reads and approved changes will appear here.</p></div>}
       </div>
-      <div className="mt-8 border-t border-white/[0.08] pt-6">
-        <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5b6879]">Voice</p>
-        <button onClick={onOpenVoice} className="group mt-3 flex w-full items-center gap-3 rounded-2xl border border-white/[0.07] bg-white/[0.025] px-3 py-3 text-left transition hover:border-[#E0BC63]/25 hover:bg-[#E0BC63]/[0.04] focus-visible:border-[#E0BC63]/35 focus-visible:outline-none">
+      <div className="mt-8 border-t border-hairline pt-6">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Voice</p>
+        <button onClick={onOpenVoice} className="group mt-3 flex w-full items-center gap-3 rounded-xl border border-hairline bg-wash/60 px-3 py-3 text-left transition hover:border-hairline-strong hover:bg-wash focus-visible:outline-none">
           <VoiceOrb phase={orbPhase} meter={voiceMeter} size={56} />
           <span className="min-w-0 flex-1">
             <span className="block truncate text-sm font-medium">{voiceConnected ? 'Voice is active' : 'Open voice'}</span>
-            <span className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.035] px-2 py-0.5 text-[10px] font-semibold text-[#cbd4db]"><span className={`oa-voice-state-dot oa-voice-state-dot--${orbPhase}`} />{voiceStateLabel}</span>
-            <span className="mt-0.5 block oa-clamp-2 text-xs leading-4 text-[#7c8a9c]">{voiceStatus}</span>
+            <span className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-hairline bg-wash px-2 py-0.5 text-[10px] font-semibold text-text-2"><span className={`oa-voice-state-dot oa-voice-state-dot--${orbPhase}`} />{voiceStateLabel}</span>
+            <span className="mt-0.5 block oa-clamp-2 text-xs leading-4 text-text-3">{voiceStatus}</span>
           </span>
         </button>
       </div>
-      <div aria-live="polite" className="mt-7 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4 oa-clamp-3 text-xs leading-5 text-[#a4b1c2]">{toast}</div>
+      <div aria-live="polite" className="mt-7 rounded-2xl border border-hairline bg-wash p-4">
+        <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4"><span aria-hidden="true" className={`inline-block h-1.5 w-1.5 rounded-full ${toastSeverity(toast) === 'error' ? 'bg-danger' : toastSeverity(toast) === 'success' ? 'bg-success' : 'bg-text-4'}`} />Latest status</p>
+        <p className="mt-2 oa-clamp-3 text-xs leading-5 text-text-2">{toast}</p>
+      </div>
     </aside>
   );
 }
@@ -1430,42 +1627,42 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
       <section className="oa-voice-dock__panel">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">OpenAssist agent</p>
-            <p className="mt-0.5 truncate text-xs text-[#7c8a9c]">{mode === 'live' ? 'Private Live Workspace' : 'Isolated judge demo'}</p>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist agent</p>
+            <p className="mt-0.5 truncate text-xs text-text-3">{mode === 'live' ? 'Private Live Workspace' : 'Isolated judge demo'}</p>
           </div>
-          <button onClick={onClose} aria-label="Close voice agent" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-white/10 text-lg text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:bg-white/[0.04] hover:text-white">×</button>
+          <button onClick={onClose} aria-label="Close voice agent" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-hairline-strong text-lg text-text-2 transition hover:border-brand/35 hover:bg-wash hover:text-ink">×</button>
         </div>
 
         <div className="mt-3 grid grid-cols-[88px_minmax(0,1fr)] items-center gap-4 max-sm:grid-cols-[72px_minmax(0,1fr)] max-sm:gap-3">
-          <div className={`relative grid h-[88px] w-[88px] place-items-center rounded-full transition duration-300 max-sm:h-[72px] max-sm:w-[72px] ${connected ? 'shadow-[0_0_48px_rgba(224,188,99,0.14)]' : ''}`}>
+          <div className="relative grid h-[88px] w-[88px] place-items-center rounded-full max-sm:h-[72px] max-sm:w-[72px]">
             <VoiceOrb phase={phase} meter={meter} size={72} />
-            <span className="absolute -bottom-1 inline-flex items-center gap-1 rounded-full border border-white/10 bg-[#11141a]/95 px-2 py-0.5 text-[9px] font-semibold text-[#d6dfeb]"><span className={`oa-voice-state-dot oa-voice-state-dot--${phase}`} />{stateLabel}</span>
+            <span className="absolute -bottom-1 inline-flex items-center gap-1 rounded-full border border-hairline-strong bg-surface/95 px-2 py-0.5 text-[9px] font-semibold text-ink/90"><span className={`oa-voice-state-dot oa-voice-state-dot--${phase}`} />{stateLabel}</span>
           </div>
           <div className="min-w-0">
             <h2 className="truncate text-base font-semibold">{connected ? `${voiceLabel(liveVoice)} is ${stateLabel.toLowerCase()}` : `Talk with ${voiceLabel(selectedVoice)}`}</h2>
-            <p aria-live="polite" className="mt-1 oa-clamp-2 text-xs leading-5 text-[#8997a8]">{status}</p>
+            <p aria-live="polite" className="mt-1 oa-clamp-2 text-xs leading-5 text-text-3">{status}</p>
             <div className="mt-2 flex flex-wrap gap-2">
-              <button onClick={onVoice} className={`rounded-lg px-3.5 py-2 text-xs font-semibold transition ${connected ? 'border border-[#FF8B78]/30 bg-[#FF8B78]/10 text-[#FFA898] hover:bg-[#FF8B78]/15' : 'bg-[#E0BC63] text-[#17130a] hover:bg-[#e6c877]'}`}>{connected ? 'Stop' : 'Start voice'}</button>
-              {connected && <button onClick={onMute} className="rounded-lg border border-white/10 px-3.5 py-2 text-xs text-[#c5ced8] transition hover:border-[#E0BC63]/30 hover:text-white">{muted ? 'Unmute' : 'Mute'}</button>}
+              <button onClick={onVoice} className={`rounded-lg px-3.5 py-2 text-xs font-semibold transition ${connected ? 'border border-danger/30 bg-danger/10 text-danger-strong hover:bg-danger/15' : 'oa-btn-primary'}`}>{connected ? 'Stop' : 'Start voice'}</button>
+              {connected && <button onClick={onMute} className="rounded-lg border border-hairline-strong px-3.5 py-2 text-xs text-text-2 transition hover:border-brand/30 hover:text-ink">{muted ? 'Unmute' : 'Mute'}</button>}
             </div>
           </div>
         </div>
 
         <div className="mt-3 grid gap-2 sm:grid-cols-2">
-          <div className="min-h-[72px] rounded-xl border border-white/[0.08] bg-white/[0.025] px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">You</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-[#d6dfeb]">{transcript.user || (connected ? 'Listening for your voice…' : 'Your live words will appear here.')}</p></div>
-          <div className="min-h-[72px] rounded-xl border border-[#E0BC63]/12 bg-[#E0BC63]/[0.025] px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">OpenAssist</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-[#d6dfeb]">{transcript.assistant || (connected ? 'Waiting to respond…' : 'The spoken answer will appear here.')}</p></div>
+          <div className="min-h-[72px] rounded-xl border border-hairline bg-wash/60 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-text-3">You</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.user || (connected ? 'Listening for your voice…' : 'Your live words will appear here.')}</p></div>
+          <div className="min-h-[72px] rounded-xl border border-accent/15 bg-accent/5 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.assistant || (connected ? 'Waiting to respond…' : 'The spoken answer will appear here.')}</p></div>
         </div>
-        <p className="mt-1.5 text-center text-[9px] text-[#5b6879]">Live transcript only · not saved by the website</p>
+        <p className="mt-1.5 text-center text-[9px] text-text-4">Live transcript only · not saved by the website</p>
 
-        <details className="oa-voice-dock__settings mt-3 rounded-xl border border-white/[0.08] bg-white/[0.018]">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 text-xs font-medium text-[#a4b1c2] transition hover:text-white">
+        <details className="oa-voice-dock__settings mt-3 rounded-xl border border-hairline bg-wash/60">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 text-xs font-medium text-text-2 transition hover:text-ink">
             <span>Voice &amp; conversation</span>
-            <span aria-hidden="true" className="oa-voice-dock__chevron text-[#E0BC63]">⌄</span>
+            <span aria-hidden="true" className="oa-voice-dock__chevron text-text-3">⌄</span>
           </summary>
-          <div className="grid gap-2 border-t border-white/[0.07] p-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} />{mode === 'live' && <div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div>}</div>
+          <div className="grid gap-2 border-t border-hairline p-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} />{mode === 'live' && <div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div>}</div>
         </details>
-        {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-[10px] leading-4 text-[#7c8a9c]">Uses only synthetic data. The server key is never sent to this browser.</p>}
-        {prompt && <div className="mt-2 rounded-xl border border-[#E0BC63]/20 bg-[#E0BC63]/[0.06] p-3"><p className="text-[11px] leading-4 text-[#a4b1c2]">Open the secure ChatGPT sign-in page, then enter this one-time code.</p><div className="mt-2 flex items-center gap-2"><a href={prompt.verificationUrl} target="_blank" rel="noreferrer" className="text-[11px] font-semibold text-[#E0BC63] underline underline-offset-4">Open sign-in</a><code className="ml-auto rounded-lg bg-black/25 px-2.5 py-1.5 text-xs font-semibold tracking-[0.14em] text-white">{prompt.userCode}</code></div></div>}
+        {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-lg border border-hairline bg-wash/60 px-3 py-2 text-[10px] leading-4 text-text-3">Uses only synthetic data. The server key is never sent to this browser.</p>}
+        {prompt && <div className="mt-2 rounded-xl border border-brand/20 bg-brand/5 p-3"><p className="text-[11px] leading-4 text-text-2">Open the secure ChatGPT sign-in page, then enter this one-time code.</p><div className="mt-2 flex items-center gap-2"><a href={prompt.verificationUrl} target="_blank" rel="noreferrer" className="text-[11px] font-semibold text-brand underline underline-offset-4">Open sign-in</a><code className="ml-auto rounded-lg bg-field px-2.5 py-1.5 text-xs font-semibold tracking-[0.14em] text-ink">{prompt.userCode}</code></div></div>}
       </section>
     </aside>
   );
@@ -1474,7 +1671,7 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
 type Selectable = { selectedId: string | null; onSelect: (id: string) => void };
 
 function BrandMark({ size = 'h-9 w-9' }: { size?: string }) {
-  return <span aria-hidden="true" className={`${size} block shrink-0 rounded-full bg-[url('/openassist-logo.svg')] bg-cover bg-center shadow-[0_0_28px_rgba(224,188,99,0.16)]`} />;
+  return <span aria-hidden="true" className={`${size} block shrink-0 rounded-full bg-[url('/openassist-logo.svg')] bg-cover bg-center`} />;
 }
 
 /** Stable per-sender colour so the same account always looks the same. */
@@ -1521,9 +1718,9 @@ function PaperclipIcon() {
 }
 
 function HaloRow({ id, selected, children, onClick }: { id: string; selected: boolean; children: React.ReactNode; onClick?: () => void }) {
-  const className = `group relative w-full min-w-0 rounded-xl px-3.5 py-3 text-left transition-[background-color,box-shadow] duration-150 ${selected ? 'bg-[#14171e] shadow-[inset_0_0_0_1px_rgba(224,188,99,0.34),0_8px_24px_-8px_rgba(0,0,0,0.6)]' : onClick ? 'hover:bg-white/[0.035] hover:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.07)]' : 'bg-white/[0.012]'}`;
+  const className = `group relative w-full min-w-0 rounded-xl px-3.5 py-3 text-left transition-[background-color,box-shadow] duration-150 ${selected ? 'bg-raised shadow-[inset_0_0_0_1px_var(--ring-selected)]' : onClick ? 'hover:bg-wash hover:shadow-[inset_0_0_0_1px_var(--hairline-strong)]' : 'bg-wash/60'}`;
   if (!onClick) return <div id={`workspace-item-${id}`} className={className}>{children}</div>;
-  return <button id={`workspace-item-${id}`} onClick={onClick} className={`${className} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E0BC63]/45`}>{children}</button>;
+  return <button id={`workspace-item-${id}`} onClick={onClick} className={`${className} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/45`}>{children}</button>;
 }
 
 function SectionHeading({ title, description, action }: { title: string; description?: string; action?: React.ReactNode }) {
@@ -1531,7 +1728,7 @@ function SectionHeading({ title, description, action }: { title: string; descrip
     <div className="mb-3 flex items-end justify-between gap-4">
       <div className="min-w-0">
         <h2 className="truncate text-lg font-semibold">{title}</h2>
-        {description && <p className="mt-1 oa-clamp-2 text-sm leading-5 text-[#7c8a9c]">{description}</p>}
+        {description && <p className="mt-1 oa-clamp-2 text-sm leading-5 text-text-3">{description}</p>}
       </div>
       {action}
     </div>
@@ -1540,9 +1737,9 @@ function SectionHeading({ title, description, action }: { title: string; descrip
 
 function EmptyState({ title, hint }: { title: string; hint: string }) {
   return (
-    <div className="rounded-2xl border border-white/[0.08] bg-white/[0.025] p-8 text-center">
+    <div className="rounded-2xl border border-hairline bg-wash/60 p-8 text-center">
       <p className="text-sm font-medium">{title}</p>
-      <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-[#7c8a9c]">{hint}</p>
+      <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-text-3">{hint}</p>
     </div>
   );
 }
@@ -1551,31 +1748,31 @@ function TodayView({ messages, tasks, events, selectedId, onSelect, onNavigate }
   const stats: Array<[string, number]> = [['Unread attention', messages.length], ['Open tasks', tasks.length], ['Today’s events', events.length]];
   return (
     <>
-      <div className="mb-7 grid grid-cols-3 gap-3 border-b border-white/[0.08] pb-6 sm:gap-7">
-        {stats.map(([label, value]) => (
-          <div key={label} className="min-w-0">
-            <p className="text-2xl font-semibold tabular-nums sm:text-3xl">{value}</p>
-            <p className="mt-1 oa-clamp-2 text-[11px] leading-4 text-[#7c8a9c] sm:text-sm">{label}</p>
+      <div className="mb-7 grid grid-cols-3 overflow-hidden rounded-2xl border border-hairline bg-wash/60">
+        {stats.map(([label, value], index) => (
+          <div key={label} className={`min-w-0 px-4 py-4 sm:px-6 sm:py-5 ${index ? 'border-l border-hairline' : ''}`}>
+            <p className="text-2xl font-semibold tabular-nums tracking-[-0.03em] sm:text-3xl">{value}</p>
+            <p className="mt-1 oa-clamp-2 text-[11px] leading-4 text-text-3 sm:text-sm">{label}</p>
           </div>
         ))}
       </div>
       <div className="grid grid-cols-[minmax(0,1.25fr)_minmax(0,0.75fr)] gap-8 max-lg:grid-cols-1">
         <section className="min-w-0">
-          <SectionHeading title="Needs attention" description="Unread messages across linked accounts." action={<button onClick={() => onNavigate('inbox')} className="shrink-0 text-sm text-[#E0BC63] transition hover:text-[#FFE9AE]">Open inbox</button>} />
+          <SectionHeading title="Needs attention" description="Unread messages across linked accounts." action={<button onClick={() => onNavigate('inbox')} className="shrink-0 text-sm text-brand transition hover:text-brand-strong">Open inbox</button>} />
           {messages.length ? (
             <div className="space-y-2">
               {messages.slice(0, 4).map((message) => (
                 <HaloRow key={message.id} id={message.id} selected={selectedId === message.id} onClick={() => onSelect(message.id)}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0 flex-1">
-                      <p className="flex min-w-0 items-center gap-2 text-xs text-[#7c8a9c]">
-                        <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${message.urgent ? 'bg-[#FF8B78]' : 'bg-[#E0BC63]'}`} />
+                      <p className="flex min-w-0 items-center gap-2 text-xs text-text-3">
+                        <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${message.urgent ? 'bg-danger' : 'bg-ink/55'}`} />
                         <span className="min-w-0 truncate">{message.account}</span>
                       </p>
                       <p className="mt-1 oa-clamp-1 text-sm font-medium">{message.subject}</p>
-                      <p className="mt-1 oa-clamp-1 text-sm text-[#7c8a9c]">{message.sender}</p>
+                      <p className="mt-1 oa-clamp-1 text-sm text-text-3">{message.sender}</p>
                     </div>
-                    <span className="shrink-0 text-xs tabular-nums text-[#5b6879]">{message.time}</span>
+                    <span className="shrink-0 text-xs tabular-nums text-text-4">{message.time}</span>
                   </div>
                 </HaloRow>
               ))}
@@ -1583,16 +1780,16 @@ function TodayView({ messages, tasks, events, selectedId, onSelect, onNavigate }
           ) : <EmptyState title="Inbox is clear." hint="No unread messages across your linked accounts right now." />}
         </section>
         <section className="min-w-0">
-          <SectionHeading title="Next up" action={<button onClick={() => onNavigate('tasks')} className="shrink-0 text-sm text-[#E0BC63] transition hover:text-[#FFE9AE]">Tasks</button>} />
+          <SectionHeading title="Next up" action={<button onClick={() => onNavigate('tasks')} className="shrink-0 text-sm text-brand transition hover:text-brand-strong">Tasks</button>} />
           {tasks.length ? (
             <div className="space-y-2">
               {tasks.slice(0, 4).map((task) => (
                 <HaloRow key={task.id} id={task.id} selected={selectedId === task.id} onClick={() => onSelect(task.id)}>
                   <div className="flex items-start gap-3">
-                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full border border-[#5b6879]" />
+                    <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full border border-text-4" />
                     <div className="min-w-0 flex-1">
                       <p className="oa-clamp-2 text-sm">{task.title}</p>
-                      <p className="mt-1 oa-clamp-1 text-xs text-[#7c8a9c]">{task.list} · {task.due}</p>
+                      <p className="mt-1 oa-clamp-1 text-xs text-text-3">{task.list} · {task.due}</p>
                     </div>
                   </div>
                 </HaloRow>
@@ -1600,10 +1797,10 @@ function TodayView({ messages, tasks, events, selectedId, onSelect, onNavigate }
             </div>
           ) : <EmptyState title="No open tasks." hint="Everything on your list is done." />}
           {events.slice(0, 1).map((event) => (
-            <div key={event.id} className="mt-6 min-w-0 border-l border-[#E0BC63]/60 pl-4">
-              <p className="text-xs tabular-nums text-[#E0BC63]">{event.start}–{event.end}</p>
+            <div key={event.id} className="mt-6 min-w-0 border-l border-brand/60 pl-4">
+              <p className="font-mono text-xs tabular-nums text-text-2">{event.start}–{event.end}</p>
               <p className="mt-1 oa-clamp-2 text-sm font-medium">{event.title}</p>
-              <p className="mt-1 oa-clamp-1 text-xs text-[#7c8a9c]">{event.account}</p>
+              <p className="mt-1 oa-clamp-1 text-xs text-text-3">{event.account}</p>
             </div>
           ))}
         </section>
@@ -1617,8 +1814,8 @@ function InboxView({ messages, selectedId, onSelect, onMarkRead }: { messages: t
   return (
     <section className="min-w-0">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <p className="text-sm tabular-nums text-[#7c8a9c]">{total} {total === 1 ? 'message' : 'messages'}</p>
-        <span className="rounded-full bg-[#FFC178]/10 px-3 py-1 text-xs text-[#FFC178]">External content is untrusted</span>
+        <p className="text-sm tabular-nums text-text-3">{total} {total === 1 ? 'message' : 'messages'}</p>
+        <span className="rounded-full bg-warning/10 px-3 py-1 text-xs text-warning">External content is untrusted</span>
       </div>
       {total ? (
         <>
@@ -1627,16 +1824,16 @@ function InboxView({ messages, selectedId, onSelect, onMarkRead }: { messages: t
               <HaloRow key={message.id} id={message.id} selected={selectedId === message.id} onClick={() => onSelect(message.id)}>
                 <div className="flex items-start gap-3">
                   {/* Unread rail: a thin bar reads faster than a pill and adds no clutter. */}
-                  <span aria-hidden="true" className={`mt-1 h-9 w-[3px] shrink-0 rounded-full ${message.unread ? (message.urgent ? 'bg-[#FF8B78]' : 'bg-[#E0BC63]') : 'bg-transparent'}`} />
+                  <span aria-hidden="true" className={`mt-1 h-9 w-[3px] shrink-0 rounded-full ${message.unread ? (message.urgent ? 'bg-danger' : 'bg-ink/55') : 'bg-transparent'}`} />
                   <Avatar name={message.sender} />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-baseline justify-between gap-3">
-                      <p className={`min-w-0 truncate text-sm ${message.unread ? 'font-semibold text-[#e8eef7]' : 'font-medium text-[#a4b1c2]'}`}>{message.sender}</p>
-                      <span className="shrink-0 text-[11px] tabular-nums text-[#5b6879]">{message.time}</span>
+                      <p className={`min-w-0 truncate text-sm ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}>{message.sender}</p>
+                      <span className="shrink-0 text-[11px] tabular-nums text-text-4">{message.time}</span>
                     </div>
-                    <p className={`mt-0.5 oa-clamp-1 text-sm ${message.unread ? 'text-[#e8eef7]' : 'text-[#a4b1c2]'}`}>{message.subject}</p>
-                    <p className="mt-1 oa-clamp-2 text-[13px] leading-5 text-[#7c8a9c]">{message.snippet}</p>
-                    <div className="mt-2 flex items-center gap-3 text-[11px] text-[#5b6879]">
+                    <p className={`mt-0.5 oa-clamp-1 text-sm ${message.unread ? 'text-ink' : 'text-text-2'}`}>{message.subject}</p>
+                    <p className="mt-1 oa-clamp-2 text-[13px] leading-5 text-text-3">{message.snippet}</p>
+                    <div className="mt-2 flex items-center gap-3 text-[11px] text-text-4">
                       <span className="truncate">{message.account}</span>
                       {message.hasAttachment && <span className="flex shrink-0 items-center gap-1"><PaperclipIcon />Attachment</span>}
                       {message.unread && (
@@ -1645,7 +1842,7 @@ function InboxView({ messages, selectedId, onSelect, onMarkRead }: { messages: t
                           tabIndex={0}
                           onClick={(event) => { event.stopPropagation(); onMarkRead(message); }}
                           onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); onMarkRead(message); } }}
-                          className="ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-[11px] text-[#7c8a9c] opacity-0 transition hover:bg-white/[0.06] hover:text-[#E0BC63] focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
+                          className="ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-[11px] text-text-3 opacity-0 transition hover:bg-wash-strong hover:text-brand focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
                         >
                           Mark read
                         </span>
@@ -1674,10 +1871,10 @@ function TasksView({ tasks, selectedId, onSelect, onCreate }: { tasks: typeof DE
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex gap-2 max-sm:oa-scroll-x max-sm:-mx-5 max-sm:px-5">
           {TASK_FILTERS.map((item) => (
-            <button key={item} onClick={() => setFilter(item)} aria-pressed={filter === item} className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition ${filter === item ? 'bg-[#E0BC63] text-[#17130a]' : 'bg-white/[0.05] text-[#a4b1c2] hover:bg-white/[0.09] hover:text-white'}`}>{item}</button>
+            <button key={item} onClick={() => setFilter(item)} aria-pressed={filter === item} className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition ${filter === item ? 'bg-brand text-brand-ink' : 'bg-wash text-text-2 hover:bg-wash-strong hover:text-ink'}`}>{item}</button>
           ))}
         </div>
-        <button onClick={onCreate} className="shrink-0 rounded-xl bg-[#E0BC63] px-4 py-2 text-sm font-semibold text-[#17130a] transition hover:bg-[#e6c877]">New task</button>
+        <button onClick={onCreate} className="oa-btn-primary shrink-0 rounded-xl px-4 py-2 text-sm font-semibold">New task</button>
       </div>
       {total ? (
         <>
@@ -1687,25 +1884,25 @@ function TasksView({ tasks, selectedId, onSelect, onCreate }: { tasks: typeof DE
                 <div className="flex items-start gap-3">
                   <span
                     aria-hidden="true"
-                    className={`mt-0.5 grid h-[18px] w-[18px] shrink-0 place-items-center rounded-[6px] border transition ${task.completed ? 'border-[#E0BC63] bg-[#E0BC63]' : 'border-[#4b5764] group-hover:border-[#E0BC63]/70'}`}
+                    className={`mt-0.5 grid h-[18px] w-[18px] shrink-0 place-items-center rounded-[6px] border transition ${task.completed ? 'border-brand bg-brand' : 'border-text-4 group-hover:border-brand/70'}`}
                   >
                     {task.completed && (
-                      <svg viewBox="0 0 24 24" fill="none" stroke="#17130a" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="var(--brand-ink)" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3">
                         <path d="m5 12.5 4.5 4.5L19 7" />
                       </svg>
                     )}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <p className={`oa-clamp-2 text-sm leading-5 ${task.completed ? 'text-[#5b6879] line-through' : 'text-[#e8eef7]'}`}>{task.title}</p>
+                    <p className={`oa-clamp-2 text-sm leading-5 ${task.completed ? 'text-text-4 line-through' : 'text-ink'}`}>{task.title}</p>
                     <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px]">
-                      <span className="text-[#5b6879]">{task.list}</span>
+                      <span className="text-text-4">{task.list}</span>
                       {task.tags.slice(0, 3).map((tag) => (
-                        <span key={tag} className="rounded-md bg-[#E0BC63]/[0.10] px-1.5 py-0.5 text-[#C9A758]">{tag.replace(/^#/, '')}</span>
+                        <span key={tag} className="rounded-md bg-wash-strong px-1.5 py-0.5 text-text-2">{tag.replace(/^#/, '')}</span>
                       ))}
-                      {task.tags.length > 3 && <span className="text-[#5b6879]">+{task.tags.length - 3}</span>}
+                      {task.tags.length > 3 && <span className="text-text-4">+{task.tags.length - 3}</span>}
                     </div>
                   </div>
-                  <span className={`shrink-0 whitespace-nowrap text-[11px] tabular-nums ${task.completed ? 'text-[#5b6879]' : 'text-[#a4b1c2]'}`}>{task.due}</span>
+                  <span className={`shrink-0 whitespace-nowrap text-[11px] tabular-nums ${task.completed ? 'text-text-4' : 'text-text-2'}`}>{task.due}</span>
                 </div>
               </HaloRow>
             ))}
@@ -1722,26 +1919,23 @@ function CalendarView({ events, selectedId, onSelect, onCreate }: { events: type
   return (
     <section className="min-w-0">
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex shrink-0 rounded-xl bg-white/[0.04] p-1">
-          <button className="rounded-lg bg-white/[0.08] px-3 py-1.5 text-xs">Agenda</button>
-          <button className="rounded-lg px-3 py-1.5 text-xs text-[#7c8a9c] transition hover:text-white">Week</button>
-        </div>
-        <button onClick={onCreate} className="shrink-0 rounded-xl bg-[#E0BC63] px-4 py-2 text-sm font-semibold text-[#17130a]">New event</button>
+        <p className="text-sm tabular-nums text-text-3">{total} {total === 1 ? 'event' : 'events'} on the agenda</p>
+        <button onClick={onCreate} className="oa-btn-primary shrink-0 rounded-xl px-4 py-2 text-sm font-semibold">New event</button>
       </div>
       {total ? (
         <>
-          <div className="border-t border-white/[0.08]">
+          <div className="border-t border-hairline">
             {pageItems.map((event) => (
-              <div key={event.id} className="grid grid-cols-[76px_minmax(0,1fr)] items-center gap-2 border-b border-white/[0.07] py-2 max-sm:grid-cols-1 max-sm:gap-0 max-sm:py-3">
-                <div className="shrink-0 text-xs text-[#7c8a9c] max-sm:mb-1 max-sm:px-4">{event.day}</div>
+              <div key={event.id} className="grid grid-cols-[76px_minmax(0,1fr)] items-center gap-2 border-b border-hairline py-2 max-sm:grid-cols-1 max-sm:gap-0 max-sm:py-3">
+                <div className="shrink-0 text-xs text-text-3 max-sm:mb-1 max-sm:px-4">{event.day}</div>
                 <div className="min-w-0">
                   <HaloRow id={event.id} selected={selectedId === event.id} onClick={() => onSelect(event.id)}>
                     <div className="flex items-start justify-between gap-4 max-sm:flex-col max-sm:gap-1">
                       <div className="min-w-0 flex-1">
                         <p className="oa-clamp-1 text-sm font-medium">{event.title}</p>
-                        <p className="mt-1 oa-clamp-1 text-xs text-[#7c8a9c]">{event.account} · Reminder {event.reminder}</p>
+                        <p className="mt-1 oa-clamp-1 text-xs text-text-3">{event.account} · Reminder {event.reminder}</p>
                       </div>
-                      <p className="shrink-0 whitespace-nowrap text-xs tabular-nums text-[#E0BC63]">{event.start}–{event.end}</p>
+                      <p className="shrink-0 whitespace-nowrap font-mono text-xs tabular-nums text-text-2">{event.start}–{event.end}</p>
                     </div>
                   </HaloRow>
                 </div>
@@ -1768,61 +1962,61 @@ function SuppliesView({ products, cart, selectedId, onSelect, onSearch, onAdd, o
   const count = cart.lines.reduce((sum, line) => sum + line.quantity, 0);
   return (
     <section className="min-w-0">
-      <div className="mb-6 overflow-hidden rounded-[24px] border border-[#E0BC63]/20 bg-[linear-gradient(120deg,rgba(224,188,99,0.10),rgba(123,92,196,0.08)_55%,rgba(255,255,255,0.02))] p-5 sm:p-6">
+      <div className="mb-6 overflow-hidden rounded-2xl border border-hairline bg-wash/60 p-5 sm:p-6">
         <div className="flex flex-wrap items-start justify-between gap-5">
           <div className="max-w-2xl">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">Guided video story</p>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-brand">Guided video story</p>
             <h2 className="mt-2 text-xl font-semibold tracking-[-0.02em]">Prepare the Northstar Friday security kit</h2>
-            <p className="mt-2 text-sm leading-6 text-[#a4b1c2]">The agent connects an urgent email and open task to a real Shopify dev-store search, then prepares a synthetic cart only after approval.</p>
+            <p className="mt-2 text-sm leading-6 text-text-2">The agent connects an urgent email and open task to a real Shopify dev-store search, then prepares a synthetic cart only after approval.</p>
           </div>
-          <div className="min-w-[180px] rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#7c8a9c]">Prepared cart</p>
+          <div className="min-w-[180px] rounded-2xl border border-hairline-strong bg-field px-4 py-3">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">Prepared cart</p>
             <p className="mt-1 text-2xl font-semibold tabular-nums">{count}</p>
-            <p className="text-xs text-[#7c8a9c]">{count === 1 ? 'item' : 'items'} · {cart.currency} {cart.total.toFixed(2)}</p>
+            <p className="text-xs text-text-3">{count === 1 ? 'item' : 'items'} · {cart.currency} {cart.total.toFixed(2)}</p>
           </div>
         </div>
-        <div className="mt-5 grid gap-3 border-t border-white/[0.08] pt-5 md:grid-cols-2">
-          <div className="rounded-2xl border border-[#E0BC63]/20 bg-black/20 p-4">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">Demo video · fixed story</p>
-            <p className="mt-2 text-sm text-[#d7dde4]">Find the urgent security work, search for a USB-C Security Key, preview the cart change, approve it, and show the verified result.</p>
+        <div className="mt-5 grid gap-3 border-t border-hairline pt-5 md:grid-cols-2">
+          <div className="rounded-2xl border border-brand/20 bg-field p-4">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Demo video · fixed story</p>
+            <p className="mt-2 text-sm text-ink/90">Find the urgent security work, search for a USB-C Security Key, preview the cart change, approve it, and show the verified result.</p>
           </div>
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#9ba8ba]">Judge test · free sandbox</p>
-            <p className="mt-2 text-sm text-[#d7dde4]">Search any of the six products, prepare a separate cart, clear it, and reset the full workspace without touching another judge.</p>
+          <div className="rounded-2xl border border-hairline-strong bg-field p-4">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">Judge test · free sandbox</p>
+            <p className="mt-2 text-sm text-ink/90">Search any of the six products, prepare a separate cart, clear it, and reset the full workspace without touching another judge.</p>
           </div>
         </div>
       </div>
 
       <form onSubmit={(event) => { event.preventDefault(); onSearch(query); }} className="mb-6 flex gap-2 max-sm:flex-col">
-        <label className="min-w-0 flex-1"><span className="sr-only">Search Shopify supplies</span><input value={query} onChange={(event) => setQuery(event.target.value)} maxLength={300} className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm outline-none transition focus:border-[#E0BC63]/50" placeholder="Search the synthetic Shopify catalog" /></label>
-        <button type="submit" className="rounded-xl bg-[#E0BC63] px-5 py-3 text-sm font-semibold text-[#17130a] transition hover:bg-[#e8cb82]">Search store</button>
+        <label className="min-w-0 flex-1"><span className="sr-only">Search Shopify supplies</span><input value={query} onChange={(event) => setQuery(event.target.value)} maxLength={300} className="w-full rounded-xl border border-hairline-strong bg-wash px-4 py-3 text-sm outline-none transition focus:border-brand/50" placeholder="Search the synthetic Shopify catalog" /></label>
+        <button type="submit" className="oa-btn-primary rounded-xl px-5 py-3 text-sm font-semibold">Search store</button>
       </form>
 
       <div className="mb-3 flex items-center justify-between gap-3">
-        <p className="text-sm text-[#7c8a9c]">{products.length} Shopify {products.length === 1 ? 'result' : 'results'}</p>
-        <span className="rounded-full bg-[#FFC178]/10 px-3 py-1 text-[11px] text-[#FFC178]">Catalog text is untrusted</span>
+        <p className="text-sm text-text-3">{products.length} Shopify {products.length === 1 ? 'result' : 'results'}</p>
+        <span className="rounded-full bg-warning/10 px-3 py-1 text-[11px] text-warning">Catalog text is untrusted</span>
       </div>
       {products.length ? <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1 2xl:grid-cols-3">
-        {products.map((product, index) => (
-          <article key={product.id} id={`workspace-item-${product.id}`} onClick={() => onSelect(product.id)} className={`group flex min-h-[230px] cursor-pointer flex-col overflow-hidden rounded-[20px] border bg-[#0d1016] transition duration-200 hover:-translate-y-0.5 hover:border-[#E0BC63]/45 hover:shadow-[0_18px_55px_rgba(0,0,0,0.28),0_0_0_1px_rgba(224,188,99,0.10)] ${selectedId === product.id ? 'border-[#E0BC63]/70 shadow-[0_0_0_1px_rgba(224,188,99,0.16),0_18px_55px_rgba(0,0,0,0.3)]' : 'border-white/[0.08]'}`}>
-            <div className={`relative h-40 overflow-hidden border-b border-white/[0.07] ${index % 2 ? 'bg-[radial-gradient(circle_at_78%_22%,rgba(224,188,99,0.32),transparent_28%),linear-gradient(130deg,rgba(224,188,99,0.12),rgba(79,70,130,0.22))]' : 'bg-[radial-gradient(circle_at_78%_22%,rgba(224,188,99,0.32),transparent_28%),linear-gradient(130deg,rgba(224,188,99,0.12),rgba(39,74,91,0.22))]'}`}>
+        {products.map((product) => (
+          <article key={product.id} id={`workspace-item-${product.id}`} onClick={() => onSelect(product.id)} className={`group flex min-h-[230px] cursor-pointer flex-col overflow-hidden rounded-2xl border bg-surface transition duration-150 hover:border-hairline-strong ${selectedId === product.id ? 'border-brand/60 shadow-[inset_0_0_0_1px_var(--ring-selected)]' : 'border-hairline'}`}>
+            <div className="relative h-40 overflow-hidden border-b border-hairline bg-wash">
               {/* Shopify returns its own CDN URLs at runtime, so this intentionally stays an unoptimized remote image. */}
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              {product.imageUrl && <img src={product.imageUrl} alt={`${product.title} product`} loading="lazy" className="h-full w-full bg-[#d8d1c8] object-contain transition duration-300 group-hover:scale-[1.025]" />}
-              <span className="absolute left-3 top-3 inline-flex rounded-full border border-white/15 bg-[#080a0f]/75 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#f0d98f] backdrop-blur-md">{product.category}</span>
+              {product.imageUrl && <img src={product.imageUrl} alt={`${product.title} product`} loading="lazy" className="h-full w-full bg-[#d8d1c8] object-contain" />}
+              <span className="absolute left-3 top-3 inline-flex rounded-full border border-hairline-strong bg-surface/85 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand-strong backdrop-blur-md">{product.category}</span>
             </div>
             <div className="flex flex-1 flex-col p-4">
-              <div className="flex items-start justify-between gap-3"><h3 className="oa-clamp-2 font-medium leading-5">{product.title}</h3><span className="shrink-0 text-sm font-semibold text-[#E0BC63]">${product.price.toFixed(2)}</span></div>
-              <p className="mt-2 oa-clamp-3 text-sm leading-5 text-[#7c8a9c]">{product.description}</p>
-              <div className="mt-auto flex items-center justify-between gap-3 pt-4"><span className="text-[11px] text-[#5b6879]">{product.available ? 'Available in demo store' : 'Unavailable'}</span><button type="button" disabled={!product.available} onClick={(event) => { event.stopPropagation(); onAdd(product); }} className="rounded-lg border border-[#E0BC63]/30 bg-[#E0BC63]/[0.08] px-3 py-2 text-xs font-semibold text-[#FFE9AE] transition hover:border-[#E0BC63]/60 hover:bg-[#E0BC63]/[0.14] disabled:opacity-40">Prepare cart</button></div>
+              <div className="flex items-start justify-between gap-3"><h3 className="oa-clamp-2 font-medium leading-5">{product.title}</h3><span className="shrink-0 text-sm font-semibold text-brand">${product.price.toFixed(2)}</span></div>
+              <p className="mt-2 oa-clamp-3 text-sm leading-5 text-text-3">{product.description}</p>
+              <div className="mt-auto flex items-center justify-between gap-3 pt-4"><span className="text-[11px] text-text-4">{product.available ? 'Available in demo store' : 'Unavailable'}</span><button type="button" disabled={!product.available} onClick={(event) => { event.stopPropagation(); onAdd(product); }} className="rounded-lg border border-brand/30 bg-brand/10 px-3 py-2 text-xs font-semibold text-brand-strong transition hover:border-brand/60 hover:bg-brand/15 disabled:opacity-40">Prepare cart</button></div>
             </div>
           </article>
         ))}
       </div> : <EmptyState title="No supplies found." hint="Try a broader search, or reset the judge demo." />}
 
-      <div className="mt-7 rounded-[22px] border border-white/[0.08] bg-white/[0.025] p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="font-medium">Judge-isolated cart</p><p className="mt-1 text-xs text-[#7c8a9c]">Each judge gets a separate Shopify cart pointer. Checkout and payment tools are never exposed.</p></div>{cart.lines.length > 0 && <button onClick={onClear} className="rounded-xl border border-[#FF8B78]/25 px-3 py-2 text-xs text-[#FF9D8E] transition hover:border-[#FF8B78]/50">Clear cart</button>}</div>
-        {cart.lines.length ? <div className="mt-4 space-y-2">{cart.lines.map((line) => <div key={line.id} className="flex items-center justify-between gap-4 rounded-xl border border-white/[0.06] bg-black/15 px-4 py-3"><div className="min-w-0"><p className="truncate text-sm">{line.title}</p><p className="mt-0.5 text-xs text-[#7c8a9c]">Quantity {line.quantity}</p></div><p className="shrink-0 text-sm font-medium text-[#E0BC63]">{line.currency} {(line.price * line.quantity).toFixed(2)}</p></div>)}</div> : <p className="mt-4 text-sm text-[#7c8a9c]">Nothing prepared yet. Ask the agent to find a security key or travel kit.</p>}
+      <div className="mt-7 rounded-2xl border border-hairline bg-wash/60 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="font-medium">Judge-isolated cart</p><p className="mt-1 text-xs text-text-3">Each judge gets a separate Shopify cart pointer. Checkout and payment tools are never exposed.</p></div>{cart.lines.length > 0 && <button onClick={onClear} className="rounded-xl border border-danger/25 px-3 py-2 text-xs text-danger-strong transition hover:border-danger/50">Clear cart</button>}</div>
+        {cart.lines.length ? <div className="mt-4 space-y-2">{cart.lines.map((line) => <div key={line.id} className="flex items-center justify-between gap-4 rounded-xl border border-hairline bg-field px-4 py-3"><div className="min-w-0"><p className="truncate text-sm">{line.title}</p><p className="mt-0.5 text-xs text-text-3">Quantity {line.quantity}</p></div><p className="shrink-0 text-sm font-medium text-brand">{line.currency} {(line.price * line.quantity).toFixed(2)}</p></div>)}</div> : <p className="mt-4 text-sm text-text-3">Nothing prepared yet. Ask the agent to find a security key or travel kit.</p>}
       </div>
     </section>
   );
@@ -1833,8 +2027,8 @@ function NotesView({ mode, notes, onCreate, onOpen }: { mode: Mode; notes: typeo
   return (
     <section className="min-w-0">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm tabular-nums text-[#7c8a9c]">{total} {total === 1 ? 'note' : 'notes'}</p>
-        <button onClick={onCreate} className="shrink-0 rounded-xl border border-white/10 px-4 py-2 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">New note</button>
+        <p className="text-sm tabular-nums text-text-3">{total} {total === 1 ? 'note' : 'notes'}</p>
+        <button onClick={onCreate} className="shrink-0 rounded-xl border border-hairline-strong px-4 py-2 text-sm text-text-2 transition hover:border-brand/35 hover:text-ink">New note</button>
       </div>
       {total ? (
         <>
@@ -1842,9 +2036,9 @@ function NotesView({ mode, notes, onCreate, onOpen }: { mode: Mode; notes: typeo
             {pageItems.map((note) => (
               <HaloRow key={note.id} id={note.id} selected={false} onClick={() => onOpen(note)}>
                 <div className="min-w-0">
-                  <div className="flex items-center justify-between gap-3"><p className="oa-clamp-1 font-medium">{note.title}</p><span className="shrink-0 text-[11px] font-medium text-[#E0BC63]">Open note</span></div>
-                  <p className="mt-3 oa-clamp-3 text-sm leading-6 text-[#7c8a9c]">{note.preview}</p>
-                  <p className="mt-4 oa-clamp-1 text-xs text-[#5b6879]">Updated {note.updated} · {mode === 'demo' ? 'Temporary demo storage' : 'Stored in Drive'}</p>
+                  <div className="flex items-center justify-between gap-3"><p className="oa-clamp-1 font-medium">{note.title}</p><span className="shrink-0 text-[11px] font-medium text-brand">Open note</span></div>
+                  <p className="mt-3 oa-clamp-3 text-sm leading-6 text-text-3">{note.preview}</p>
+                  <p className="mt-4 oa-clamp-1 text-xs text-text-4">Updated {note.updated} · {mode === 'demo' ? 'Temporary demo storage' : 'Stored in Drive'}</p>
                 </div>
               </HaloRow>
             ))}
@@ -1852,7 +2046,7 @@ function NotesView({ mode, notes, onCreate, onOpen }: { mode: Mode; notes: typeo
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="notes" onPage={setPage} />
         </>
       ) : <EmptyState title="No notes yet." hint="Notes hold long reference material that would clutter a task." />}
-      <p className="mt-7 max-w-2xl text-sm leading-6 text-[#7c8a9c]">{mode === 'demo' ? 'These synthetic notes are isolated to this browser session and automatically removed after 24 hours.' : 'OpenAssist creates a Drive note only when reference material is genuinely too long for a task. Short actions stay as clean Google Tasks.'}</p>
+      <p className="mt-7 max-w-2xl text-sm leading-6 text-text-3">{mode === 'demo' ? 'These synthetic notes are isolated to this browser session and automatically removed after 24 hours.' : 'OpenAssist creates a Drive note only when reference material is genuinely too long for a task. Short actions stay as clean Google Tasks.'}</p>
     </section>
   );
 }
@@ -1862,8 +2056,8 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
   return (
     <section className="min-w-0">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <p className="oa-clamp-1 text-sm text-[#7c8a9c]">Strict quality gate · no raw email stored</p>
-        <button onClick={onRemember} className="shrink-0 rounded-xl border border-[#E0BC63]/30 px-4 py-2 text-sm text-[#E0BC63] transition hover:border-[#E0BC63]/60 hover:text-[#FFE9AE]">Remember a fact</button>
+        <p className="oa-clamp-1 text-sm text-text-3">Strict quality gate · no raw email stored</p>
+        <button onClick={onRemember} className="shrink-0 rounded-xl border border-brand/30 px-4 py-2 text-sm text-brand transition hover:border-brand/60 hover:text-brand-strong">Remember a fact</button>
       </div>
       {total ? (
         <>
@@ -1871,8 +2065,8 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
             {pageItems.map((fact) => (
               <HaloRow key={fact.id} id={fact.id} selected={false}>
                 <div className="min-w-0">
-                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#E0BC63]">{fact.category}</p>
-                  <p className="mt-2 oa-wrap-anywhere text-sm leading-6 text-[#d6dfeb]">{fact.fact}</p>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">{fact.category}</p>
+                  <p className="mt-2 oa-wrap-anywhere text-sm leading-6 text-ink/90">{fact.fact}</p>
                 </div>
               </HaloRow>
             ))}
@@ -1880,9 +2074,9 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="facts" onPage={setPage} />
         </>
       ) : <EmptyState title="No saved facts." hint="Durable preferences appear here once you approve them." />}
-      <div className="mt-7 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-5">
+      <div className="mt-7 rounded-2xl border border-hairline bg-wash p-5">
         <p className="font-medium">Storage boundary</p>
-        <p className="mt-2 text-sm leading-6 text-[#7c8a9c]">{mode === 'demo' ? 'Synthetic memory is stored only in this isolated Cloudflare demo workspace and expires after 24 hours.' : 'Memory text lives in one private Google Drive document. The website stores only its encrypted connection and document pointer.'}</p>
+        <p className="mt-2 text-sm leading-6 text-text-3">{mode === 'demo' ? 'Synthetic memory is stored only in this isolated Cloudflare demo workspace and expires after 24 hours.' : 'Memory text lives in one private Google Drive document. The website stores only its encrypted connection and document pointer.'}</p>
       </div>
     </section>
   );
@@ -1891,23 +2085,23 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
 function AccountsView({ mode, accounts }: { mode: Mode; accounts: DemoAccount[] }) {
   return (
     <section className="min-w-0">
-      <div className="mb-6 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-5">
+      <div className="mb-6 rounded-2xl border border-hairline bg-wash p-5">
         <p className="text-sm font-medium">{mode === 'demo' ? 'Synthetic accounts' : 'Owner connection required'}</p>
-        <p className="mt-2 text-sm leading-6 text-[#7c8a9c]">{mode === 'demo' ? 'These are safe sample identities. Judge actions never touch your Google accounts and are removed automatically.' : 'Google credentials remain managed by Composio. OpenAssist never receives the Google refresh token.'}</p>
+        <p className="mt-2 text-sm leading-6 text-text-3">{mode === 'demo' ? 'These are safe sample identities. Judge actions never touch your Google accounts and are removed automatically.' : 'Google credentials remain managed by Composio. OpenAssist never receives the Google refresh token.'}</p>
       </div>
       {accounts.length ? (
         <div className="space-y-3">
           {accounts.map((account, index) => (
-            <HaloRow key={account.id} id={account.id} selected={index === 0}>
+            <HaloRow key={account.id} id={account.id} selected={false}>
               <div className="flex items-start justify-between gap-4 max-sm:flex-col max-sm:gap-3">
                 <div className="min-w-0 flex-1">
                   <p className="oa-clamp-1 font-medium">{account.label}</p>
-                  <p className="mt-1 oa-wrap-anywhere text-sm text-[#7c8a9c]">{account.email}</p>
-                  <p className="mt-0.5 text-xs text-[#5b6879]">{account.type}</p>
+                  <p className="mt-1 oa-wrap-anywhere text-sm text-text-3">{account.email}</p>
+                  <p className="mt-0.5 text-xs text-text-4">{account.type}</p>
                 </div>
                 <div className="flex shrink-0 flex-wrap gap-2">
-                  {index === 0 && <span className="whitespace-nowrap rounded-full bg-[#E0BC63]/10 px-2.5 py-1 text-[10px] text-[#E0BC63]">Default tasks</span>}
-                  <span className="whitespace-nowrap rounded-full bg-white/[0.05] px-2.5 py-1 text-[10px] text-[#a4b1c2]">Gmail · Calendar · Tasks</span>
+                  {index === 0 && <span className="whitespace-nowrap rounded-full bg-brand/10 px-2.5 py-1 text-[10px] text-brand">Default tasks</span>}
+                  <span className="whitespace-nowrap rounded-full bg-wash px-2.5 py-1 text-[10px] text-text-2">Gmail · Calendar · Tasks</span>
                 </div>
               </div>
             </HaloRow>
@@ -1938,7 +2132,12 @@ function liveRows(view: WorkspaceView, source: unknown): Array<Record<string, un
     ];
   }
   if (view === 'inbox') return arrayValue(objectValue(data.mail).results).map((item) => ({ ...item, _kind: 'Unread mail' }));
-  if (view === 'tasks') return arrayValue(data.results).map((item) => ({ ...item, _kind: 'Task' }));
+  if (view === 'tasks') return arrayValue(data.results).map((item) => {
+    const task = objectValue(item.task);
+    return Object.keys(task).length
+      ? { ...task, taskListId: item.taskListId, _kind: 'Task' }
+      : { ...item, _kind: 'Task' };
+  });
   if (view === 'calendar') return arrayValue(data.events).map((item) => ({ ...item, _kind: 'Calendar' }));
   if (view === 'notes') {
     const account = displayText(data, ['account'], 'Main');
@@ -1990,52 +2189,183 @@ function safeExternalUrl(value: string): string | undefined {
   }
 }
 
-function LiveWorkspaceView({ view, live, selectedId, ownerCode, onOwnerCode, onBootstrap, onReconnect, onRetry, onOpenNote, onOpenItem }: { view: WorkspaceView; live: LiveState; selectedId: string | null; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void; onRetry: () => void; onOpenNote: (item: Record<string, unknown>) => void; onOpenItem: (id: string, item: Record<string, unknown>) => void }) {
+function liveTimeLabel(value: string): string {
+  if (!value) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const date = new Date(`${value}T00:00:00`);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function liveDayLabel(value: string): string {
+  if (!value) return '';
+  const date = new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00` : value);
+  if (Number.isNaN(date.getTime())) return '';
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return 'Today';
+  const tomorrow = new Date(today.getTime() + 86_400_000);
+  if (date.toDateString() === tomorrow.toDateString()) return 'Tomorrow';
+  return date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+/**
+ * Live rows render with the same visual language as the demo views (avatars,
+ * unread rails, checkboxes, time columns) instead of a generic list, so the
+ * owner surface looks like the product rather than a data dump.
+ */
+function LiveRowBody({ view, item, fallbackTitle }: { view: WorkspaceView; item: Record<string, unknown>; fallbackTitle: string }) {
+  if (view === 'inbox') {
+    const sender = displayText(item, ['sender', 'from', 'fromName'], 'Unknown sender');
+    const subject = displayText(item, ['subject', 'title'], fallbackTitle);
+    const snippet = displayText(item, ['snippet', 'preview', 'summary'], '');
+    const account = displayText(item, ['account', 'accountEmail', '_account'], '');
+    const time = liveTimeLabel(displayText(item, ['time', 'date', 'receivedAt'], ''));
+    return (
+      <div className="flex items-start gap-3">
+        <span aria-hidden="true" className="mt-1 h-9 w-[3px] shrink-0 rounded-full bg-ink/50" />
+        <Avatar name={sender} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline justify-between gap-3">
+            <p className="min-w-0 truncate text-sm font-semibold text-ink">{sender}</p>
+            {time && <span className="shrink-0 text-[11px] tabular-nums text-text-3">{time}</span>}
+          </div>
+          <p className="mt-0.5 oa-clamp-1 text-sm text-ink">{subject}</p>
+          {snippet && <p className="mt-1 oa-clamp-2 text-[13px] leading-5 text-text-3">{snippet}</p>}
+          {account && <p className="mt-2 truncate text-[11px] text-text-4">{account}</p>}
+        </div>
+      </div>
+    );
+  }
+  if (view === 'tasks') {
+    const completed = item.completed === true || displayText(item, ['status'], '') === 'completed';
+    const title = displayText(item, ['title', 'summary'], fallbackTitle);
+    const list = displayText(item, ['list', 'listTitle', 'taskListTitle'], '');
+    const due = displayText(item, ['due', 'dueDate'], '');
+    return (
+      <div className="flex items-start gap-3">
+        <span aria-hidden="true" className={`mt-0.5 grid h-[18px] w-[18px] shrink-0 place-items-center rounded-[6px] border transition ${completed ? 'border-brand bg-brand' : 'border-text-4 group-hover:border-brand/70'}`}>
+          {completed && (
+            <svg viewBox="0 0 24 24" fill="none" stroke="var(--brand-ink)" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3">
+              <path d="m5 12.5 4.5 4.5L19 7" />
+            </svg>
+          )}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className={`oa-clamp-2 text-sm leading-5 ${completed ? 'text-text-4 line-through' : 'text-ink'}`}>{title}</p>
+          {list && <p className="mt-1 oa-clamp-1 text-[11px] text-text-4">{list}</p>}
+        </div>
+        {due && <span className="shrink-0 whitespace-nowrap text-[11px] tabular-nums text-text-3">{liveDayLabel(due) || due}</span>}
+      </div>
+    );
+  }
+  if (view === 'calendar') {
+    const title = displayText(item, ['title', 'summary'], fallbackTitle);
+    const start = displayText(item, ['start', 'startTime'], '');
+    const end = displayText(item, ['end', 'endTime'], '');
+    const account = displayText(item, ['account', 'accountEmail', 'calendar'], '');
+    return (
+      <div className="flex items-start justify-between gap-4 max-sm:flex-col max-sm:gap-1">
+        <div className="min-w-0 flex-1">
+          <p className="oa-clamp-1 text-sm font-medium">{title}</p>
+          <p className="mt-1 oa-clamp-1 text-xs text-text-3">{[liveDayLabel(start), account].filter(Boolean).join(' · ')}</p>
+        </div>
+        {(start || end) && <p className="shrink-0 whitespace-nowrap font-mono text-xs tabular-nums text-text-2">{[liveTimeLabel(start), liveTimeLabel(end)].filter(Boolean).join('–')}</p>}
+      </div>
+    );
+  }
+  if (view === 'notes') {
+    const title = displayText(item, ['title', 'name'], fallbackTitle);
+    const preview = displayText(item, ['preview', 'snippet', 'description'], '');
+    const updated = displayText(item, ['updated', 'modifiedTime', 'updatedAt'], '');
+    return (
+      <div className="min-w-0">
+        <div className="flex items-center justify-between gap-3"><p className="oa-clamp-1 text-sm font-medium">{title}</p><span className="shrink-0 text-[11px] font-medium text-brand">Open note</span></div>
+        {preview && <p className="mt-2 oa-clamp-2 text-sm leading-6 text-text-3">{preview}</p>}
+        <p className="mt-2 oa-clamp-1 text-xs text-text-4">{[updated ? `Updated ${liveDayLabel(updated) || updated}` : '', 'Stored in Drive'].filter(Boolean).join(' · ')}</p>
+      </div>
+    );
+  }
+  if (view === 'memory') {
+    const category = displayText(item, ['category', 'kind'], 'Memory');
+    const fact = displayText(item, ['fact', 'text', 'content'], fallbackTitle);
+    return (
+      <div className="min-w-0">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">{category}</p>
+        <p className="mt-1.5 oa-wrap-anywhere text-sm leading-6 text-ink/90">{fact}</p>
+      </div>
+    );
+  }
+  if (view === 'accounts' || view === 'activity') {
+    const label = displayText(item, ['friendlyLabel', 'label', 'name'], fallbackTitle);
+    const email = displayText(item, ['email', 'accountEmail'], '');
+    const type = displayText(item, ['type', 'kind'], '');
+    return (
+      <div className="flex items-start justify-between gap-4 max-sm:flex-col max-sm:gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="oa-clamp-1 text-sm font-medium">{label}</p>
+          {email && <p className="mt-1 oa-wrap-anywhere text-sm text-text-3">{email}</p>}
+          {type && <p className="mt-0.5 text-xs text-text-4">{type}</p>}
+        </div>
+        <span className="shrink-0 whitespace-nowrap rounded-full bg-wash-strong px-2.5 py-1 text-[10px] text-text-2">Gmail · Calendar · Tasks</span>
+      </div>
+    );
+  }
+  const kind = String(item._kind ?? 'Workspace');
+  return (
+    <div className="min-w-0 flex-1">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">{kind}</p>
+      <p className="mt-1 oa-clamp-1 text-sm font-medium">{displayText(item, ['subject', 'title', 'summary', 'friendlyLabel', 'fact', 'name', 'email'], fallbackTitle)}</p>
+      <p className="mt-1 oa-clamp-1 text-sm text-text-3">{displayText(item, ['sender', 'from', 'email', 'due', 'start', 'account', 'category', 'status'], 'Live Workspace item')}</p>
+    </div>
+  );
+}
+
+function LiveWorkspaceView({ view, live, query, selectedId, ownerCode, onOwnerCode, onBootstrap, onReconnect, onRetry, onOpenNote, onOpenItem }: { view: WorkspaceView; live: LiveState; query: string; selectedId: string | null; ownerCode: string; onOwnerCode: (value: string) => void; onBootstrap: () => void; onReconnect: () => void; onRetry: () => void; onOpenNote: (item: Record<string, unknown>) => void; onOpenItem: (id: string, item: Record<string, unknown>) => void }) {
   const source = view === 'accounts' || view === 'activity' ? live.accounts : live.data[view];
-  const rows = useMemo(() => liveRows(view, source), [source, view]);
+  const rows = useMemo(() => {
+    const allRows = liveRows(view, source);
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return allRows;
+    return allRows.filter((item) => Object.values(item).some((value) => typeof value === 'string' && value.toLowerCase().includes(normalized)));
+  }, [query, source, view]);
   const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(rows, PAGE_SIZE, `${view}-${rows.length}`);
 
   if (live.loading && !live.data[view]) {
-    return <div className="grid min-h-[360px] place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Loading your private Workspace…</p></div></div>;
+    return <WorkspaceLoading />;
   }
   if (live.error) {
     if (live.error.startsWith('Owner access')) {
-      return <div className="mx-auto max-w-xl rounded-[26px] border border-[#E0BC63]/20 bg-[#E0BC63]/[0.045] p-6 sm:p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">One-time setup</p><h2 className="mt-2 text-xl font-semibold">Bind this private owner account</h2><p className="mt-3 text-sm leading-6 text-[#a4b1c2]">Enter the one-time owner code. It is used only to bind this signed-in ChatGPT account, then it can be removed.</p><label className="mt-5 block"><span className="sr-only">One-time owner code</span><input type="password" autoComplete="one-time-code" value={ownerCode} onChange={(event) => onOwnerCode(event.target.value)} placeholder="One-time owner code" className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none transition placeholder:text-[#5b6879] focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10" /></label><button onClick={onBootstrap} disabled={!ownerCode.trim()} className="mt-4 w-full rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a] disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto">Finish owner setup</button></div>;
+      return <div className="mx-auto max-w-xl rounded-2xl border border-brand/20 bg-brand/5 p-6 sm:p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">One-time setup</p><h2 className="mt-2 text-xl font-semibold">Bind this private owner account</h2><p className="mt-3 text-sm leading-6 text-text-2">Enter the one-time owner code. It is used only to bind this signed-in ChatGPT account, then it can be removed.</p><label className="mt-5 block"><span className="sr-only">One-time owner code</span><input type="password" autoComplete="one-time-code" value={ownerCode} onChange={(event) => onOwnerCode(event.target.value)} placeholder="One-time owner code" className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none transition placeholder:text-text-4 focus:border-brand/50 focus:ring-2 focus:ring-brand/10" /></label><button onClick={onBootstrap} disabled={!ownerCode.trim()} className="oa-btn-primary mt-4 w-full rounded-xl px-5 py-2.5 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto">Finish owner setup</button></div>;
     }
-    return <div className="mx-auto max-w-xl rounded-[26px] border border-[#FF8B78]/20 bg-[#FF8B78]/[0.045] p-6 sm:p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#FFA898]">Live Workspace unavailable</p><h2 className="mt-2 text-xl font-semibold">Reconnect securely</h2><p className="mt-3 oa-wrap-anywhere text-sm leading-6 text-[#a4b1c2]">{live.error}</p><button onClick={onReconnect} className="mt-6 w-full rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a] sm:w-auto">Connect Workspace</button></div>;
+    return <div className="mx-auto max-w-xl rounded-2xl border border-danger/20 bg-danger/5 p-6 sm:p-7"><p className="text-xs font-semibold uppercase tracking-[0.14em] text-danger-strong">Live Workspace unavailable</p><h2 className="mt-2 text-xl font-semibold">Reconnect securely</h2><p className="mt-3 oa-wrap-anywhere text-sm leading-6 text-text-2">{live.error}</p><button onClick={onReconnect} className="oa-btn-primary mt-6 w-full rounded-xl px-5 py-2.5 text-sm font-semibold sm:w-auto">Connect Workspace</button></div>;
   }
   if (!source) {
-    return <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.025] p-6 sm:p-7"><p className="text-sm leading-6 text-[#a4b1c2]">{live.warning ?? 'Connect Workspace to load private data. Demo records are intentionally hidden in Live mode.'}</p><button onClick={live.warning ? onRetry : onReconnect} className="mt-5 w-full rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a] sm:w-auto">{live.warning ? 'Try again' : 'Connect Workspace'}</button></div>;
+    return <div className="rounded-2xl border border-hairline bg-wash/60 p-6 sm:p-7"><p className="text-sm leading-6 text-text-2">{live.warning ?? 'Connect Workspace to load private data. Demo records are intentionally hidden in Live mode.'}</p><button onClick={live.warning ? onRetry : onReconnect} className="oa-btn-primary mt-5 w-full rounded-xl px-5 py-2.5 text-sm font-semibold sm:w-auto">{live.warning ? 'Try again' : 'Connect Workspace'}</button></div>;
   }
 
   return (
     <section className="min-w-0">
-      <div className="mb-6 flex items-start justify-between gap-4 rounded-2xl border border-[#E0BC63]/15 bg-[#E0BC63]/[0.045] px-4 py-3.5 sm:px-5 sm:py-4">
+      <div className="mb-6 flex items-start justify-between gap-4 rounded-2xl border border-hairline bg-wash/60 px-4 py-3.5 sm:px-5 sm:py-4">
         <div className="min-w-0">
-          <p className="text-sm font-medium text-[#FFE9AE]">Private owner mode</p>
-          <p className="mt-1 oa-clamp-2 text-xs leading-5 text-[#7c8a9c]">Loaded live through OpenAssist. Nothing below is copied into the site database.</p>
+          <p className="text-sm font-medium text-ink">Private owner mode</p>
+          <p className="mt-1 oa-clamp-2 text-xs leading-5 text-text-3">Loaded live through OpenAssist. Nothing below is copied into the site database.</p>
         </div>
-        <button onClick={onReconnect} className="shrink-0 rounded-xl border border-[#E0BC63]/25 px-3 py-2 text-xs text-[#FFE9AE] transition hover:border-[#E0BC63]/50">Connection</button>
+        <button onClick={onReconnect} className="shrink-0 rounded-lg border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:text-ink">Connection</button>
       </div>
-      {live.warning && <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#FFC178]/20 bg-[#FFC178]/[0.05] px-4 py-3 text-sm text-[#d7c399]"><span>Refresh failed. Showing the last loaded Workspace data.</span><button onClick={onRetry} className="rounded-lg border border-[#FFC178]/25 px-3 py-1.5 text-xs font-semibold text-[#FFE9AE]">Retry</button></div>}
-      {total ? (
+      {live.warning && <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-warning/20 bg-warning/5 px-4 py-3 text-sm text-warning-strong"><span>Refresh failed. Showing the last loaded Workspace data.</span><button onClick={onRetry} className="rounded-lg border border-warning/25 px-3 py-1.5 text-xs font-semibold text-brand-strong">Retry</button></div>}
+      {view === 'today' ? (
+        <LiveTodayDashboard rows={rows} selectedId={selectedId} onOpenItem={onOpenItem} />
+      ) : total ? (
         <>
           <div className="space-y-2">
             {pageItems.map((item, index) => {
-              const kind = String(item._kind ?? 'Workspace');
-              const title = displayText(item, ['subject', 'title', 'summary', 'friendlyLabel', 'fact', 'name', 'email'], `${kind} ${rangeStart + index}`);
-              const subtitle = displayText(item, ['sender', 'from', 'email', 'due', 'start', 'account', 'category', 'status'], 'Live Workspace item');
               const itemId = liveItemId(item, `${view}-${rangeStart + index}`);
               return (
                 <HaloRow key={itemId} id={itemId} selected={selectedId === itemId} onClick={view === 'notes' ? () => onOpenNote(item) : () => onOpenItem(itemId, item)}>
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0 flex-1">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.13em] text-[#E0BC63]">{kind}</p>
-                      <p className="mt-1 oa-clamp-1 text-sm font-medium">{title}</p>
-                      <p className="mt-1 oa-clamp-1 text-sm text-[#7c8a9c]">{subtitle}</p>
-                    </div>
-                    {view === 'notes' ? <span className="mt-1 shrink-0 text-[11px] font-medium text-[#E0BC63]">Open note</span> : <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[#E0BC63] shadow-[0_0_14px_rgba(224,188,99,0.45)]" />}
-                  </div>
+                  <LiveRowBody view={view} item={item} fallbackTitle={`${String(item._kind ?? 'Workspace')} ${rangeStart + index}`} />
                 </HaloRow>
               );
             })}
@@ -2044,6 +2374,86 @@ function LiveWorkspaceView({ view, live, selectedId, ownerCode, onOwnerCode, onB
         </>
       ) : <EmptyState title="Nothing needs attention here." hint="This is a real empty state, not demo content." />}
     </section>
+  );
+}
+
+function WorkspaceLoading({ title = 'Organizing your live workspace', detail = 'Checking connected mail, tasks, and calendar securely…' }: { title?: string; detail?: string }) {
+  return (
+    <section aria-label="Loading private workspace" aria-busy="true" className="space-y-5">
+      <div className="flex items-center gap-3 rounded-2xl border border-hairline bg-wash/60 px-4 py-3.5">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-text-3" />
+        <div><p className="text-sm font-medium text-ink">{title}</p><p className="mt-0.5 text-xs text-text-4">{detail}</p></div>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-3">
+        {[0, 1, 2].map((item) => <div key={item} className="h-24 animate-pulse rounded-2xl border border-hairline bg-wash/60" />)}
+      </div>
+      <div className="grid gap-5 xl:grid-cols-2">
+        {[0, 1].map((column) => <div key={column} className="overflow-hidden rounded-2xl border border-hairline bg-wash/60"><div className="h-16 border-b border-hairline bg-wash/60" /><div className="space-y-3 p-4">{[0, 1, 2].map((row) => <div key={row} className="h-14 animate-pulse rounded-xl bg-wash" />)}</div></div>)}
+      </div>
+    </section>
+  );
+}
+
+function LiveTodayDashboard({ rows, selectedId, onOpenItem }: { rows: Array<Record<string, unknown>>; selectedId: string | null; onOpenItem: (id: string, item: Record<string, unknown>) => void }) {
+  const mail = rows.filter((item) => item._kind === 'Unread mail');
+  const tasks = rows.filter((item) => item._kind === 'Task');
+  const events = rows.filter((item) => item._kind === 'Calendar');
+  const sections = [
+    { id: 'mail', label: 'Needs attention', detail: 'Unread across connected Gmail accounts', rows: mail.slice(0, 5), empty: 'No unread mail needs attention.' },
+    { id: 'tasks', label: 'Next actions', detail: 'Open tasks from your default Tasks account', rows: tasks.slice(0, 5), empty: 'Your active task list is clear.' },
+    { id: 'calendar', label: 'On your calendar', detail: 'Events scheduled for today', rows: events.slice(0, 5), empty: 'No events are scheduled today.' },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <section aria-label="Today summary" className="grid overflow-hidden rounded-2xl border border-hairline bg-wash/60 sm:grid-cols-3">
+        {[
+          { label: 'Unread attention', value: mail.length, accent: 'text-ink' },
+          { label: 'Open actions', value: tasks.length, accent: 'text-ink' },
+          { label: "Today’s events", value: events.length, accent: 'text-ink' },
+        ].map((metric, index) => (
+          <div key={metric.label} className={`px-5 py-5 sm:px-6 ${index ? 'border-t border-hairline sm:border-l sm:border-t-0' : ''}`}>
+            <p className={`text-3xl font-semibold tabular-nums tracking-[-0.04em] ${metric.accent}`}>{metric.value}</p>
+            <p className="mt-1 text-xs font-medium text-text-3">{metric.label}</p>
+          </div>
+        ))}
+      </section>
+
+      <div className="grid gap-5 2xl:grid-cols-3">
+        {sections.map((section) => (
+          <section key={section.id} aria-labelledby={`today-${section.id}`} className="min-w-0 overflow-hidden rounded-2xl border border-hairline bg-wash/60">
+            <header className="border-b border-hairline px-5 py-4">
+              <div className="flex items-center justify-between gap-3">
+                <h2 id={`today-${section.id}`} className="text-sm font-semibold text-ink">{section.label}</h2>
+                <span className="rounded-full border border-hairline bg-wash px-2 py-0.5 text-[10px] font-semibold tabular-nums text-text-2">{section.rows.length}</span>
+              </div>
+              <p className="mt-1 text-[11px] leading-5 text-text-4">{section.detail}</p>
+            </header>
+            {section.rows.length ? (
+              <div className="divide-y divide-hairline">
+                {section.rows.map((item, index) => {
+                  const itemId = liveItemId(item, `${section.id}-${index + 1}`);
+                  const title = displayText(item, ['subject', 'title', 'summary'], 'Untitled item');
+                  const subtitle = displayText(item, ['from', 'sender', 'due', 'start', 'accountEmail', 'account'], section.label);
+                  return (
+                    <button key={itemId} type="button" onClick={() => onOpenItem(itemId, item)} aria-current={selectedId === itemId ? 'true' : undefined} className={`group block w-full px-5 py-4 text-left transition duration-150 ${selectedId === itemId ? 'bg-brand/10' : 'hover:bg-wash'}`}>
+                      <div className="flex items-start gap-3">
+                        <span aria-hidden="true" className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${section.id === 'calendar' ? 'bg-teal' : section.id === 'tasks' ? 'border border-text-4' : 'bg-ink/55'}`} />
+                        <span className="min-w-0 flex-1">
+                          <span className="oa-clamp-2 block text-sm font-medium leading-5 text-ink transition group-hover:text-ink">{title}</span>
+                          <span className="mt-1 oa-clamp-1 block text-[11px] text-text-4">{subtitle}</span>
+                        </span>
+                        <span aria-hidden="true" className="text-sm text-text-4 transition group-hover:text-text-2">›</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : <div className="px-5 py-8 text-center text-xs leading-5 text-text-4">{section.empty}</div>}
+          </section>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -2060,9 +2470,9 @@ function ActivityView({ mode, activity, owner = false, onVoicePolicyChanged }: {
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0 flex-1">
                     <p className="oa-clamp-2 text-sm">{item.action}</p>
-                    <p className="mt-1 oa-clamp-1 text-xs text-[#7c8a9c]">{item.actor} · {item.type === 'write' ? 'Approved write' : 'Read only'}</p>
+                    <p className="mt-1 oa-clamp-1 text-xs text-text-3">{item.actor} · {item.type === 'write' ? 'Approved write' : 'Read only'}</p>
                   </div>
-                  <span className="shrink-0 whitespace-nowrap text-xs text-[#5b6879]">{item.time}</span>
+                  <span className="shrink-0 whitespace-nowrap text-xs text-text-4">{item.time}</span>
                 </div>
               </HaloRow>
             ))}
@@ -2070,7 +2480,7 @@ function ActivityView({ mode, activity, owner = false, onVoicePolicyChanged }: {
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="events" onPage={setPage} />
         </>
       ) : <EmptyState title="No activity yet." hint="Reads and approved writes will appear here as they happen." />}
-      <p className="mt-7 max-w-2xl text-sm leading-6 text-[#7c8a9c]">{mode === 'demo' ? 'This temporary activity belongs only to the isolated judge workspace and expires with it.' : 'Activity stores safe metadata only. It does not copy message bodies, attachments, task text, calendar text, notes, memory, audio, or transcripts into the database.'}</p>
+      <p className="mt-7 max-w-2xl text-sm leading-6 text-text-3">{mode === 'demo' ? 'This temporary activity belongs only to the isolated judge workspace and expires with it.' : 'Activity stores safe metadata only. It does not copy message bodies, attachments, task text, calendar text, notes, memory, audio, or transcripts into the database.'}</p>
     </section>
   );
 }
@@ -2159,46 +2569,46 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
   }, [load, onChanged]);
 
   return (
-    <section className="mb-8 overflow-hidden rounded-[24px] border border-[#E0BC63]/20 bg-[linear-gradient(145deg,rgba(224,188,99,0.07),rgba(255,255,255,0.018))] shadow-[0_18px_70px_rgba(0,0,0,0.22)]">
-      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-white/[0.08] px-5 py-5 sm:px-6">
+    <section className="mb-8 overflow-hidden rounded-2xl border border-hairline bg-wash/60">
+      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-hairline px-5 py-5 sm:px-6">
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#E0BC63]">Owner only</p>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Owner only</p>
           <h2 className="mt-1 text-xl font-semibold">Judge voice controls</h2>
-          <p className="mt-1 max-w-2xl text-sm leading-6 text-[#7c8a9c]">Fund the judge demo with your protected API key, set strict limits, and monitor usage.</p>
+          <p className="mt-1 max-w-2xl text-sm leading-6 text-text-3">Fund the judge demo with your protected API key, set strict limits, and monitor usage.</p>
         </div>
-        <button type="button" onClick={() => void load()} disabled={loading || saving} className="rounded-xl border border-white/10 px-3 py-2 text-xs text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white disabled:opacity-50">Refresh</button>
+        <button type="button" onClick={() => void load()} disabled={loading || saving} className="rounded-xl border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:border-brand/35 hover:text-ink disabled:opacity-50">Refresh</button>
       </div>
 
-      {loading && !config ? <div className="px-6 py-8 text-sm text-[#7c8a9c]">Loading secure settings…</div> : config && (
+      {loading && !config ? <div className="px-6 py-8 text-sm text-text-3">Loading secure settings…</div> : config && (
         <div className="grid gap-6 px-5 py-6 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] sm:px-6">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${config.available ? 'bg-[#68D391]/10 text-[#8BE7AE]' : 'bg-[#FF8B78]/10 text-[#FFA898]'}`}>{config.available ? 'Funded demo ready' : config.enabled ? 'Key needed' : 'Paused'}</span>
-              <span className="text-xs text-[#667480]">{config.source === 'owner_key' ? 'Encrypted owner key' : config.source === 'worker_secret' ? 'Protected deployment key' : 'No funded key'}</span>
+              <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${config.available ? 'bg-success/10 text-success-strong' : 'bg-danger/10 text-danger-strong'}`}>{config.available ? 'Funded demo ready' : config.enabled ? 'Key needed' : 'Paused'}</span>
+              <span className="text-xs text-text-4">{config.source === 'owner_key' ? 'Encrypted owner key' : config.source === 'worker_secret' ? 'Protected deployment key' : 'No funded key'}</span>
             </div>
 
             <label className="mt-5 block">
-              <span className="mb-2 block text-xs font-medium text-[#a4b1c2]">OpenAI API key</span>
-              <input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" spellCheck={false} placeholder={config.keyConfigured ? 'Key is saved securely · enter a new key to replace it' : 'Paste a funded project key'} className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none transition placeholder:text-[#53606e] focus:border-[#E0BC63]/50 focus:ring-2 focus:ring-[#E0BC63]/10" />
-              <span className="mt-2 block text-[11px] leading-5 text-[#667480]">The key is verified server-side, encrypted in R2, and never returned to this page or shown to judges.</span>
+              <span className="mb-2 block text-xs font-medium text-text-2">OpenAI API key</span>
+              <input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="new-password" spellCheck={false} placeholder={config.keyConfigured ? 'Key is saved securely · enter a new key to replace it' : 'Paste a funded project key'} className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none transition placeholder:text-text-4 focus:border-brand/50 focus:ring-2 focus:ring-brand/10" />
+              <span className="mt-2 block text-[11px] leading-5 text-text-4">The key is verified server-side, encrypted in R2, and never returned to this page or shown to judges.</span>
             </label>
 
             <div className="mt-5 grid gap-3 sm:grid-cols-3">
-              <label className="block"><span className="mb-2 block text-xs text-[#a4b1c2]">Sessions / day</span><input type="number" min={1} max={100} value={config.dailySessionLimit} onChange={(event) => setConfig({ ...config, dailySessionLimit: Number(event.target.value) })} className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-[#E0BC63]/50" /></label>
-              <label className="block"><span className="mb-2 block text-xs text-[#a4b1c2]">Seconds / session</span><input type="number" min={60} max={300} step={30} value={config.sessionSeconds} onChange={(event) => setConfig({ ...config, sessionSeconds: Number(event.target.value) })} className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-[#E0BC63]/50" /></label>
-              <label className="block"><span className="mb-2 block text-xs text-[#a4b1c2]">Tools / session</span><input type="number" min={1} max={25} value={config.maxToolCalls} onChange={(event) => setConfig({ ...config, maxToolCalls: Number(event.target.value) })} className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-[#E0BC63]/50" /></label>
+              <label className="block"><span className="mb-2 block text-xs text-text-2">Sessions / day</span><input type="number" min={1} max={100} value={config.dailySessionLimit} onChange={(event) => setConfig({ ...config, dailySessionLimit: Number(event.target.value) })} className="w-full rounded-xl border border-hairline-strong bg-field px-3 py-2.5 text-sm outline-none focus:border-brand/50" /></label>
+              <label className="block"><span className="mb-2 block text-xs text-text-2">Seconds / session</span><input type="number" min={60} max={300} step={30} value={config.sessionSeconds} onChange={(event) => setConfig({ ...config, sessionSeconds: Number(event.target.value) })} className="w-full rounded-xl border border-hairline-strong bg-field px-3 py-2.5 text-sm outline-none focus:border-brand/50" /></label>
+              <label className="block"><span className="mb-2 block text-xs text-text-2">Tools / session</span><input type="number" min={1} max={25} value={config.maxToolCalls} onChange={(event) => setConfig({ ...config, maxToolCalls: Number(event.target.value) })} className="w-full rounded-xl border border-hairline-strong bg-field px-3 py-2.5 text-sm outline-none focus:border-brand/50" /></label>
             </div>
 
             <div className="mt-5 flex flex-wrap gap-2">
-              <button type="button" onClick={() => void save({ enabled: true })} disabled={saving || (!apiKey && !config.keyConfigured)} className="rounded-xl bg-[#E0BC63] px-4 py-2.5 text-sm font-semibold text-[#17130a] transition hover:bg-[#F0CF77] disabled:cursor-not-allowed disabled:opacity-45">{saving ? 'Saving…' : config.enabled ? 'Save limits' : 'Enable funded demo'}</button>
-              {config.enabled && <button type="button" onClick={() => void save({ enabled: false })} disabled={saving} className="rounded-xl border border-white/10 px-4 py-2.5 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white disabled:opacity-45">Pause</button>}
-              {config.keyConfigured && <button type="button" onClick={() => void removeKey()} disabled={saving} className="rounded-xl border border-[#FF8B78]/20 px-4 py-2.5 text-sm text-[#FFA898] transition hover:border-[#FF8B78]/45 disabled:opacity-45">Remove key</button>}
+              <button type="button" onClick={() => void save({ enabled: true })} disabled={saving || (!apiKey && !config.keyConfigured)} className="oa-btn-primary rounded-xl px-4 py-2.5 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-45">{saving ? 'Saving…' : config.enabled ? 'Save limits' : 'Enable funded demo'}</button>
+              {config.enabled && <button type="button" onClick={() => void save({ enabled: false })} disabled={saving} className="rounded-xl border border-hairline-strong px-4 py-2.5 text-sm text-text-2 transition hover:border-brand/35 hover:text-ink disabled:opacity-45">Pause</button>}
+              {config.keyConfigured && <button type="button" onClick={() => void removeKey()} disabled={saving} className="rounded-xl border border-danger/20 px-4 py-2.5 text-sm text-danger-strong transition hover:border-danger/45 disabled:opacity-45">Remove key</button>}
             </div>
-            {message && <p aria-live="polite" className="mt-4 rounded-xl border border-white/[0.08] bg-black/15 px-3 py-2.5 text-xs leading-5 text-[#a4b1c2]">{message}</p>}
+            {message && <p aria-live="polite" className="mt-4 rounded-xl border border-hairline bg-field px-3 py-2.5 text-xs leading-5 text-text-2">{message}</p>}
           </div>
 
-          <div className="min-w-0 rounded-2xl border border-white/[0.08] bg-black/15 p-4 sm:p-5">
-            <div className="flex items-center justify-between gap-3"><h3 className="text-sm font-semibold">Anonymous usage</h3><a href="https://platform.openai.com/usage" target="_blank" rel="noreferrer" className="text-xs font-medium text-[#E0BC63] underline decoration-[#E0BC63]/25 underline-offset-4">OpenAI usage</a></div>
+          <div className="min-w-0 rounded-2xl border border-hairline bg-field p-4 sm:p-5">
+            <div className="flex items-center justify-between gap-3"><h3 className="text-sm font-semibold">Anonymous usage</h3><a href="https://platform.openai.com/usage" target="_blank" rel="noreferrer" className="text-xs font-medium text-brand underline decoration-brand/25 underline-offset-4">OpenAI usage</a></div>
             {usage ? <>
               <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3">
                 {[
@@ -2208,13 +2618,13 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
                   ['Active', usage.activeSessions],
                   ['Failures', usage.failures],
                   ['Minutes', usage.totalMinutes],
-                ].map(([label, value]) => <div key={String(label)} className="rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-3"><p className="text-lg font-semibold tabular-nums">{value}</p><p className="mt-0.5 text-[10px] uppercase tracking-[0.12em] text-[#667480]">{label}</p></div>)}
+                ].map(([label, value]) => <div key={String(label)} className="rounded-xl border border-hairline bg-wash/60 px-3 py-3"><p className="text-lg font-semibold tabular-nums">{value}</p><p className="mt-0.5 text-[10px] uppercase tracking-[0.14em] text-text-4">{label}</p></div>)}
               </div>
               <div className="mt-4 max-h-56 space-y-1 overflow-y-auto pr-1">
-                {usage.recent.length ? usage.recent.map((event) => <div key={event.eventId} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 text-xs transition hover:bg-white/[0.025]"><div className="min-w-0"><p className="truncate text-[#cbd4db]">{event.judgeLabel} · {event.kind === 'funded_session' ? 'Funded' : event.kind === 'subscription_session' ? 'My ChatGPT' : 'Sign-in'}</p><p className="mt-0.5 text-[10px] text-[#5b6879]">{new Date(event.startedAt).toLocaleString()} · {event.toolCalls} tools</p></div><span className={`shrink-0 text-[10px] font-semibold uppercase ${event.status === 'failed' ? 'text-[#FFA898]' : event.status === 'active' ? 'text-[#8BE7AE]' : 'text-[#7c8a9c]'}`}>{event.status}</span></div>) : <p className="py-5 text-center text-xs text-[#667480]">No judge voice use yet.</p>}
+                {usage.recent.length ? usage.recent.map((event) => <div key={event.eventId} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 text-xs transition hover:bg-wash/60"><div className="min-w-0"><p className="truncate text-text-2">{event.judgeLabel} · {event.kind === 'funded_session' ? 'Funded' : event.kind === 'subscription_session' ? 'My ChatGPT' : 'Sign-in'}</p><p className="mt-0.5 text-[10px] text-text-4">{new Date(event.startedAt).toLocaleString()} · {event.toolCalls} tools</p></div><span className={`shrink-0 text-[10px] font-semibold uppercase ${event.status === 'failed' ? 'text-danger-strong' : event.status === 'active' ? 'text-success-strong' : 'text-text-3'}`}>{event.status}</span></div>) : <p className="py-5 text-center text-xs text-text-4">No judge voice use yet.</p>}
               </div>
-            </> : <p className="mt-5 text-xs text-[#667480]">Usage has not loaded yet.</p>}
-            <p className="mt-4 border-t border-white/[0.07] pt-4 text-[11px] leading-5 text-[#667480]">Only session counts, time, tool counts, and safe error codes are stored. No audio, transcript, prompt, tool arguments, or Workspace content is saved.</p>
+            </> : <p className="mt-5 text-xs text-text-4">Usage has not loaded yet.</p>}
+            <p className="mt-4 border-t border-hairline pt-4 text-[11px] leading-5 text-text-4">Only session counts, time, tool counts, and safe error codes are stored. No audio, transcript, prompt, tool arguments, or Workspace content is saved.</p>
           </div>
         </div>
       )}
@@ -2235,15 +2645,15 @@ function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () =
   ].filter((entry) => entry[1]);
   return (
     <div className="fixed inset-0 z-[80] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={`${kind} details`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="w-full max-w-xl rounded-[28px] border border-[#E0BC63]/20 bg-[#0d0f14]/95 p-6 shadow-[0_30px_100px_rgba(0,0,0,0.65),0_0_40px_rgba(224,188,99,0.06)] sm:p-7">
+      <section className="w-full max-w-xl rounded-2xl border border-hairline-strong bg-raised p-6 shadow-[0_24px_64px_rgba(0,0,0,0.5)] sm:p-7">
         <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">{kind}</p><h2 className="mt-2 oa-wrap-anywhere text-xl font-semibold leading-7">{title}</h2></div>
-          <button onClick={onClose} aria-label="Close details" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-white/10 text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">×</button>
+          <div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-brand">{kind}</p><h2 className="mt-2 oa-wrap-anywhere text-xl font-semibold leading-7">{title}</h2></div>
+          <button onClick={onClose} aria-label="Close details" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-hairline-strong text-text-2 transition hover:border-brand/35 hover:text-ink">×</button>
         </div>
-        <dl className="mt-6 divide-y divide-white/[0.07] rounded-2xl border border-white/[0.07] bg-white/[0.025] px-4">
-          {fields.map(([label, text]) => <div key={label} className="grid gap-1 py-3 sm:grid-cols-[84px_1fr]"><dt className="text-xs font-medium text-[#7c8a9c]">{label}</dt><dd className="oa-wrap-anywhere text-sm leading-5 text-[#d6dfeb]">{text}</dd></div>)}
+        <dl className="mt-6 divide-y divide-hairline rounded-2xl border border-hairline bg-wash/60 px-4">
+          {fields.map(([label, text]) => <div key={label} className="grid gap-1 py-3 sm:grid-cols-[84px_1fr]"><dt className="text-xs font-medium text-text-3">{label}</dt><dd className="oa-wrap-anywhere text-sm leading-5 text-ink/90">{text}</dd></div>)}
         </dl>
-        <p className="mt-4 text-xs leading-5 text-[#667480]">Loaded live from OpenAssist. This content is not copied into the site database.</p>
+        <p className="mt-4 text-xs leading-5 text-text-4">Loaded live from OpenAssist. This content is not copied into the site database.</p>
       </section>
     </div>
   );
@@ -2258,23 +2668,23 @@ function NoteReader({ note, onClose }: { note: OpenNote; onClose: () => void }) 
 
   return (
     <div className="fixed inset-0 z-[70] grid place-items-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="note-reader-title">
-      <article className="my-auto w-full max-w-3xl overflow-hidden rounded-[28px] border border-white/10 bg-[#11141a] shadow-[0_28px_90px_rgba(0,0,0,0.65)]">
-        <header className="flex items-start justify-between gap-4 border-b border-white/[0.08] px-5 py-5 sm:px-7">
+      <article className="my-auto w-full max-w-3xl overflow-hidden rounded-2xl border border-hairline-strong bg-raised shadow-[0_24px_64px_rgba(0,0,0,0.5)]">
+        <header className="flex items-start justify-between gap-4 border-b border-hairline px-5 py-5 sm:px-7">
           <div className="min-w-0">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-[#E0BC63]">{note.source}</p>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">{note.source}</p>
             <h2 id="note-reader-title" className="mt-1 oa-wrap-anywhere text-xl font-semibold sm:text-2xl">{note.title}</h2>
-            <p className="mt-2 text-xs leading-5 text-[#7c8a9c]">Drive and note content is untrusted. OpenAssist shows it as plain text and never follows instructions found inside it.</p>
+            <p className="mt-2 text-xs leading-5 text-text-3">Drive and note content is untrusted. OpenAssist shows it as plain text and never follows instructions found inside it.</p>
           </div>
-          <button type="button" onClick={onClose} aria-label="Close note" className="shrink-0 rounded-full border border-white/10 px-3 py-1.5 text-sm text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">Close</button>
+          <button type="button" onClick={onClose} aria-label="Close note" className="shrink-0 rounded-full border border-hairline-strong px-3 py-1.5 text-sm text-text-2 transition hover:border-brand/35 hover:text-ink">Close</button>
         </header>
         <div className="max-h-[65vh] overflow-y-auto px-5 py-6 sm:px-7">
-          {note.loading ? <div className="grid min-h-48 place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-[#E0BC63]/50 bg-[#E0BC63]/10" /><p className="mt-4 text-sm text-[#7c8a9c]">Opening note from Drive…</p></div></div>
-            : note.error ? <div className="rounded-2xl border border-[#FF8B78]/20 bg-[#FF8B78]/[0.05] p-5 text-sm leading-6 text-[#FFA898]">{note.error}</div>
-              : <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-7 text-[#d6dfeb]">{note.content}</pre>}
+          {note.loading ? <div className="grid min-h-48 place-items-center"><div className="text-center"><span className="mx-auto block h-8 w-8 animate-pulse rounded-full border border-brand/50 bg-brand/10" /><p className="mt-4 text-sm text-text-3">Opening note from Drive…</p></div></div>
+            : note.error ? <div className="rounded-2xl border border-danger/20 bg-danger/5 p-5 text-sm leading-6 text-danger-strong">{note.error}</div>
+              : <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-7 text-ink/90">{note.content}</pre>}
         </div>
-        <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.08] px-5 py-4 sm:px-7">
-          <span className="text-xs text-[#5b6879]">Read only</span>
-          {note.openUrl && <a href={note.openUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-[#E0BC63]/25 px-4 py-2 text-sm font-medium text-[#E0BC63] transition hover:border-[#E0BC63]/55 hover:text-[#FFE9AE]">Open in Google Drive</a>}
+        <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-hairline px-5 py-4 sm:px-7">
+          <span className="text-xs text-text-4">Read only</span>
+          {note.openUrl && <a href={note.openUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-brand/25 px-4 py-2 text-sm font-medium text-brand transition hover:border-brand/55 hover:text-brand-strong">Open in Google Drive</a>}
         </footer>
       </article>
     </div>
@@ -2283,9 +2693,9 @@ function NoteReader({ note, onClose }: { note: OpenNote; onClose: () => void }) 
 
 function ItemEditor({ kind, onCancel, onSubmit }: { kind: Exclude<EditorKind, null>; onCancel: () => void; onSubmit: (args: Record<string, unknown>) => void }) {
   const isTask = kind === 'task';
-  return <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="item-editor-title"><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); if (isTask) { const tags = String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean).map((tag) => tag.startsWith('#') ? tag : `#${tag}`); onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), list: String(data.get('list') ?? 'My Tasks'), due: String(data.get('due') ?? ''), tags }); } else { onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), content: String(data.get('content') ?? '') }); } }} className="my-auto w-full max-w-xl rounded-[26px] border border-white/10 bg-[#14171e] p-5 shadow-2xl sm:p-6"><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#E0BC63]">Demo workspace</p><h2 id="item-editor-title" className="mt-1 text-xl font-semibold">{isTask ? 'Create a task' : 'Create a note'}</h2><p className="mt-2 text-sm text-[#a4b1c2]">A locked approval preview will open before anything is saved.</p></div><button type="button" onClick={onCancel} className="rounded-full border border-white/10 px-3 py-1.5 text-sm text-[#a4b1c2]">Close</button></div><div className="mt-6 space-y-4"><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Title</span><input name="title" required maxLength={200} autoFocus className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50" placeholder={isTask ? 'What needs to be done?' : 'Note title'} /></label>{isTask ? <><div className="grid grid-cols-2 gap-4 max-sm:grid-cols-1"><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">List</span><select name="list" className="w-full rounded-xl border border-white/10 bg-[#0d0f14] px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50"><option>My Tasks</option><option>Backlog</option></select></label><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Due date</span><input name="due" type="date" className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50" /></label></div><label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Tags</span><input name="tags" maxLength={240} className="w-full rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-[#E0BC63]/50" placeholder="Launch, Work" /></label></> : <label className="block"><span className="mb-2 block text-xs font-medium text-[#a4b1c2]">Content</span><textarea name="content" required maxLength={20000} rows={9} className="w-full resize-y rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm leading-6 outline-none focus:border-[#E0BC63]/50" placeholder="Add useful reference material…" /></label>}</div><div className="mt-6 flex justify-end gap-3 max-sm:flex-col-reverse"><button type="button" onClick={onCancel} className="rounded-xl border border-white/10 px-4 py-2.5 text-sm transition hover:border-white/25">Cancel</button><button type="submit" className="rounded-xl bg-[#E0BC63] px-5 py-2.5 text-sm font-semibold text-[#17130a]">Review before saving</button></div></form></div>;
+  return <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="item-editor-title"><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); if (isTask) { const tags = String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean).map((tag) => tag.startsWith('#') ? tag : `#${tag}`); onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), list: String(data.get('list') ?? 'My Tasks'), due: String(data.get('due') ?? ''), tags }); } else { onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), content: String(data.get('content') ?? '') }); } }} className="my-auto w-full max-w-xl rounded-2xl border border-hairline-strong bg-raised p-5 shadow-[0_24px_64px_rgba(0,0,0,0.5)] sm:p-6"><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">Demo workspace</p><h2 id="item-editor-title" className="mt-1 text-xl font-semibold">{isTask ? 'Create a task' : 'Create a note'}</h2><p className="mt-2 text-sm text-text-2">A locked approval preview will open before anything is saved.</p></div><button type="button" onClick={onCancel} className="rounded-full border border-hairline-strong px-3 py-1.5 text-sm text-text-2">Close</button></div><div className="mt-6 space-y-4"><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Title</span><input name="title" required maxLength={200} autoFocus className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" placeholder={isTask ? 'What needs to be done?' : 'Note title'} /></label>{isTask ? <><div className="grid grid-cols-2 gap-4 max-sm:grid-cols-1"><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">List</span><select name="list" className="w-full rounded-xl border border-hairline-strong bg-surface px-4 py-3 text-sm outline-none focus:border-brand/50"><option>My Tasks</option><option>Backlog</option></select></label><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Due date</span><input name="due" type="date" className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" /></label></div><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Tags</span><input name="tags" maxLength={240} className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" placeholder="Launch, Work" /></label></> : <label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Content</span><textarea name="content" required maxLength={20000} rows={9} className="w-full resize-y rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm leading-6 outline-none focus:border-brand/50" placeholder="Add useful reference material…" /></label>}</div><div className="mt-6 flex justify-end gap-3 max-sm:flex-col-reverse"><button type="button" onClick={onCancel} className="rounded-xl border border-hairline-strong px-4 py-2.5 text-sm transition hover:border-hairline-strong">Cancel</button><button type="submit" className="oa-btn-primary rounded-xl px-5 py-2.5 text-sm font-semibold">Review before saving</button></div></form></div>;
 }
 
 function ApprovalDrawer({ action, onCancel, onApprove }: { action: PendingAction; onCancel: () => void; onApprove: () => void }) {
-  return <aside className="oa-approval-dock" aria-labelledby="approval-title"><div className="oa-approval-dock__panel"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#FFC178]">Approval required</p><h2 id="approval-title" className="mt-1 oa-wrap-anywhere text-base font-semibold">{action.title}</h2><p className="mt-1 text-xs leading-5 text-[#a4b1c2]">Review this exact change while the workspace remains visible.</p></div><button onClick={onCancel} aria-label="Cancel approval" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-white/10 text-lg text-[#a4b1c2] transition hover:border-[#E0BC63]/35 hover:text-white">×</button></div><dl className="mt-3 max-h-[26vh] space-y-1.5 overflow-y-auto rounded-xl bg-black/20 p-3">{compactArgs(action.args).map(({ key, value }) => <div key={key} className="grid grid-cols-[minmax(72px,96px)_minmax(0,1fr)] gap-2 text-xs max-sm:grid-cols-1 max-sm:gap-0.5"><dt className="oa-wrap-anywhere text-[#7c8a9c]">{key}</dt><dd className="oa-wrap-anywhere text-[#d6dfeb]">{value}</dd></div>)}</dl>{action.destructive ? <p className="mt-3 rounded-lg border border-[#FF8B78]/25 bg-[#FF8B78]/[0.06] px-3 py-2 text-xs leading-5 text-[#FFA898]">A screen tap is required. Voice confirmation cannot approve it.</p> : <p className="mt-3 text-xs leading-5 text-[#a4b1c2]">Tap Approve or say “confirm” while this preview is active.</p>}<div className="mt-3 flex justify-end gap-2"><button onClick={onCancel} className="rounded-lg border border-white/10 px-3.5 py-2 text-xs transition hover:border-white/25">Cancel</button><button onClick={onApprove} className={`rounded-lg px-4 py-2 text-xs font-semibold ${action.destructive ? 'bg-[#FF8B78] text-[#2A0A06]' : 'bg-[#E0BC63] text-[#17130a]'}`}>Approve</button></div></div></aside>;
+  return <aside className="oa-approval-dock" aria-labelledby="approval-title"><div className="oa-approval-dock__panel"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-warning">Approval required</p><h2 id="approval-title" className="mt-1 oa-wrap-anywhere text-base font-semibold">{action.title}</h2><p className="mt-1 text-xs leading-5 text-text-2">Review this exact change while the workspace remains visible.</p></div><button onClick={onCancel} aria-label="Cancel approval" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-hairline-strong text-lg text-text-2 transition hover:border-brand/35 hover:text-ink">×</button></div><dl className="mt-3 max-h-[26vh] space-y-1.5 overflow-y-auto rounded-xl bg-field p-3">{compactArgs(action.args).map(({ key, value }) => <div key={key} className="grid grid-cols-[minmax(72px,96px)_minmax(0,1fr)] gap-2 text-xs max-sm:grid-cols-1 max-sm:gap-0.5"><dt className="oa-wrap-anywhere text-text-3">{key}</dt><dd className="oa-wrap-anywhere text-ink/90">{value}</dd></div>)}</dl>{action.destructive ? <p className="mt-3 rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs leading-5 text-danger-strong">A screen tap is required. Voice confirmation cannot approve it.</p> : <p className="mt-3 text-xs leading-5 text-text-2">Tap Approve or say “confirm” while this preview is active.</p>}<div className="mt-3 flex justify-end gap-2"><button onClick={onCancel} className="rounded-lg border border-hairline-strong px-3.5 py-2 text-xs transition hover:border-hairline-strong">Cancel</button><button onClick={onApprove} className={`rounded-lg px-4 py-2 text-xs font-semibold ${action.destructive ? 'bg-danger text-brand-ink' : 'oa-btn-primary'}`}>Approve</button></div></div></aside>;
 }

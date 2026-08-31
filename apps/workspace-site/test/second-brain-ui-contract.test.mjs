@@ -95,7 +95,7 @@ test('live adapter maps the Site tools to Drive-backed Second Brain MCP tools', 
   assert.doesNotMatch(search, /projectId/);
   const promotion = client.slice(client.indexOf("name === 'workspace_promote_work_item_to_task'"), client.indexOf("name === 'workspace_assign_work_item'"));
   assert.match(promotion, /userConfirmed: true/);
-  assert.match(promotion, /resolveAccount\(accessToken, args\.account, 'tasks'\)/);
+  assert.match(promotion, /resolveAccount\(accessToken, args\.account, 'tasks', requestCall\)/);
   assert.match(promotion, /stableSiteAttemptKey\('site-promote-work-item'\)/);
   assert.doesNotMatch(promotion, /await taskListId/);
 
@@ -103,6 +103,20 @@ test('live adapter maps the Site tools to Drive-backed Second Brain MCP tools', 
   assert.match(promotionTool, /\['workItemId', 'account', 'taskListId', 'title'\]/);
   assert.match(work, /disabled=\{saving \|\| !taskAccount \|\| !effectiveTaskListId/);
   assert.match(work, /onPromote\(\{ workItemId: itemId, account: taskAccount, taskListId: effectiveTaskListId, title \}\)/);
+});
+
+test('work dashboard preserves every project and work item returned by its bounded MCP queries', async () => {
+  const client = await text('lib/mcp-client.ts');
+  const dashboard = client.slice(
+    client.indexOf("name === 'workspace_get_work_dashboard'"),
+    client.indexOf("name === 'workspace_search_second_brain'"),
+  );
+  assert.match(dashboard, /list_second_brain_projects', \{ limit: 25 \}/);
+  assert.match(dashboard, /list_second_brain_work_items'.*limit: 50/s);
+  assert.match(dashboard, /mapWithConcurrency\(visibleProjectRows, 3/);
+  assert.match(dashboard, /mapWithConcurrency\(workRows, 3/);
+  assert.doesNotMatch(dashboard, /projectRows\.slice\(0, 8\)/);
+  assert.doesNotMatch(dashboard, /workRows\.slice\(0, 20\)/);
 });
 
 test('owner UI routes queued and resumed work to the exact orchestrator', async () => {

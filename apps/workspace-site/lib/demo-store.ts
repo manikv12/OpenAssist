@@ -452,8 +452,16 @@ export async function executeDemoWrite(
 
   switch (name) {
     case 'workspace_set_mail_read_state': {
-      const ids = stringArray(args.messageIds, 20, 160);
+      const ids = [...new Set(stringArray(args.messageIds, 20, 160))];
       if (!ids.length) throw new Error('At least one demo message is required.');
+      const placeholders = ids.map(() => '?').join(', ');
+      const existing = await db.prepare(
+        `SELECT COUNT(*) AS count FROM demo_messages
+         WHERE workspace_id = ? AND message_id IN (${placeholders})`,
+      ).bind(workspaceId, ...ids).first<{ count: number }>();
+      if (Number(existing?.count ?? 0) !== ids.length) {
+        throw new Error('The demo message selection is stale. Refresh and choose the messages again.');
+      }
       const unread = args.state === 'unread' ? 1 : 0;
       await db.batch(ids.map((id) => db.prepare(
         'UPDATE demo_messages SET unread = ?, updated_at = ? WHERE workspace_id = ? AND message_id = ?',
@@ -510,7 +518,8 @@ export async function executeDemoWrite(
     }
     case 'workspace_delete_task': {
       itemId = safeIdentifier(args.taskId, 'Task ID');
-      await db.prepare('DELETE FROM demo_tasks WHERE workspace_id = ? AND task_id = ?').bind(workspaceId, itemId).run();
+      const result = await db.prepare('DELETE FROM demo_tasks WHERE workspace_id = ? AND task_id = ?').bind(workspaceId, itemId).run();
+      if (!Number(result.meta.changes ?? 0)) throw new Error('The demo task no longer exists.');
       break;
     }
     case 'workspace_create_calendar_event': {
@@ -578,7 +587,8 @@ export async function executeDemoWrite(
     }
     case 'workspace_delete_calendar_event': {
       itemId = safeIdentifier(args.eventId, 'Event ID');
-      await db.prepare('DELETE FROM demo_events WHERE workspace_id = ? AND event_id = ?').bind(workspaceId, itemId).run();
+      const result = await db.prepare('DELETE FROM demo_events WHERE workspace_id = ? AND event_id = ?').bind(workspaceId, itemId).run();
+      if (!Number(result.meta.changes ?? 0)) throw new Error('The demo event no longer exists.');
       break;
     }
     case 'workspace_save_note': {
@@ -605,7 +615,8 @@ export async function executeDemoWrite(
     }
     case 'workspace_trash_note': {
       itemId = safeIdentifier(args.noteId, 'Note ID');
-      await db.prepare('DELETE FROM demo_notes WHERE workspace_id = ? AND note_id = ?').bind(workspaceId, itemId).run();
+      const result = await db.prepare('DELETE FROM demo_notes WHERE workspace_id = ? AND note_id = ?').bind(workspaceId, itemId).run();
+      if (!Number(result.meta.changes ?? 0)) throw new Error('The demo note no longer exists.');
       break;
     }
     case 'workspace_remember_fact': {
@@ -635,7 +646,8 @@ export async function executeDemoWrite(
     }
     case 'workspace_forget_fact': {
       itemId = safeIdentifier(args.factId, 'Memory fact ID');
-      await db.prepare('DELETE FROM demo_memory WHERE workspace_id = ? AND fact_id = ?').bind(workspaceId, itemId).run();
+      const result = await db.prepare('DELETE FROM demo_memory WHERE workspace_id = ? AND fact_id = ?').bind(workspaceId, itemId).run();
+      if (!Number(result.meta.changes ?? 0)) throw new Error('The demo memory fact no longer exists.');
       break;
     }
     case 'workspace_update_supply_cart': {

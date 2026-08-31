@@ -55,9 +55,25 @@ test('calendar reads use the saved calendar-default account when none is supplie
     client.indexOf("if (name === 'workspace_create_calendar_event')"),
   );
 
-  assert.match(calendarRead, /resolveAccount\(accessToken, args\.account, 'calendar'\)/);
+  assert.match(calendarRead, /resolveAccount\(accessToken, args\.account, 'calendar', requestCall\)/);
   assert.match(calendarRead, /accounts: \[account\]/);
   assert.doesNotMatch(calendarRead, /args\.account \? \[args\.account\]/);
+});
+
+test('live task updates keep tags and live note queries filter returned note titles', async () => {
+  const client = await text('lib/mcp-client.ts');
+  const taskUpdate = client.slice(
+    client.indexOf("name === 'workspace_update_task'"),
+    client.indexOf("name === 'workspace_delete_task'"),
+  );
+  assert.match(taskUpdate, /tags: args\.tags/);
+
+  const notes = client.slice(
+    client.indexOf("name === 'workspace_list_notes'"),
+    client.indexOf("name === 'workspace_read_note'"),
+  );
+  assert.match(notes, /args\.query\.trim\(\)\.toLowerCase\(\)/);
+  assert.match(notes, /String\(note\.title \?\? ''\)\.toLowerCase\(\)\.includes\(query\)/);
 });
 
 test('demo and owner Live mode remain separate', async () => {
@@ -90,4 +106,55 @@ test('Shopify results render real images and show the two separate demo paths', 
   assert.match(component, /alt=\{`\$\{product\.title\} product`\}/);
   assert.equal([...demoData.matchAll(/imageUrl: '\/catalog\/[a-z0-9-]+\.webp'/g)].length, 6);
   assert.match(storefront, /imageUrl: textValue\(image\.url \?\? image\.src\) \|\| curated\?\.imageUrl/);
+});
+
+test('live reads reuse one MCP session and ignore disconnected automatic-search accounts', async () => {
+  const client = await text('lib/mcp-client.ts');
+  assert.match(client, /function createWorkspaceMcpCaller/);
+  assert.match(client, /initializedPromise \?\?= initialize\(\)/);
+  assert.match(client, /const requestCall = createWorkspaceMcpCaller\(accessToken\)/);
+
+  const brief = client.slice(
+    client.indexOf("name === 'workspace_get_daily_brief'"),
+    client.indexOf("name === 'workspace_search_mail'"),
+  );
+  assert.match(brief, /includedInAutomaticSearch !== false/);
+  assert.match(brief, /supportsService\(account, 'search'\)/);
+  assert.match(brief, /accounts: mailAccounts/);
+  assert.doesNotMatch(brief, /accounts: args\.account \? \[args\.account\] : undefined/);
+});
+
+test('owner workspace removes stale date and fake Live activity, and filters loaded rows', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  assert.doesNotMatch(component, /Thursday · August 27/);
+  assert.match(component, /ownerAccess \? \[\] : DEMO_ACTIVITY/);
+  assert.match(component, /Object\.values\(item\)\.some/);
+  assert.match(component, /placeholder=\{view === 'work' \? 'Use Knowledge search below' : 'Filter this view'\}/);
+  assert.match(component, /function LiveTodayDashboard/);
+  assert.match(component, /function WorkspaceLoading/);
+});
+
+test('WebMCP focus opens cached search results and never claims a missing item opened', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  assert.match(component, /const toolRowsRef = useRef/);
+  assert.match(component, /if \(rows\.length > 0\) toolRowsRef\.current\[resultView\] = rows/);
+  assert.match(component, /let opened = false/);
+  assert.match(component, /return \{ status: 'focused', view: nextView, itemId: resolvedItemId \?\? null, opened \}/);
+  assert.doesNotMatch(component, /opened: Boolean\(resolvedItemId\)/);
+});
+
+test('voice failures return an error and approved Live writes refresh the affected view', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  assert.match(component, /openassist:site-tool-result[\s\S]*requestId: detail\.requestId, error: message/);
+  assert.match(component, /const updatedView = viewForTool\(action\.tool\)/);
+  assert.match(component, /focusView\(updatedView, itemId\)[\s\S]*setLiveRefreshKey/);
+});
+
+test('initial Live loading reuses the account ref and navigation clears stale filters', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  assert.match(component, /setSearch\(''\)/);
+  assert.match(component, /const accountsPromise = liveRef\.current\.accounts/);
+  assert.doesNotMatch(component, /\[invokeTool, live\.accounts, liveRefreshKey/);
+  assert.match(component, /No connected Gmail account\|Connect the required Google service\|Gmail is disconnected/);
+  assert.match(component, /<JudgeQuickStart onNavigate=\{focusView\} toolCount=\{webMcpTools\.length\}/);
 });

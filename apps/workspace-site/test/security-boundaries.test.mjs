@@ -105,6 +105,21 @@ test('demo writes use the same signed preview and approval boundary', async () =
   assert.match(session, /HttpOnly|cookieHeader/);
 });
 
+test('stale demo write targets fail instead of reporting a false verified success', async () => {
+  const store = await read('lib/demo-store.ts');
+  assert.match(store, /SELECT COUNT\(\*\) AS count FROM demo_messages/);
+  assert.match(store, /demo message selection is stale/);
+  for (const message of [
+    'The demo task no longer exists.',
+    'The demo event no longer exists.',
+    'The demo note no longer exists.',
+    'The demo memory fact no longer exists.',
+  ]) {
+    assert.match(store, new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  assert.ok([...store.matchAll(/if \(!Number\(result\.meta\.changes \?\? 0\)\) throw new Error\('The demo/g)].length >= 6);
+});
+
 test('demo routes never call the Live Workspace MCP', async () => {
   const files = [
     'app/api/demo/workspace/route.ts',
@@ -191,7 +206,14 @@ test('server code does not log private Workspace content', async () => {
 
 test('API errors stay JSON so the owner UI can show a useful reconnect message', async () => {
   const http = await read('lib/http.ts');
+  const client = await read('lib/mcp-client.ts');
   assert.match(http, /error instanceof Response[\s\S]*error\.clone\(\)\.text/);
+  assert.match(http, /No Google account with connected/);
+  assert.match(http, /No connected Gmail account/);
+  assert.match(http, /Connect the required Google service/);
+  assert.match(http, /Gmail is disconnected/);
+  assert.match(http, /Google account “\[\^”\\r\\n\]\{1,320\}” must reconnect/);
+  assert.match(client, /Google account “\$\{exact\.friendlyLabel \?\? exact\.email/);
   assert.match(http, /return json\(\{ error: safe \}, \{ status \}\)/);
 });
 
