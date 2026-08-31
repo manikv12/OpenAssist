@@ -168,16 +168,28 @@ function hexToRgb(hex: string): [number, number, number] {
   return [((int >> 16) & 255) / 255, ((int >> 8) & 255) / 255, (int & 255) / 255];
 }
 
+type OrbColors = { low: string; mid: string; key: string; rim: string };
+
+const PHASE_COLORS: Record<OrbPhase, OrbColors> = {
+  idle: { low: '#25263a', mid: '#d5aa4a', key: '#f1d58b', rim: '#7163c8' },
+  connecting: { low: '#3f2f18', mid: '#c58f32', key: '#f2d18a', rim: '#7563db' },
+  listening: { low: '#123044', mid: '#3c9db5', key: '#83d8e3', rim: '#7466d4' },
+  thinking: { low: '#211a42', mid: '#7563db', key: '#c2b8ff', rim: '#d5aa4a' },
+  speaking: { low: '#10342d', mid: '#3aaa88', key: '#8be1be', rim: '#d5aa4a' },
+  muted: { low: '#2f343b', mid: '#69727e', key: '#9aa2ab', rim: '#4e5660' },
+  error: { low: '#4a1d1a', mid: '#c84e3b', key: '#ffab9d', rim: '#792c24' },
+};
+
 export function VoiceOrb({
   phase,
   meter,
   size = 44,
-  colors = { low: '#6f9dff', mid: '#e9c76e', key: '#5ee0ae', rim: '#ff8bd2' },
+  colors,
 }: {
   phase: OrbPhase;
   meter: VoiceLevelMeter | null;
   size?: number;
-  colors?: { low: string; mid: string; key: string; rim: string };
+  colors?: OrbColors;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const phaseRef = useRef(phase);
@@ -226,10 +238,17 @@ export function VoiceOrb({
     const uThink = uniform('u_think');
     const uSpeak = uniform('u_speak');
 
-    gl.uniform3fv(uniform('u_colorLow'), hexToRgb(colors.low));
-    gl.uniform3fv(uniform('u_colorMid'), hexToRgb(colors.mid));
-    gl.uniform3fv(uniform('u_colorKey'), hexToRgb(colors.key));
-    gl.uniform3fv(uniform('u_colorRim'), hexToRgb(colors.rim));
+    const uColorLow = uniform('u_colorLow');
+    const uColorMid = uniform('u_colorMid');
+    const uColorKey = uniform('u_colorKey');
+    const uColorRim = uniform('u_colorRim');
+    const initialPalette = colors ?? PHASE_COLORS[phaseRef.current];
+    const colorState = {
+      low: hexToRgb(initialPalette.low),
+      mid: hexToRgb(initialPalette.mid),
+      key: hexToRgb(initialPalette.key),
+      rim: hexToRgb(initialPalette.rim),
+    };
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const pixels = Math.round(size * dpr);
@@ -285,6 +304,19 @@ export function VoiceOrb({
       blend.thinking += (((current === 'thinking' || current === 'connecting') ? 1 : 0) - blend.thinking) * ease;
       blend.speaking += ((current === 'speaking' ? 1 : 0) - blend.speaking) * ease;
 
+      const targetPalette = colors ?? PHASE_COLORS[current];
+      const paletteEase = 1 - Math.exp(-dt / 0.34);
+      const moveColor = (currentColor: [number, number, number], targetHex: string) => {
+        const target = hexToRgb(targetHex);
+        currentColor[0] += (target[0] - currentColor[0]) * paletteEase;
+        currentColor[1] += (target[1] - currentColor[1]) * paletteEase;
+        currentColor[2] += (target[2] - currentColor[2]) * paletteEase;
+      };
+      moveColor(colorState.low, targetPalette.low);
+      moveColor(colorState.mid, targetPalette.mid);
+      moveColor(colorState.key, targetPalette.key);
+      moveColor(colorState.rim, targetPalette.rim);
+
       gl.uniform1f(uTime, now / 1000);
       gl.uniform1f(uMic, micValue);
       gl.uniform1f(uOutput, outValue);
@@ -292,6 +324,10 @@ export function VoiceOrb({
       gl.uniform1f(uListen, blend.listening);
       gl.uniform1f(uThink, blend.thinking);
       gl.uniform1f(uSpeak, blend.speaking);
+      gl.uniform3fv(uColorLow, colorState.low);
+      gl.uniform3fv(uColorMid, colorState.mid);
+      gl.uniform3fv(uColorKey, colorState.key);
+      gl.uniform3fv(uColorRim, colorState.rim);
 
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
@@ -311,7 +347,7 @@ export function VoiceOrb({
       gl.deleteShader(fragment);
       gl.deleteBuffer(buffer);
     };
-  }, [colors.key, colors.low, colors.mid, colors.rim, size]);
+  }, [colors, size]);
 
   return (
     <span className={`oa-orb oa-orb--${phase}`} style={{ width: size, height: size }} aria-hidden="true">

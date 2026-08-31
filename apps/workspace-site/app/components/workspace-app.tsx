@@ -4,6 +4,12 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation';
 import { VoiceOrb, type OrbPhase } from './voice-orb';
 import { SecondBrainWorkspace } from './second-brain-workspace';
+import {
+  normalizeEmailDisplayFields,
+  parseEmailSender,
+  resolveEmailUnread,
+} from '../../lib/email-presentation.mjs';
+import { LatestRequestGate } from '../../lib/latest-request.mjs';
 import { VoiceLevelMeter } from '../../lib/voice-levels';
 import {
   DEFAULT_REALTIME_VOICE,
@@ -205,14 +211,14 @@ function Pagination({ page, pageCount, rangeStart, rangeEnd, total, unit, onPage
       </p>
       {pageCount > 1 && (
         <div className="flex items-center gap-1">
-          <button type="button" onClick={() => onPage(page - 1)} disabled={page <= 1} aria-label={`Previous page of ${unit}`} className="grid h-8 w-8 place-items-center rounded-lg border border-hairline-strong text-sm text-text-2 transition hover:border-hairline-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-hairline-strong">‹</button>
+          <button type="button" onClick={() => onPage(page - 1)} disabled={page <= 1} aria-label={`Previous page of ${unit}`} className="grid h-11 w-11 place-items-center rounded-xl border border-hairline-strong text-sm text-text-2 transition hover:border-hairline-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-hairline-strong">‹</button>
           <div className="flex items-center gap-1 max-sm:hidden">
             {window.map((entry, index) => entry === 'gap'
               ? <span key={`gap-${index}`} aria-hidden="true" className="px-1 text-xs text-text-4">…</span>
-              : <button key={entry} type="button" onClick={() => onPage(entry)} aria-label={`Page ${entry}`} aria-current={entry === page ? 'page' : undefined} className={`h-8 min-w-8 rounded-lg px-2 text-xs font-semibold tabular-nums transition ${entry === page ? 'bg-brand text-brand-ink' : 'border border-hairline-strong text-text-2 hover:border-hairline-strong hover:text-ink'}`}>{entry}</button>)}
+              : <button key={entry} type="button" onClick={() => onPage(entry)} aria-label={`Page ${entry}`} aria-current={entry === page ? 'page' : undefined} className={`h-11 min-w-11 rounded-xl px-2 text-xs font-semibold tabular-nums transition ${entry === page ? 'bg-brand text-brand-ink' : 'border border-hairline-strong text-text-2 hover:border-hairline-strong hover:text-ink'}`}>{entry}</button>)}
           </div>
           <span className="px-2 text-xs tabular-nums text-text-2 sm:hidden">{page} / {pageCount}</span>
-          <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pageCount} aria-label={`Next page of ${unit}`} className="grid h-8 w-8 place-items-center rounded-lg border border-hairline-strong text-sm text-text-2 transition hover:border-hairline-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-hairline-strong">›</button>
+          <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pageCount} aria-label={`Next page of ${unit}`} className="grid h-11 w-11 place-items-center rounded-xl border border-hairline-strong text-sm text-text-2 transition hover:border-hairline-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-hairline-strong">›</button>
         </div>
       )}
     </nav>
@@ -347,6 +353,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [themePreference, setThemePreference] = useState<ThemePreference>('system');
   const [systemDark, setSystemDark] = useState(true);
   const liveRef = useRef(live);
+  const liveItemRequestGateRef = useRef(new LatestRequestGate());
   const lastLiveRefreshRef = useRef(-1);
   const tasksRef = useRef(tasks);
   const messagesRef = useRef(messages);
@@ -367,6 +374,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const voiceSessionIdRef = useRef<string | null>(null);
   const activeVoiceKindRef = useRef<ActiveVoiceKind | null>(null);
   const voiceTimeoutRef = useRef<number | null>(null);
+  const voiceProtocolTimerRef = useRef<number | null>(null);
   const voiceToolCountRef = useRef(0);
   const cappedToolLimitRef = useRef(12);
   const voiceMeterRef = useRef<VoiceLevelMeter | null>(null);
@@ -377,6 +385,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [voiceHearing, setVoiceHearing] = useState(false);
   const [voiceThinking, setVoiceThinking] = useState(false);
   const [voiceSpeaking, setVoiceSpeaking] = useState(false);
+  const [voiceProtocolPhase, setVoiceProtocolPhase] = useState<'thinking' | 'speaking' | null>(null);
 
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { demoVoiceAccessRef.current = demoVoiceAccess; }, [demoVoiceAccess]);
@@ -709,6 +718,32 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     }
   }, [invokeTool]);
 
+  const openLiveItemDetails = useCallback((itemView: WorkspaceView, id: string, item: Record<string, unknown>) => {
+    const requestId = liveItemRequestGateRef.current.begin();
+    setSelectedId(id);
+    setOpenLiveItem({ id, view: itemView, item });
+    const kind = displayText(item, ['_kind'], '');
+    if (itemView !== 'inbox' && !/mail|email/i.test(kind)) return;
+    const account = displayText(item, ['account', 'accountEmail', '_account'], '');
+    const messageId = displayText(item, ['messageId', 'id'], id);
+    if (!account || !messageId) return;
+    void invokeTool('workspace_read_mail_message', { account, messageId }).then((result) => {
+      if (!liveItemRequestGateRef.current.isCurrent(requestId)) return;
+      const record = objectValue(result);
+      const nested = objectValue(record.message);
+      const message = Object.keys(nested).length ? nested : record;
+      setOpenLiveItem({ id, view: 'inbox', item: { ...item, ...message, _kind: 'Email' } });
+    }).catch((error: unknown) => {
+      if (!liveItemRequestGateRef.current.isCurrent(requestId)) return;
+      setOpenLiveItem({ id, view: 'inbox', item: { ...item, _readerWarning: error instanceof Error ? error.message : 'The full message could not be loaded.' } });
+    });
+  }, [invokeTool]);
+
+  const closeLiveItem = useCallback(() => {
+    liveItemRequestGateRef.current.cancel();
+    setOpenLiveItem(null);
+  }, []);
+
   useEffect(() => {
     if (mode !== 'live' || !user) return;
     const controller = new AbortController();
@@ -725,7 +760,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
       const requestForView: Record<WorkspaceView, [WorkspaceToolName, Record<string, unknown>]> = {
         today: ['workspace_get_daily_brief', { date: localDateString(now, timeZone), timeZone }],
-        inbox: ['workspace_get_daily_brief', { date: localDateString(now, timeZone), timeZone }],
+        inbox: ['workspace_search_mail', { query: 'in:inbox', maxResults: 10 }],
         tasks: ['workspace_find_tasks', { status: 'all' }],
         calendar: ['workspace_list_calendar', { timeMin: now.toISOString(), timeMax: weekLater.toISOString() }],
         supplies: ['workspace_list_accounts', {}],
@@ -909,6 +944,18 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setVoiceTranscript((current) => ({ ...current, [role]: '' }));
   }, []);
 
+  const setVoiceProtocolState = useCallback((phase: 'thinking' | 'speaking' | null, clearAfterMs = 0) => {
+    if (voiceProtocolTimerRef.current != null) window.clearTimeout(voiceProtocolTimerRef.current);
+    voiceProtocolTimerRef.current = null;
+    setVoiceProtocolPhase(phase);
+    if (phase && clearAfterMs > 0) {
+      voiceProtocolTimerRef.current = window.setTimeout(() => {
+        voiceProtocolTimerRef.current = null;
+        setVoiceProtocolPhase(null);
+      }, clearAfterMs);
+    }
+  }, []);
+
   const stopVoice = useCallback((message = 'Voice stopped', persist = true) => {
     const kind = activeVoiceKindRef.current;
     const callId = voiceCallIdRef.current;
@@ -925,6 +972,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     voiceToolCountRef.current = 0;
     if (voiceTimeoutRef.current != null) window.clearTimeout(voiceTimeoutRef.current);
     voiceTimeoutRef.current = null;
+    if (voiceProtocolTimerRef.current != null) window.clearTimeout(voiceProtocolTimerRef.current);
+    voiceProtocolTimerRef.current = null;
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'control', action: 'stop' }));
     socket?.close();
     voiceSocketRef.current = null;
@@ -940,6 +989,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     voiceMeterRef.current = null;
     setVoiceMeter(null);
     setVoiceSpeaking(false);
+    setVoiceProtocolPhase(null);
     setVoiceConnected(false);
     setVoiceMuted(false);
     setVoiceStatus(message);
@@ -1042,15 +1092,30 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
           let message: { type?: string; name?: string; call_id?: string; arguments?: string; delta?: string; transcript?: string; text?: string; error?: { message?: string } };
           try { message = JSON.parse(String(event.data)) as typeof message; } catch { return; }
           if (message.type === 'error') {
+            setVoiceProtocolState(null);
             setVoiceStatus(message.error?.message ?? 'The demo voice service returned an error.');
             return;
           }
-          if (message.type === 'input_audio_buffer.speech_started') resetVoiceTurn('user');
-          if (message.type === 'response.created') resetVoiceTurn('assistant');
+          if (message.type === 'input_audio_buffer.speech_started') {
+            setVoiceProtocolState(null);
+            resetVoiceTurn('user');
+          }
+          if (message.type === 'input_audio_buffer.speech_stopped') setVoiceProtocolState('thinking');
+          if (message.type === 'response.created') {
+            setVoiceProtocolState('thinking');
+            resetVoiceTurn('assistant');
+          }
           if (message.type === 'conversation.item.input_audio_transcription.delta' && message.delta) updateVoiceTranscript('user', message.delta);
           if (message.type === 'conversation.item.input_audio_transcription.completed' && message.transcript) updateVoiceTranscript('user', message.transcript, true);
-          if ((message.type === 'response.audio_transcript.delta' || message.type === 'response.output_audio_transcript.delta' || message.type === 'response.text.delta') && message.delta) updateVoiceTranscript('assistant', message.delta);
-          if ((message.type === 'response.audio_transcript.done' || message.type === 'response.output_audio_transcript.done' || message.type === 'response.text.done') && (message.transcript || message.text)) updateVoiceTranscript('assistant', message.transcript ?? message.text ?? '', true);
+          if ((message.type === 'response.audio_transcript.delta' || message.type === 'response.output_audio_transcript.delta' || message.type === 'response.text.delta') && message.delta) {
+            setVoiceProtocolState('speaking');
+            updateVoiceTranscript('assistant', message.delta);
+          }
+          if ((message.type === 'response.audio_transcript.done' || message.type === 'response.output_audio_transcript.done' || message.type === 'response.text.done') && (message.transcript || message.text)) {
+            setVoiceProtocolState('speaking', 1_000);
+            updateVoiceTranscript('assistant', message.transcript ?? message.text ?? '', true);
+          }
+          if (message.type === 'response.done' || message.type === 'output_audio_buffer.stopped') setVoiceProtocolState(null);
           if (message.type !== 'response.function_call_arguments.done' || !message.call_id || !message.name) return;
           voiceToolCountRef.current += 1;
           const sendResult = (output: unknown) => {
@@ -1130,10 +1195,15 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         let message: { type?: string; callId?: string; operation?: string; tool?: string; args?: Record<string, unknown>; previewId?: string; message?: string; role?: string; delta?: string; text?: string };
         try { message = JSON.parse(String(event.data)) as typeof message; } catch { return; }
         if (message.type === 'transcript' && (message.role === 'user' || message.role === 'assistant')) {
+          if (message.role === 'user' && message.text) setVoiceProtocolState('thinking');
+          if (message.role === 'assistant') setVoiceProtocolState('speaking', message.text ? 1_000 : 0);
           updateVoiceTranscript(message.role, message.text ?? message.delta ?? '', Boolean(message.text));
           return;
         }
-        if (message.type === 'tool_call') voiceToolCountRef.current += 1;
+        if (message.type === 'tool_call') {
+          voiceToolCountRef.current += 1;
+          setVoiceProtocolState('thinking');
+        }
         if (message.type === 'tool_call' && message.callId && message.operation === 'confirm_preview' && message.previewId) {
           void approve('voice', message.previewId).then((result) => {
             if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'tool_result', callId: message.callId, success: true, result }));
@@ -1149,6 +1219,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
         } else if (message.type === 'session_warning') {
           setVoiceStatus(message.message ?? 'Voice will stop in five minutes.');
         } else if (message.type === 'voice_error') {
+          setVoiceProtocolState(null);
           setVoiceStatus(message.message ?? 'The realtime voice service returned an error.');
         } else if (message.type === 'session_ended') {
           stopVoice(message.message ?? 'Voice session ended.');
@@ -1166,7 +1237,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     } catch (error) {
       stopVoice(error instanceof Error ? error.message : 'Voice is temporarily unavailable.');
     }
-  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, resetVoiceTurn, selectedVoiceThreadId, stopVoice, updateVoiceTranscript, user, voiceConnected]);
+  }, [approve, invokeTool, judgeVoicePolicy.sessionSeconds, resetVoiceTurn, selectedVoiceThreadId, setVoiceProtocolState, stopVoice, updateVoiceTranscript, user, voiceConnected]);
 
   const toggleVoiceMute = useCallback(() => {
     const next = !voiceMuted;
@@ -1238,17 +1309,19 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const voiceStatusLower = voiceStatus.toLowerCase();
   const voiceIsConnecting = /checking|starting|pending|sign-in|connecting/.test(voiceStatusLower);
   const voiceHasError = /failed|error|unavailable|could not|ended|not compatible/.test(voiceStatusLower);
-  const orbPhase: OrbPhase = !voiceConnected
+  const orbPhase: OrbPhase = voiceHasError
+    ? 'error'
+    : !voiceConnected
     ? voiceIsConnecting
       ? 'connecting'
-      : voiceHasError
-        ? 'error'
-        : 'idle'
+      : 'idle'
     : voiceMuted
       ? 'muted'
-      : voiceSpeaking
+      : voiceSpeaking || voiceProtocolPhase === 'speaking'
         ? 'speaking'
-        : voiceThinking
+        : voiceHearing
+          ? 'listening'
+        : voiceProtocolPhase === 'thinking' || voiceThinking
           ? 'thinking'
           : 'listening';
   const voiceStateLabel = orbPhase === 'connecting'
@@ -1342,7 +1415,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       : VIEW_COPY[view];
   const resolvedTheme = themePreference === 'system' ? (systemDark ? 'dark' : 'light') : themePreference;
   return (
-    <main data-theme={resolvedTheme} className="oa-app-shell min-h-screen text-ink">
+    <main data-theme={resolvedTheme} data-workspace-mode={mode === 'live' ? 'owner' : 'judge'} className="oa-app-shell min-h-screen text-ink">
       <div className="mx-auto grid min-h-screen w-full max-w-[1800px] grid-cols-[238px_minmax(0,1fr)_minmax(300px,340px)] max-xl:grid-cols-[84px_minmax(0,1fr)] max-md:grid-cols-1">
         <Sidebar view={view} user={user} items={visibleNavigation} onView={focusView} onSignOut={() => void signOut()} />
         <section id={`view-${view}`} className="min-w-0 pb-[calc(88px+env(safe-area-inset-bottom))] md:pb-10">
@@ -1354,7 +1427,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 <p className="truncate text-[11px] leading-tight text-text-3">Daily Workspace</p>
               </div>
             </div>
-            <div className="flex shrink-0 items-center gap-2"><span className="rounded-full border border-brand/20 bg-brand/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">{user?.access === 'judge' ? 'Judge' : mode}</span><button onClick={() => void signOut()} className="text-[10px] font-medium text-text-3">Sign out</button></div>
+            <div className="flex shrink-0 items-center gap-2"><span className="oa-mobile-mode-badge rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]">{mode === 'live' ? 'Private Live' : 'Judge Demo'}</span><button onClick={() => void signOut()} className="text-[10px] font-medium text-text-3">Sign out</button></div>
           </div>
 
           <div className="px-5 pt-5 sm:px-8 sm:pt-6 lg:px-12">
@@ -1382,7 +1455,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:border-brand/35 hover:text-ink">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="mt-4 rounded-xl border border-hairline bg-wash/60 px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-text-3"><span className="oa-wrap-anywhere">Private synthetic judge workspace · no Google data</span><span className="oa-wrap-anywhere">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div></div>}
+            {mode === 'demo' && <div className="oa-mode-strip mt-4" data-mode="judge"><div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><div className="min-w-0"><p className="text-xs font-semibold text-ink">Isolated judge demo</p><p className="oa-wrap-anywhere mt-0.5 text-[11px] text-text-3">Private synthetic judge workspace · no Google data</p></div></div><span className="oa-wrap-anywhere text-[11px] text-text-3">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div>}
             {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} toolCount={webMcpTools.length} />}
             <div key={view} className="oa-view-in py-7">
               {mode === 'live' ? (
@@ -1390,10 +1463,10 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 ? <ActivityView mode={mode} activity={activity} owner={Boolean(user?.owner)} onVoicePolicyChanged={refreshJudgeVoicePolicy} />
                 : view === 'work' && live.accounts && !live.error
                   ? <SecondBrainWorkspace source={live.data.work} loading={live.loading} warning={live.warning} onRefresh={() => setLiveRefreshKey((current) => current + 1)} onInvoke={invokeTool} />
-                : <LiveWorkspaceView view={view} live={live} query={search} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => { setSelectedId(id); setOpenLiveItem({ id, view, item }); }} />
+                : <LiveWorkspaceView view={view} live={live} query={search} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => openLiveItemDetails(view, id, item)} />
             ) : demoLoading ? <WorkspaceLoading title="Loading the demo workspace" /> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
-              {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
+              {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); const message = messages.find((candidate) => candidate.id === id); if (message) setOpenLiveItem({ id, view: 'inbox', item: { ...message, _kind: 'Demo email' } }); }} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
               {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); const task = tasks.find((candidate) => candidate.id === id); if (task) setOpenLiveItem({ id, view: 'tasks', item: { ...task, _kind: 'Demo task' } }); }} onCreate={() => setEditor('task')} />}
               {view === 'calendar' && <CalendarView events={events} selectedId={selectedId} onSelect={setSelectedId} onCreate={() => void invokeTool('workspace_create_calendar_event', { account: 'Main', summary: 'WebMCP demo review', start: '2026-08-28T11:00:00-05:00', end: '2026-08-28T11:30:00-05:00', timeZone: 'America/Chicago', reminderMinutes: [10] })} />}
               {view === 'supplies' && <SuppliesView products={supplies} cart={supplyCart} selectedId={selectedId} onSelect={setSelectedId} onSearch={(query) => void invokeTool('workspace_search_supplies', { query, limit: 12 })} onAdd={(product) => void invokeTool('workspace_update_supply_cart', { productId: product.id, variantId: product.variantId, title: product.title, quantity: 1 })} onClear={() => void invokeTool('workspace_clear_supply_cart', {})} />}
@@ -1411,7 +1484,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
       {openNote && <NoteReader note={openNote} onClose={() => setOpenNote(null)} />}
-      {openLiveItem && <LiveItemReader value={openLiveItem} onClose={() => setOpenLiveItem(null)} />}
+      {openLiveItem && <LiveItemReader value={openLiveItem} onClose={closeLiveItem} />}
       <div aria-live="polite" className={`fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 z-30 w-[min(92vw,460px)] -translate-x-1/2 rounded-2xl border bg-surface/95 px-4 py-3 text-center text-xs leading-5 shadow-[0_18px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-opacity duration-500 xl:hidden md:bottom-5 ${toastFaded ? 'pointer-events-none opacity-0' : 'opacity-100'} ${toastSeverity(toast) === 'error' ? 'border-danger/30 text-danger-strong' : toastSeverity(toast) === 'success' ? 'border-success/25 text-text-2' : 'border-hairline-strong text-text-2'}`}>{toast}</div>
       <MobileNavigation view={view} items={visibleNavigation} onView={focusView} />
     </main>
@@ -1522,10 +1595,19 @@ const THEME_OPTIONS: Array<{ id: ThemePreference; label: string; icon: React.Rea
 ];
 
 function ThemePicker({ value, onChange }: { value: ThemePreference; onChange: (value: ThemePreference) => void }) {
+  const moveTheme = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    event.preventDefault();
+    const offset = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
+    const nextIndex = (index + offset + THEME_OPTIONS.length) % THEME_OPTIONS.length;
+    onChange(THEME_OPTIONS[nextIndex].id);
+    const group = event.currentTarget.parentElement;
+    window.requestAnimationFrame(() => group?.querySelectorAll<HTMLButtonElement>('[role="radio"]')[nextIndex]?.focus());
+  };
   return (
     <div role="radiogroup" aria-label="Color theme" className="flex h-9 shrink-0 items-center rounded-xl border border-hairline-strong bg-wash p-0.5">
-      {THEME_OPTIONS.map((option) => (
-        <button key={option.id} type="button" role="radio" aria-checked={value === option.id} title={option.label} onClick={() => onChange(option.id)} className={`grid h-full w-8 place-items-center rounded-[10px] transition ${value === option.id ? 'bg-wash-strong text-ink shadow-[inset_0_0_0_1px_var(--hairline-strong)]' : 'text-text-4 hover:text-text-2'}`}>
+      {THEME_OPTIONS.map((option, index) => (
+        <button key={option.id} type="button" role="radio" aria-checked={value === option.id} tabIndex={value === option.id ? 0 : -1} title={option.label} onClick={() => onChange(option.id)} onKeyDown={(event) => moveTheme(event, index)} className={`grid h-full w-8 place-items-center rounded-[10px] transition ${value === option.id ? 'bg-wash-strong text-ink shadow-[inset_0_0_0_1px_var(--hairline-strong)]' : 'text-text-4 hover:text-text-2'}`}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="h-4 w-4">{option.icon}</svg>
           <span className="sr-only">{option.label}</span>
         </button>
@@ -1536,7 +1618,7 @@ function ThemePicker({ value, onChange }: { value: ThemePreference; onChange: (v
 
 function Sidebar({ view, user, items, onView, onSignOut }: { view: WorkspaceView; user: SiteUser; items: typeof NAVIGATION; onView: (view: WorkspaceView) => void; onSignOut: () => void }) {
   const owner = user?.access === 'owner';
-  return <aside className="min-w-0 border-r border-hairline px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-text-3">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`relative flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'font-medium text-ink before:absolute before:inset-y-1 before:left-0 before:w-[3px] before:rounded-full before:bg-brand max-xl:before:hidden' : 'text-text-3 hover:bg-wash hover:text-ink'}`}><span className={`grid h-5 w-5 shrink-0 place-items-center ${view === item.view ? 'text-ink' : 'text-text-4'}`}><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-hairline pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Access</p><span className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] ${owner ? 'border-teal/20 bg-teal/10 text-teal-strong' : 'border-brand/20 bg-brand/10 text-brand'}`}>{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-text-3">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-text-2 transition hover:text-ink">Sign out</button></div></aside>;
+  return <aside className="min-w-0 border-r border-hairline px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-text-3">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`relative flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'bg-brand/10 font-semibold text-ink shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--brand)_16%,transparent)] before:absolute before:inset-y-2 before:left-0 before:w-[3px] before:rounded-full before:bg-brand max-xl:before:hidden' : 'text-text-3 hover:bg-wash-strong hover:text-ink'}`}><span className={`grid h-5 w-5 shrink-0 place-items-center ${view === item.view ? 'text-brand-strong' : 'text-text-3'}`}><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-hairline pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Access</p><span className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] ${owner ? 'border-teal/20 bg-teal/10 text-teal-strong' : 'border-accent/20 bg-accent/10 text-accent-strong'}`}>{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-text-3">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-text-2 transition hover:text-ink">Sign out</button></div></aside>;
 }
 
 function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, onRefresh }: { threads: VoiceThread[]; selectedId: string | null; loading: boolean; connected: boolean; onSelect: (threadId: string | null) => void; onRefresh: () => void }) {
@@ -1631,19 +1713,125 @@ function ActivityRail({ activity, toast, voiceStatus, voiceStateLabel, voiceConn
 
 function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePolicy, status, stateLabel, prompt, connected, muted, selectedVoice, activeVoice, phase, meter, transcript, threads, selectedThreadId, threadsLoading, onClose, onVoice, onMute, onVoiceChange, onDemoVoiceAccess, onSelectThread, onRefreshThreads }: { mode: Mode; demoVoiceAccess: DemoVoiceAccess; cappedVoiceAvailable: boolean | null; judgeVoicePolicy: JudgeVoicePolicy; status: string; stateLabel: string; prompt: VoicePrompt; connected: boolean; muted: boolean; selectedVoice: RealtimeVoice; activeVoice: RealtimeVoice | null; phase: OrbPhase; meter: VoiceLevelMeter | null; transcript: VoiceTranscript; threads: VoiceThread[]; selectedThreadId: string | null; threadsLoading: boolean; onClose: () => void; onVoice: () => void; onMute: () => void; onVoiceChange: (voice: RealtimeVoice) => void; onDemoVoiceAccess: (access: DemoVoiceAccess) => void; onSelectThread: (threadId: string | null) => void; onRefreshThreads: () => void }) {
   const liveVoice = activeVoice ?? selectedVoice;
+  const dockRef = useRef<HTMLElement | null>(null);
+  const primaryActionRef = useRef<HTMLButtonElement | null>(null);
+  const closeActionRef = useRef(onClose);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const positionRef = useRef<{ x: number; y: number } | null>(null);
+  const dragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
+  const [desktop, setDesktop] = useState(false);
+
+  useEffect(() => { closeActionRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => primaryActionRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeActionRef.current();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('keydown', onKeyDown);
+      returnFocusRef.current?.focus();
+    };
+  }, []);
+
+  const placeDock = useCallback((x: number, y: number, persist = true) => {
+    const rect = dockRef.current?.getBoundingClientRect();
+    const width = rect?.width ?? 560;
+    const height = rect?.height ?? 560;
+    const margin = 16;
+    const next = {
+      x: Math.max(margin, Math.min(x, window.innerWidth - width - margin)),
+      y: Math.max(margin, Math.min(y, window.innerHeight - height - margin)),
+    };
+    positionRef.current = next;
+    setPosition(next);
+    if (persist) window.sessionStorage.setItem('openassist.voice.position.v1', JSON.stringify(next));
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 768px)');
+    const syncDesktop = () => setDesktop(media.matches);
+    syncDesktop();
+    const saved = window.sessionStorage.getItem('openassist.voice.position.v1');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved) as { x?: unknown; y?: unknown };
+        if (typeof parsed.x === 'number' && typeof parsed.y === 'number') window.requestAnimationFrame(() => placeDock(parsed.x as number, parsed.y as number, false));
+      } catch { window.sessionStorage.removeItem('openassist.voice.position.v1'); }
+    }
+    const keepVisible = () => {
+      const current = positionRef.current;
+      if (current && media.matches) placeDock(current.x, current.y, false);
+    };
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(keepVisible);
+    if (dockRef.current) resizeObserver?.observe(dockRef.current);
+    media.addEventListener('change', syncDesktop);
+    window.addEventListener('resize', keepVisible);
+    return () => {
+      resizeObserver?.disconnect();
+      media.removeEventListener('change', syncDesktop);
+      window.removeEventListener('resize', keepVisible);
+    };
+  }, [placeDock]);
+
+  const beginDrag = (event: React.PointerEvent<HTMLElement>) => {
+    if (!desktop || !dockRef.current) return;
+    const rect = dockRef.current.getBoundingClientRect();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, originX: rect.left, originY: rect.top, moved: false };
+  };
+  const moveDrag = (event: React.PointerEvent<HTMLElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+    drag.moved = true;
+    event.preventDefault();
+    placeDock(drag.originX + dx, drag.originY + dy, false);
+  };
+  const endDrag = (event: React.PointerEvent<HTMLElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    if (drag.moved && positionRef.current) window.sessionStorage.setItem('openassist.voice.position.v1', JSON.stringify(positionRef.current));
+  };
+  const moveByKeyboard = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!desktop || !['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key) || !dockRef.current) return;
+    event.preventDefault();
+    const rect = dockRef.current.getBoundingClientRect();
+    const step = event.shiftKey ? 40 : 12;
+    placeDock(rect.left + (event.key === 'ArrowRight' ? step : event.key === 'ArrowLeft' ? -step : 0), rect.top + (event.key === 'ArrowDown' ? step : event.key === 'ArrowUp' ? -step : 0));
+  };
+  const resetPosition = () => {
+    positionRef.current = null;
+    setPosition(null);
+    window.sessionStorage.removeItem('openassist.voice.position.v1');
+  };
+  const dockStyle = desktop && position ? { left: position.x, top: position.y, right: 'auto', bottom: 'auto', transform: 'none' } : undefined;
   return (
-    <aside className="oa-voice-dock" aria-label="OpenAssist voice agent">
+    <aside ref={dockRef} style={dockStyle} className={`oa-voice-dock ${position && desktop ? 'is-positioned' : ''}`} role="dialog" aria-modal="false" aria-labelledby="voice-panel-title" data-phase={phase}>
       <section className="oa-voice-dock__panel">
-        <div className="flex items-center justify-between gap-3">
+        <div className="oa-voice-dock__header flex items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist agent</p>
-            <p className="mt-0.5 truncate text-xs text-text-3">{mode === 'live' ? 'Private Live Workspace' : 'Isolated judge demo'}</p>
+            <p id="voice-panel-title" className="mt-0.5 truncate text-xs text-text-3">{mode === 'live' ? 'Private Live Workspace' : 'Isolated judge demo'}</p>
           </div>
-          <button onClick={onClose} aria-label="Close voice agent" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-hairline-strong text-lg text-text-2 transition hover:border-brand/35 hover:bg-wash hover:text-ink">×</button>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button type="button" onPointerDown={beginDrag} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onKeyDown={moveByKeyboard} aria-label="Move voice panel. Use arrow keys or drag." title="Move voice panel" className="oa-voice-dock__drag hidden h-11 min-w-11 items-center justify-center gap-1 rounded-full border border-hairline-strong px-3 text-[11px] font-medium text-text-3 transition hover:border-brand/35 hover:bg-wash hover:text-ink md:inline-flex"><span aria-hidden="true">⠿</span><span className="max-lg:sr-only">Move</span></button>
+            {position && desktop && <button type="button" onClick={resetPosition} className="hidden h-11 rounded-full border border-hairline-strong px-3 text-[11px] font-medium text-text-3 transition hover:border-brand/35 hover:bg-wash hover:text-ink md:block">Reset</button>}
+            <button onClick={onClose} aria-label="Close voice panel. Voice will stay active." className="grid h-11 w-11 shrink-0 place-items-center rounded-full border border-hairline-strong text-xl text-text-2 transition hover:border-brand/35 hover:bg-wash hover:text-ink">×</button>
+          </div>
         </div>
 
         <div className="mt-3 grid grid-cols-[88px_minmax(0,1fr)] items-center gap-4 max-sm:grid-cols-[72px_minmax(0,1fr)] max-sm:gap-3">
-          <div className="relative grid h-[88px] w-[88px] place-items-center rounded-full max-sm:h-[72px] max-sm:w-[72px]">
+          <div role={desktop ? 'button' : undefined} tabIndex={desktop ? 0 : -1} aria-label={desktop ? 'Move voice panel by dragging the orb or using arrow keys' : undefined} title={desktop ? 'Drag to move voice' : undefined} onPointerDown={beginDrag} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onKeyDown={moveByKeyboard} className="oa-voice-orb-handle relative grid h-[88px] w-[88px] place-items-center rounded-full max-sm:h-[72px] max-sm:w-[72px]">
             <VoiceOrb phase={phase} meter={meter} size={72} />
             <span className="absolute -bottom-1 inline-flex items-center gap-1 rounded-full border border-hairline-strong bg-surface/95 px-2 py-0.5 text-[9px] font-semibold text-ink/90"><span className={`oa-voice-state-dot oa-voice-state-dot--${phase}`} />{stateLabel}</span>
           </div>
@@ -1651,7 +1839,7 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
             <h2 className="truncate text-base font-semibold">{connected ? `${voiceLabel(liveVoice)} is ${stateLabel.toLowerCase()}` : `Talk with ${voiceLabel(selectedVoice)}`}</h2>
             <p aria-live="polite" className="mt-1 oa-clamp-2 text-xs leading-5 text-text-3">{status}</p>
             <div className="mt-2 flex flex-wrap gap-2">
-              <button onClick={onVoice} className={`rounded-lg px-3.5 py-2 text-xs font-semibold transition ${connected ? 'border border-danger/30 bg-danger/10 text-danger-strong hover:bg-danger/15' : 'oa-btn-primary'}`}>{connected ? 'Stop' : 'Start voice'}</button>
+              <button ref={primaryActionRef} onClick={onVoice} className={`min-h-11 rounded-lg px-3.5 py-2 text-xs font-semibold transition ${connected ? 'border border-danger/30 bg-danger/10 text-danger-strong hover:bg-danger/15' : 'oa-btn-primary'}`}>{connected ? 'Stop' : 'Start voice'}</button>
               {connected && <button onClick={onMute} className="rounded-lg border border-hairline-strong px-3.5 py-2 text-xs text-text-2 transition hover:border-brand/30 hover:text-ink">{muted ? 'Unmute' : 'Mute'}</button>}
             </div>
           </div>
@@ -1685,11 +1873,11 @@ function BrandMark({ size = 'h-9 w-9' }: { size?: string }) {
 
 /** Stable per-sender colour so the same account always looks the same. */
 const AVATAR_TINTS = [
-  { bg: 'rgba(224,188,99,0.14)', ring: 'rgba(224,188,99,0.32)', text: '#E6C377' },
-  { bg: 'rgba(124,107,240,0.16)', ring: 'rgba(124,107,240,0.34)', text: '#A99BF7' },
-  { bg: 'rgba(63,185,198,0.14)', ring: 'rgba(63,185,198,0.32)', text: '#6FD2DC' },
-  { bg: 'rgba(95,211,163,0.14)', ring: 'rgba(95,211,163,0.30)', text: '#7FDCB8' },
-  { bg: 'rgba(255,193,120,0.14)', ring: 'rgba(255,193,120,0.30)', text: '#FFCF95' },
+  { bg: 'var(--avatar-gold-bg)', ring: 'var(--avatar-gold-ring)', text: 'var(--avatar-gold-text)' },
+  { bg: 'var(--avatar-violet-bg)', ring: 'var(--avatar-violet-ring)', text: 'var(--avatar-violet-text)' },
+  { bg: 'var(--avatar-teal-bg)', ring: 'var(--avatar-teal-ring)', text: 'var(--avatar-teal-text)' },
+  { bg: 'var(--avatar-green-bg)', ring: 'var(--avatar-green-ring)', text: 'var(--avatar-green-text)' },
+  { bg: 'var(--avatar-orange-bg)', ring: 'var(--avatar-orange-ring)', text: 'var(--avatar-orange-text)' },
 ];
 
 function tintFor(seed: string) {
@@ -1723,6 +1911,74 @@ function PaperclipIcon() {
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="h-3.5 w-3.5">
       <path d="M21 12.5 12.5 21a5 5 0 0 1-7-7l8-8a3.5 3.5 0 1 1 5 5l-8 8a2 2 0 0 1-3-3l7.5-7.5" />
     </svg>
+  );
+}
+
+type EmailRowModel = {
+  sender: string;
+  subject: string;
+  snippet: string;
+  account: string;
+  time: string;
+  unread: boolean;
+  urgent: boolean;
+  hasAttachment: boolean;
+};
+
+function emailRowModel(item: Record<string, unknown>): EmailRowModel {
+  const normalized = normalizeEmailDisplayFields(item);
+  const rawLabels: unknown = normalized.labels;
+  const labels = Array.isArray(rawLabels)
+    ? rawLabels.filter((label: unknown): label is string => typeof label === 'string').map((label: string) => label.toUpperCase())
+    : [];
+  return {
+    sender: displayText(normalized, ['sender', 'from', 'fromName'], 'Unknown sender'),
+    subject: displayText(normalized, ['subject', 'title'], 'Untitled message'),
+    snippet: displayText(normalized, ['snippet', 'preview', 'summary'], ''),
+    account: displayText(normalized, ['account', 'accountEmail', '_account'], ''),
+    time: liveTimeLabel(displayText(normalized, ['time', 'date', 'receivedAt'], '')),
+    unread: resolveEmailUnread(normalized),
+    urgent: normalized.urgent === true || normalized.important === true || labels.includes('IMPORTANT') || displayText(normalized, ['importance', 'priority'], '').toLowerCase() === 'high',
+    hasAttachment: normalized.hasAttachment === true || normalized.hasAttachments === true || (Array.isArray(normalized.attachments) && normalized.attachments.length > 0),
+  };
+}
+
+function EmailRow({ id, item, selected, onOpen, onMarkRead }: {
+  id: string;
+  item: Record<string, unknown>;
+  selected: boolean;
+  onOpen: () => void;
+  onMarkRead?: () => void;
+}) {
+  const message = emailRowModel(item);
+  const mailbox = parseEmailSender(message.sender);
+  const senderLabel = mailbox.name || mailbox.email || 'Unknown sender';
+  const stateDescription = [message.unread ? 'unread' : 'read', message.urgent ? 'important' : '', message.hasAttachment ? 'has attachment' : '', message.account ? `account ${message.account}` : ''].filter(Boolean).join(', ');
+  return (
+    <article id={`workspace-item-${id}`} data-selected={selected ? 'true' : 'false'} className="oa-mail-row group relative min-w-0">
+      <button type="button" onClick={onOpen} aria-label={`Open ${stateDescription} email from ${senderLabel}: ${message.subject}`} aria-current={selected ? 'true' : undefined} className="oa-mail-row__open absolute inset-0 z-0 rounded-[inherit]"><span className="sr-only">Open email</span></button>
+      <div className="pointer-events-none relative z-[1] flex min-w-0 items-start gap-3 px-4 py-4 sm:gap-4 sm:px-5 sm:pr-32">
+        <span aria-hidden="true" className={`mt-0.5 h-11 w-1 shrink-0 rounded-full ${message.unread ? (message.urgent ? 'bg-danger' : 'bg-brand') : 'bg-transparent'}`} />
+        <Avatar name={senderLabel} size="h-10 w-10" />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <p className={`truncate text-sm ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}><bdi dir="auto">{senderLabel}</bdi></p>
+              {mailbox.email && mailbox.email !== senderLabel && <p dir="ltr" className="mt-0.5 truncate text-[11px] text-text-3">{mailbox.email}</p>}
+            </div>
+            {message.time && <time className={`shrink-0 pt-0.5 text-[11px] font-medium tabular-nums ${message.unread ? 'text-brand-strong' : 'text-text-3'}`}>{message.time}</time>}
+          </div>
+          <p className={`mt-1.5 oa-clamp-1 text-[15px] leading-5 ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}>{message.subject}</p>
+          {message.snippet && <p className="oa-mail-snippet mt-1 oa-clamp-2 text-[13px] leading-5 text-text-2">{message.snippet}</p>}
+          <div className="mt-2.5 flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-text-3">
+            {message.account && <span className="max-w-full truncate rounded-md border border-hairline bg-wash px-2 py-0.5 text-text-2">{message.account}</span>}
+            {message.hasAttachment && <span className="flex shrink-0 items-center gap-1"><PaperclipIcon />Attachment</span>}
+            {onMarkRead && message.unread && <button type="button" onClick={(event) => { event.stopPropagation(); onMarkRead(); }} className="pointer-events-auto relative z-10 ml-auto min-h-11 shrink-0 rounded-lg border border-hairline-strong bg-surface px-3 py-2 text-[11px] font-medium text-text-2 transition hover:border-brand/35 hover:text-ink max-sm:opacity-100 sm:absolute sm:right-12 sm:top-1/2 sm:-translate-y-1/2 sm:opacity-0 sm:focus-visible:opacity-100 sm:group-hover:opacity-100">Mark read</button>}
+          </div>
+        </div>
+        <span aria-hidden="true" className="mt-3 shrink-0 text-base text-text-4 transition group-hover:translate-x-0.5 group-hover:text-brand-strong">›</span>
+      </div>
+    </article>
   );
 }
 
@@ -1828,38 +2084,9 @@ function InboxView({ messages, selectedId, onSelect, onMarkRead }: { messages: t
       </div>
       {total ? (
         <>
-          <div className="space-y-2">
+          <div className="oa-mail-list">
             {pageItems.map((message) => (
-              <HaloRow key={message.id} id={message.id} selected={selectedId === message.id} onClick={() => onSelect(message.id)}>
-                <div className="flex items-start gap-3">
-                  {/* Unread rail: a thin bar reads faster than a pill and adds no clutter. */}
-                  <span aria-hidden="true" className={`mt-1 h-9 w-[3px] shrink-0 rounded-full ${message.unread ? (message.urgent ? 'bg-danger' : 'bg-ink/55') : 'bg-transparent'}`} />
-                  <Avatar name={message.sender} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline justify-between gap-3">
-                      <p className={`min-w-0 truncate text-sm ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}>{message.sender}</p>
-                      <span className="shrink-0 text-[11px] tabular-nums text-text-4">{message.time}</span>
-                    </div>
-                    <p className={`mt-0.5 oa-clamp-1 text-sm ${message.unread ? 'text-ink' : 'text-text-2'}`}>{message.subject}</p>
-                    <p className="mt-1 oa-clamp-2 text-[13px] leading-5 text-text-3">{message.snippet}</p>
-                    <div className="mt-2 flex items-center gap-3 text-[11px] text-text-4">
-                      <span className="truncate">{message.account}</span>
-                      {message.hasAttachment && <span className="flex shrink-0 items-center gap-1"><PaperclipIcon />Attachment</span>}
-                      {message.unread && (
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          onClick={(event) => { event.stopPropagation(); onMarkRead(message); }}
-                          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); onMarkRead(message); } }}
-                          className="ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-[11px] text-text-3 opacity-0 transition hover:bg-wash-strong hover:text-brand focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
-                        >
-                          Mark read
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </HaloRow>
+              <EmailRow key={message.id} id={message.id} item={{ ...message }} selected={selectedId === message.id} onOpen={() => onSelect(message.id)} onMarkRead={() => onMarkRead(message)} />
             ))}
           </div>
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="messages" onPage={setPage} />
@@ -2140,7 +2367,10 @@ function liveRows(view: WorkspaceView, source: unknown): Array<Record<string, un
       ...events.map((item) => ({ ...item, _kind: 'Calendar' })),
     ];
   }
-  if (view === 'inbox') return arrayValue(objectValue(data.mail).results).map((item) => ({ ...item, _kind: 'Unread mail' }));
+  if (view === 'inbox') {
+    const results = Array.isArray(data.results) ? data.results : objectValue(data.mail).results;
+    return arrayValue(results).map((item) => ({ ...item, _kind: 'Mail' }));
+  }
   if (view === 'tasks') return arrayValue(data.results).map((item) => {
     const task = objectValue(item.task);
     return Object.keys(task).length
@@ -2206,7 +2436,10 @@ function liveTimeLabel(value: string): string {
   }
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (date.getFullYear() === today.getFullYear()) return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 function liveDayLabel(value: string): string {
@@ -2227,23 +2460,21 @@ function liveDayLabel(value: string): string {
  */
 function LiveRowBody({ view, item, fallbackTitle }: { view: WorkspaceView; item: Record<string, unknown>; fallbackTitle: string }) {
   if (view === 'inbox') {
-    const sender = displayText(item, ['sender', 'from', 'fromName'], 'Unknown sender');
-    const subject = displayText(item, ['subject', 'title'], fallbackTitle);
-    const snippet = displayText(item, ['snippet', 'preview', 'summary'], '');
-    const account = displayText(item, ['account', 'accountEmail', '_account'], '');
-    const time = liveTimeLabel(displayText(item, ['time', 'date', 'receivedAt'], ''));
+    const message = emailRowModel(item);
+    const mailbox = parseEmailSender(message.sender);
+    const sender = mailbox.name || mailbox.email || 'Unknown sender';
     return (
       <div className="flex items-start gap-3">
         <span aria-hidden="true" className="mt-1 h-9 w-[3px] shrink-0 rounded-full bg-ink/50" />
         <Avatar name={sender} />
         <div className="min-w-0 flex-1">
           <div className="flex items-baseline justify-between gap-3">
-            <p className="min-w-0 truncate text-sm font-semibold text-ink">{sender}</p>
-            {time && <span className="shrink-0 text-[11px] tabular-nums text-text-3">{time}</span>}
+            <p className="min-w-0 truncate text-sm font-semibold text-ink"><bdi dir="auto">{sender}</bdi></p>
+            {message.time && <span className="shrink-0 text-[11px] tabular-nums text-text-3">{message.time}</span>}
           </div>
-          <p className="mt-0.5 oa-clamp-1 text-sm text-ink">{subject}</p>
-          {snippet && <p className="mt-1 oa-clamp-2 text-[13px] leading-5 text-text-3">{snippet}</p>}
-          {account && <p className="mt-2 truncate text-[11px] text-text-4">{account}</p>}
+          <p className="mt-0.5 oa-clamp-1 text-sm text-ink">{message.subject || fallbackTitle}</p>
+          {message.snippet && <p className="mt-1 oa-clamp-2 text-[13px] leading-5 text-text-3">{message.snippet}</p>}
+          {message.account && <p className="mt-2 truncate text-[11px] text-text-4">{message.account}</p>}
         </div>
       </div>
     );
@@ -2357,11 +2588,8 @@ function LiveWorkspaceView({ view, live, query, selectedId, ownerCode, onOwnerCo
 
   return (
     <section className="min-w-0">
-      <div className="mb-6 flex items-start justify-between gap-4 rounded-2xl border border-hairline bg-wash/60 px-4 py-3.5 sm:px-5 sm:py-4">
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-ink">Private owner mode</p>
-          <p className="mt-1 oa-clamp-2 text-xs leading-5 text-text-3">Loaded live through OpenAssist. Nothing below is copied into the site database.</p>
-        </div>
+      <div className="oa-mode-strip mb-6" data-mode="owner">
+        <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><div className="min-w-0"><p className="text-xs font-semibold text-ink">Private live</p><p className="mt-0.5 oa-clamp-2 text-[11px] leading-5 text-text-3">Connected Google data · nothing below is copied into the site database.</p></div></div>
         <button onClick={onReconnect} className="shrink-0 rounded-lg border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:text-ink">Connection</button>
       </div>
       {live.warning && <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-warning/20 bg-warning/5 px-4 py-3 text-sm text-warning-strong"><span>Refresh failed. Showing the last loaded Workspace data.</span><button onClick={onRetry} className="rounded-lg border border-warning/25 px-3 py-1.5 text-xs font-semibold text-brand-strong">Retry</button></div>}
@@ -2369,9 +2597,12 @@ function LiveWorkspaceView({ view, live, query, selectedId, ownerCode, onOwnerCo
         <LiveTodayDashboard rows={rows} selectedId={selectedId} onOpenItem={onOpenItem} />
       ) : total ? (
         <>
-          <div className="space-y-2">
+          <div className={view === 'inbox' ? 'oa-mail-list' : 'space-y-2'}>
             {pageItems.map((item, index) => {
               const itemId = liveItemId(item, `${view}-${rangeStart + index}`);
+              if (view === 'inbox') {
+                return <EmailRow key={itemId} id={itemId} item={item} selected={selectedId === itemId} onOpen={() => onOpenItem(itemId, item)} />;
+              }
               return (
                 <HaloRow key={itemId} id={itemId} selected={selectedId === itemId} onClick={view === 'notes' ? () => onOpenNote(item) : () => onOpenItem(itemId, item)}>
                   <LiveRowBody view={view} item={item} fallbackTitle={`${String(item._kind ?? 'Workspace')} ${rangeStart + index}`} />
@@ -2442,8 +2673,12 @@ function LiveTodayDashboard({ rows, selectedId, onOpenItem }: { rows: Array<Reco
               <div className="divide-y divide-hairline">
                 {section.rows.map((item, index) => {
                   const itemId = liveItemId(item, `${section.id}-${index + 1}`);
-                  const title = displayText(item, ['subject', 'title', 'summary'], 'Untitled item');
-                  const subtitle = displayText(item, ['from', 'sender', 'due', 'start', 'accountEmail', 'account'], section.label);
+                  const email = section.id === 'mail' ? emailRowModel(item) : null;
+                  const mailbox = email ? parseEmailSender(email.sender) : null;
+                  const title = email?.subject ?? displayText(item, ['subject', 'title', 'summary'], 'Untitled item');
+                  const subtitle = email
+                    ? [mailbox?.name || mailbox?.email, email.account].filter(Boolean).join(' · ')
+                    : displayText(item, ['from', 'sender', 'due', 'start', 'accountEmail', 'account'], section.label);
                   return (
                     <button key={itemId} type="button" onClick={() => onOpenItem(itemId, item)} aria-current={selectedId === itemId ? 'true' : undefined} className={`group block w-full px-5 py-4 text-left transition duration-150 ${selectedId === itemId ? 'bg-brand/10' : 'hover:bg-wash'}`}>
                       <div className="flex items-start gap-3">
@@ -2707,9 +2942,70 @@ function NoteBody({ text }: { text: string }) {
 }
 
 function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () => void }) {
-  const item = value.item;
-  const kind = displayText(item, ['_kind'], value.view === 'tasks' ? 'Task' : 'Workspace item');
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return;
+      const controls = Array.from(dialogRef.current.querySelectorAll<HTMLElement>('button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter((node) => !node.hasAttribute('disabled'));
+      if (!controls.length) return;
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      returnFocusRef.current?.focus();
+    };
+  }, [onClose]);
+
+  const item = value.view === 'inbox' ? normalizeEmailDisplayFields(value.item) : value.item;
+  const kind = displayText(item, ['_kind'], value.view === 'tasks' ? 'Task' : value.view === 'inbox' ? 'Email' : 'Workspace item');
   const title = displayText(item, ['subject', 'title', 'summary', 'friendlyLabel', 'fact', 'name', 'email'], kind);
+  const isEmail = value.view === 'inbox' || /mail|email/i.test(kind);
+  if (isEmail) {
+    const from = displayText(item, ['sender', 'from', 'fromName'], 'Unknown sender');
+    const mailbox = parseEmailSender(from);
+    const senderName = mailbox.name || mailbox.email || 'Unknown sender';
+    const account = displayText(item, ['account', 'accountEmail', '_account'], '');
+    const receivedRaw = displayText(item, ['date', 'receivedAt', 'time'], '');
+    const received = receivedRaw && !Number.isNaN(new Date(receivedRaw).getTime())
+      ? new Date(receivedRaw).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+      : receivedRaw;
+    const body = displayText(item, ['plainText', 'body', 'content', 'text'], '');
+    const preview = body || displayText(item, ['snippet', 'preview', 'summary'], 'No message preview was returned.');
+    const readerWarning = displayText(item, ['_readerWarning'], '');
+    const attachments = Array.isArray(item.attachments) ? item.attachments : [];
+    return (
+      <div className="fixed inset-0 z-[90] grid place-items-center overflow-y-auto bg-black/65 p-3 backdrop-blur-sm sm:p-5" role="dialog" aria-modal="true" aria-labelledby="email-reader-title" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+        <section ref={dialogRef} className="my-auto flex max-h-[min(88dvh,780px)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-hairline-strong bg-raised shadow-[0_28px_80px_rgba(0,0,0,0.48)]">
+          <header className="flex max-h-[min(42dvh,320px)] shrink-0 items-start justify-between gap-4 overflow-y-auto overscroll-contain border-b border-hairline bg-surface px-5 py-5 sm:px-7">
+            <div className="min-w-0"><p className="flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand-strong"><span>Email</span>{account && <span className="max-w-full truncate rounded-full border border-hairline-strong bg-wash px-2 py-0.5 normal-case tracking-normal text-text-2">{account}</span>}</p><h2 id="email-reader-title" className="mt-2 oa-wrap-anywhere text-xl font-semibold leading-7 sm:text-2xl">{title}</h2></div>
+            <button ref={closeRef} onClick={onClose} aria-label="Close email details" className="sticky top-0 grid h-11 w-11 shrink-0 place-items-center rounded-full border border-hairline-strong bg-surface text-xl text-text-2 transition hover:border-brand/35 hover:bg-wash hover:text-ink">×</button>
+          </header>
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-7">
+            <div className="flex items-start gap-3 border-b border-hairline pb-5">
+              <Avatar name={senderName} size="h-11 w-11" />
+              <div className="min-w-0 flex-1"><p className="oa-wrap-anywhere font-semibold"><bdi dir="auto">{senderName}</bdi></p>{mailbox.email && <p dir="ltr" className="mt-0.5 oa-wrap-anywhere text-xs text-text-3">{mailbox.email}</p>}<p className="mt-1 text-xs text-text-3">{received || 'Received time unavailable'}</p></div>
+            </div>
+            <section aria-labelledby="email-preview-title" className="py-5"><p id="email-preview-title" className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">{body ? 'Plain-text message' : 'Message preview'}</p><p className="mt-3 whitespace-pre-wrap oa-wrap-anywhere text-sm leading-7 text-ink/90">{preview}</p>{!body && <p className="mt-3 text-xs leading-5 text-text-3">Preview only. OpenAssist did not receive the complete message body for this row.</p>}{readerWarning && <p className="mt-3 rounded-xl border border-warning/25 bg-warning/5 px-3 py-2 text-xs leading-5 text-warning-strong">{readerWarning}</p>}</section>
+            {attachments.length > 0 && <div className="border-t border-hairline py-4"><p className="flex items-center gap-2 text-xs font-medium text-text-2"><PaperclipIcon />{attachments.length} {attachments.length === 1 ? 'attachment' : 'attachments'}</p></div>}
+            <p className="border-t border-hairline pt-4 text-xs leading-5 text-warning-strong">Email and attachment content is untrusted. OpenAssist displays it as plain text and never follows instructions found inside it.</p>
+          </div>
+        </section>
+      </div>
+    );
+  }
   const fields = [
     ['Account', displayText(item, ['account', '_account', 'email'], '')],
     ['List', displayText(item, ['list', 'taskListTitle', 'listTitle'], '')],
@@ -2718,11 +3014,11 @@ function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () =
     ['Notes', displayText(item, ['notes', 'description', 'snippet'], '')],
   ].filter((entry) => entry[1]);
   return (
-    <div className="fixed inset-0 z-[80] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={`${kind} details`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="w-full max-w-xl rounded-2xl border border-hairline-strong bg-raised p-6 shadow-[0_24px_64px_rgba(0,0,0,0.5)] sm:p-7">
+    <div className="fixed inset-0 z-[90] grid place-items-center overflow-y-auto bg-black/65 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={`${kind} details`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section ref={dialogRef} className="my-auto max-h-[88dvh] w-full max-w-xl overflow-y-auto rounded-2xl border border-hairline-strong bg-raised p-6 shadow-[0_24px_64px_rgba(0,0,0,0.5)] sm:p-7">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-brand">{kind}</p><h2 className="mt-2 oa-wrap-anywhere text-xl font-semibold leading-7">{title}</h2></div>
-          <button onClick={onClose} aria-label="Close details" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-hairline-strong text-text-2 transition hover:border-brand/35 hover:text-ink">×</button>
+          <button ref={closeRef} onClick={onClose} aria-label="Close details" className="grid h-11 w-11 shrink-0 place-items-center rounded-full border border-hairline-strong text-text-2 transition hover:border-brand/35 hover:text-ink">×</button>
         </div>
         <dl className="mt-6 divide-y divide-hairline rounded-2xl border border-hairline bg-wash/60 px-4">
           {fields.map(([label, text]) => (

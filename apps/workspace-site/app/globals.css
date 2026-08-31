@@ -3,27 +3,27 @@
 :root {
   /* Ink: a cool blue-black instead of neutral grey, so the gold reads warm
      against it rather than sitting on flat charcoal. */
-  --background: #10131a;
-  --surface: #161a23;
-  --surface-raised: #1d222d;
-  --surface-hover: #242a37;
+  --background: #11110f;
+  --surface: #181816;
+  --surface-raised: #20201d;
+  --surface-hover: #2a2924;
 
   /* Text: a soft blue-white, stepped down through three clear levels. */
-  --foreground: #e8eef7;
-  --text-secondary: #a4b1c2;
-  --text-muted: #7c8a9c;
-  --text-faint: #5b6879;
+  --foreground: #f2efe7;
+  --text-secondary: #c3bcae;
+  --text-muted: #9c9487;
+  --text-faint: #837b70;
 
   /* Brand gold, plus the two accents that give the palette range. */
-  --brand: #E0BC63;
-  --brand-strong: #FFE9AE;
-  --brand-deep: #8A6B22;
+  --brand: #c8a04b;
+  --brand-strong: #e0c27a;
+  --brand-deep: #76551d;
   --accent-violet: #7C6BF0;
   --accent-teal: #3FB9C6;
 
   /* Status */
   --danger: #FF8B78;
-  --warning: #FFC178;
+  --warning: #d39b46;
   --success: #5FD3A3;
 
   /* Readable text variants of the accents and statuses. These flip to deeper
@@ -32,19 +32,44 @@
   --accent-violet-strong: #B9B0FF;
   --accent-teal-strong: #76D5DE;
   --danger-strong: #FFA898;
-  --warning-strong: #FFC178;
+  --warning-strong: #f0c780;
   --success-strong: #8BE7AE;
 
-  --hairline: rgba(255, 255, 255, 0.09);
-  --hairline-strong: rgba(255, 255, 255, 0.16);
+  --hairline: rgba(255, 255, 255, 0.11);
+  --hairline-strong: rgba(255, 255, 255, 0.20);
 
   /* Neutral fills: wash for resting cards and hovers, field for inputs. */
-  --wash: rgba(255, 255, 255, 0.055);
-  --wash-strong: rgba(255, 255, 255, 0.095);
+  --wash: rgba(242, 239, 231, 0.06);
+  --wash-strong: rgba(242, 239, 231, 0.11);
   --field: rgba(0, 0, 0, 0.2);
 
   /* Selected-row halo ring, themed so it survives light backgrounds. */
   --ring-selected: rgba(224, 188, 99, 0.34);
+
+  --mode-owner: #23866b;
+  --mode-judge: #7563db;
+  --voice-ready: #b4872f;
+  --voice-listening: #3c9db5;
+  --voice-thinking: #7563db;
+  --voice-speaking: #3aaa88;
+  --voice-muted: #69727e;
+  --voice-error: #c84e3b;
+
+  --avatar-gold-bg: rgba(200, 160, 75, 0.16);
+  --avatar-gold-ring: rgba(224, 194, 122, 0.38);
+  --avatar-gold-text: #f0cf89;
+  --avatar-violet-bg: rgba(117, 99, 219, 0.18);
+  --avatar-violet-ring: rgba(164, 149, 244, 0.38);
+  --avatar-violet-text: #c2b8ff;
+  --avatar-teal-bg: rgba(60, 157, 181, 0.17);
+  --avatar-teal-ring: rgba(131, 216, 227, 0.34);
+  --avatar-teal-text: #91dce6;
+  --avatar-green-bg: rgba(58, 170, 136, 0.17);
+  --avatar-green-ring: rgba(139, 225, 190, 0.32);
+  --avatar-green-text: #9be8c8;
+  --avatar-orange-bg: rgba(211, 135, 70, 0.17);
+  --avatar-orange-ring: rgba(240, 174, 108, 0.34);
+  --avatar-orange-text: #f1bd86;
 
   --shell-gutter: 1.25rem;
   --bottom-nav-space: 0px;
@@ -110,35 +135,51 @@ body {
 
 [data-theme='light'] {
   color-scheme: light;
-  --background: #f5f3ee;
-  --surface: #fbfaf7;
-  --surface-raised: #ffffff;
-  --surface-hover: #f0ede5;
-  --foreground: #192029;
-  --text-secondary: #4d5968;
-  --text-muted: #5f6b7c;
-  --text-faint: #7b8592;
+  --background: #eeeae1;
+  --surface: #f8f5ee;
+  --surface-raised: #fffdf8;
+  --surface-hover: #e9e2d4;
+  --foreground: #171a1f;
+  --text-secondary: #424d5a;
+  --text-muted: #5c6876;
+  --text-faint: #566271;
 
   /* Gold must deepen on paper or it reads as pale yellow and fails contrast. */
-  --brand: #8a6b22;
-  --brand-strong: #6b5316;
-  --brand-deep: #57430f;
+  --brand: #825d16;
+  --brand-strong: #765514;
+  --brand-deep: #50390b;
   --brand-ink: #fffaf0;
 
   --accent-violet-strong: #5646c8;
   --accent-teal-strong: #0d6d79;
   --danger: #d4553f;
   --danger-strong: #b3402e;
-  --warning-strong: #8a5a1a;
+  --warning: #955410;
+  --warning-strong: #78400a;
   --success: #1e7d55;
   --success-strong: #1e7d55;
 
-  --hairline: rgba(24, 31, 41, 0.10);
-  --hairline-strong: rgba(24, 31, 41, 0.16);
-  --wash: rgba(22, 28, 38, 0.045);
-  --wash-strong: rgba(22, 28, 38, 0.08);
+  --hairline: rgba(24, 31, 41, 0.14);
+  --hairline-strong: rgba(24, 31, 41, 0.23);
+  --wash: rgba(80, 57, 11, 0.05);
+  --wash-strong: rgba(80, 57, 11, 0.09);
   --field: rgba(22, 28, 38, 0.05);
   --ring-selected: rgba(138, 107, 34, 0.5);
+  --avatar-gold-bg: #f5e7c6;
+  --avatar-gold-ring: #caa650;
+  --avatar-gold-text: #6f4d0c;
+  --avatar-violet-bg: #e7e1fb;
+  --avatar-violet-ring: #9a89db;
+  --avatar-violet-text: #4d378e;
+  --avatar-teal-bg: #d9eef1;
+  --avatar-teal-ring: #72aeb8;
+  --avatar-teal-text: #175d69;
+  --avatar-green-bg: #dcefe7;
+  --avatar-green-ring: #72ad96;
+  --avatar-green-text: #205f4d;
+  --avatar-orange-bg: #f6e2d0;
+  --avatar-orange-ring: #cf9363;
+  --avatar-orange-text: #78421a;
   background: var(--background);
   color: var(--foreground) !important;
 }
@@ -295,6 +336,89 @@ button {
   display: none;
 }
 
+/* A real working surface: the rails are paper layers, while the center stays
+   calm and open. Gold is reserved for focus and the selected object. */
+.oa-app-shell > div > aside:first-child,
+.oa-app-shell > div > aside:last-child {
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+}
+
+[data-workspace-mode='owner'] {
+  --workspace-mode: var(--mode-owner);
+}
+
+[data-workspace-mode='judge'] {
+  --workspace-mode: var(--mode-judge);
+}
+
+.oa-mode-strip {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid color-mix(in srgb, var(--workspace-mode) 28%, var(--hairline));
+  border-radius: 0.9rem;
+  background: color-mix(in srgb, var(--workspace-mode) 7%, var(--surface));
+  padding: 0.75rem 1rem;
+}
+
+.oa-mode-strip__dot {
+  width: 0.48rem;
+  height: 0.48rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--workspace-mode);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--workspace-mode) 12%, transparent);
+}
+
+.oa-mobile-mode-badge {
+  color: color-mix(in srgb, var(--workspace-mode) 62%, var(--foreground));
+  border: 1px solid color-mix(in srgb, var(--workspace-mode) 34%, var(--hairline));
+  background: color-mix(in srgb, var(--workspace-mode) 10%, var(--surface));
+}
+
+@media (max-width: 520px) {
+  .oa-mode-strip { align-items: flex-start; flex-direction: column; gap: 0.45rem; }
+}
+
+/* Email is one continuous inbox, not a pile of disconnected cards. */
+.oa-mail-list {
+  overflow: hidden;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 1.15rem;
+  background: var(--surface);
+  box-shadow: 0 14px 40px color-mix(in srgb, #000 16%, transparent);
+}
+
+.oa-mail-row {
+  background: var(--surface);
+  transition: background-color 140ms ease, box-shadow 140ms ease;
+}
+
+.oa-mail-row + .oa-mail-row {
+  border-top: 1px solid var(--hairline);
+}
+
+.oa-mail-row:hover,
+.oa-mail-row:has(.oa-mail-row__open:focus-visible) {
+  background: var(--surface-hover);
+}
+
+.oa-mail-row[data-selected='true'] {
+  background: color-mix(in srgb, var(--brand) 10%, var(--surface));
+  box-shadow: inset 3px 0 0 var(--brand), inset 0 0 0 1px var(--ring-selected);
+}
+
+.oa-mail-row__open:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -3px;
+}
+
+.oa-mail-snippet {
+  color: var(--text-muted);
+}
+
 /* Voice stays present like an agent, without blocking the workspace. */
 .oa-voice-dock {
   position: fixed;
@@ -312,13 +436,34 @@ button {
   pointer-events: auto;
   border: 1px solid var(--hairline-strong);
   border-radius: 1.1rem;
-  background: rgba(23, 27, 36, 0.97);
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
   padding: 1rem;
-  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 76px rgba(0, 0, 0, 0.42), 0 0 0 1px color-mix(in srgb, var(--workspace-mode) 10%, transparent);
   backdrop-filter: blur(22px) saturate(1.08);
   scrollbar-width: thin;
   scrollbar-color: rgba(224, 188, 99, 0.32) transparent;
   animation: oa-agent-dock-in 180ms ease-out both;
+}
+
+.oa-voice-dock__header {
+  position: sticky;
+  top: -1rem;
+  z-index: 4;
+  margin: -1rem -1rem 0;
+  padding: 1rem;
+  border-bottom: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--surface-raised) 94%, transparent);
+  backdrop-filter: blur(18px);
+}
+
+.oa-voice-dock__drag {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.oa-voice-dock__drag:active {
+  cursor: grabbing;
 }
 
 .oa-voice-dock__settings[open] .oa-voice-dock__chevron {
@@ -337,6 +482,10 @@ button {
     width: min(560px, calc(100vw - 2rem));
     transform: translateX(-50%);
   }
+
+  .oa-voice-dock.is-positioned {
+    width: min(560px, calc(100vw - 2rem));
+  }
 }
 
 @media (min-width: 1280px) {
@@ -353,11 +502,34 @@ button {
 /* Action previews stay visible without freezing the workspace underneath. */
 .oa-approval-dock {
   position: fixed;
-  z-index: 65;
+  z-index: 110;
   top: 4.5rem;
   right: 0.75rem;
   left: 0.75rem;
   pointer-events: none;
+}
+
+@media (max-width: 767px) {
+  .oa-voice-dock__panel {
+    max-height: calc(100dvh - 6rem - env(safe-area-inset-top));
+    overscroll-behavior: contain;
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+  }
+
+  .oa-mail-row > div {
+    padding-inline: 0.85rem;
+  }
+
+  .oa-mail-row .oa-clamp-1 {
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+}
+
+@media (forced-colors: active) {
+  .oa-orb { outline: 2px solid CanvasText; }
+  .oa-voice-state-dot { forced-color-adjust: none; }
+  .oa-mail-row[data-selected='true'] { outline: 2px solid Highlight; outline-offset: -2px; }
 }
 
 .oa-approval-dock__panel {
@@ -433,7 +605,7 @@ button {
   border-radius: inherit;
   background:
     radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.95) 0 14%, transparent 30%),
-    conic-gradient(from 215deg, #6f9dff, #5ee0ae, #e9c76e, #ff8bd2, #6f9dff);
+    conic-gradient(from 215deg, #25263a, #d5aa4a, #f1d58b, #7163c8, #25263a);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.30);
   transition: opacity 240ms ease;
 }
@@ -465,7 +637,7 @@ button {
 }
 
 .oa-orb--listening::after {
-  background: radial-gradient(circle, rgba(111, 157, 255, 0.42), transparent 68%);
+  background: radial-gradient(circle, rgba(60, 157, 181, 0.42), transparent 68%);
   opacity: 1;
 }
 
@@ -480,7 +652,7 @@ button {
 }
 
 .oa-orb--speaking::after {
-  background: radial-gradient(circle, rgba(94, 224, 174, 0.42), transparent 68%);
+  background: radial-gradient(circle, rgba(58, 170, 136, 0.42), transparent 68%);
   opacity: 1;
 }
 
@@ -512,20 +684,24 @@ button {
   box-shadow: 0 0 0 3px rgba(124, 138, 156, 0.08);
 }
 
-.oa-voice-state-dot--connecting,
-.oa-voice-state-dot--listening {
+.oa-voice-state-dot--connecting {
   background: #e0bc63;
   box-shadow: 0 0 0 3px rgba(224, 188, 99, 0.10), 0 0 10px rgba(224, 188, 99, 0.48);
 }
 
+.oa-voice-state-dot--listening {
+  background: var(--voice-listening);
+  box-shadow: 0 0 0 3px rgba(60, 157, 181, 0.12), 0 0 10px rgba(60, 157, 181, 0.48);
+}
+
 .oa-voice-state-dot--thinking {
-  background: #8f7ff0;
+  background: var(--voice-thinking);
   box-shadow: 0 0 0 3px rgba(143, 127, 240, 0.10), 0 0 10px rgba(143, 127, 240, 0.46);
 }
 
 .oa-voice-state-dot--speaking {
-  background: #4dc7d2;
-  box-shadow: 0 0 0 3px rgba(77, 199, 210, 0.10), 0 0 10px rgba(77, 199, 210, 0.46);
+  background: var(--voice-speaking);
+  box-shadow: 0 0 0 3px rgba(58, 170, 136, 0.10), 0 0 10px rgba(58, 170, 136, 0.46);
 }
 
 .oa-voice-state-dot--muted {
@@ -533,7 +709,7 @@ button {
 }
 
 .oa-voice-state-dot--error {
-  background: #ff6f61;
+  background: var(--voice-error);
   box-shadow: 0 0 0 3px rgba(255, 111, 97, 0.10), 0 0 10px rgba(255, 111, 97, 0.42);
 }
 
