@@ -158,3 +158,9 @@ test('initial Live loading reuses the account ref and navigation clears stale fi
   assert.match(component, /No connected Gmail account\|Connect the required Google service\|Gmail is disconnected/);
   assert.match(component, /<JudgeQuickStart onNavigate=\{focusView\} toolCount=\{webMcpTools\.length\}/);
 });
+
+test('daily brief limits unread metadata work while keeping every enabled account', async () => {
+  const client = await text('lib/mcp-client.ts');
+  assert.match(client, /get_google_mail_attention', \{ accounts: mailAccounts, maxPerAccount: 2 \}/);
+  assert.match(client, /includedInAutomaticSearch !== false/);
+});

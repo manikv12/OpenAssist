@@ -663,7 +663,10 @@ export async function executeLiveWorkspaceTool(
     const [lists, mail, calendar] = await Promise.all([
       callWorkspaceMcp(accessToken, 'list_google_task_lists', { account: taskAccount }) as Promise<{ taskLists?: Array<{ id?: string; title?: string }> }>,
       mailAccounts.length
-        ? callWorkspaceMcp(accessToken, 'get_google_mail_attention', { accounts: mailAccounts, maxPerAccount: 5 })
+        // Today renders only the five newest messages. Two per account keeps
+        // every automatic-search account represented without fetching up to
+        // 25 message metadata records that the screen will never display.
+        ? callWorkspaceMcp(accessToken, 'get_google_mail_attention', { accounts: mailAccounts, maxPerAccount: 2 })
         : Promise.resolve({ warning: 'No connected Gmail account is enabled for automatic search.', results: [] }),
       callWorkspaceMcp(accessToken, 'list_google_calendar_events', { accounts: [calendarAccount], calendarId: 'primary', ...range, maxPerAccount: 25 }),
     ]);
