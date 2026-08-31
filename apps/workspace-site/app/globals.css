@@ -432,10 +432,9 @@ button {
   inset: 0;
   border-radius: inherit;
   background:
-    radial-gradient(circle at 32% 26%, var(--brand-strong), transparent 46%),
-    radial-gradient(circle at 72% 74%, var(--accent-violet), transparent 52%),
-    radial-gradient(circle at 50% 50%, var(--brand) 8%, var(--brand-deep) 62%, #14100a 100%);
-  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.28);
+    radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.95) 0 14%, transparent 30%),
+    conic-gradient(from 215deg, #6f9dff, #5ee0ae, #e9c76e, #ff8bd2, #6f9dff);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.30);
   transition: opacity 240ms ease;
 }
 
@@ -445,8 +444,8 @@ button {
   position: absolute;
   inset: -42%;
   border-radius: inherit;
-  background: radial-gradient(circle, rgba(224, 188, 99, 0.30), transparent 66%);
-  filter: blur(10px);
+  background: radial-gradient(circle, rgba(111, 157, 255, 0.26), transparent 68%);
+  filter: blur(9px);
   opacity: var(--oa-orb-bloom);
   transform: scale(var(--oa-orb-bloom-scale));
   z-index: -1;
@@ -466,12 +465,12 @@ button {
 }
 
 .oa-orb--listening::after {
-  background: radial-gradient(circle, rgba(224, 188, 99, 0.46), transparent 68%);
+  background: radial-gradient(circle, rgba(111, 157, 255, 0.42), transparent 68%);
   opacity: 1;
 }
 
 .oa-orb--connecting::after {
-  background: radial-gradient(circle, rgba(224, 188, 99, 0.44), transparent 68%);
+  background: radial-gradient(circle, rgba(233, 199, 110, 0.42), transparent 68%);
   opacity: 1;
 }
 
@@ -481,7 +480,7 @@ button {
 }
 
 .oa-orb--speaking::after {
-  background: radial-gradient(circle, rgba(63, 185, 198, 0.42), transparent 68%);
+  background: radial-gradient(circle, rgba(94, 224, 174, 0.42), transparent 68%);
   opacity: 1;
 }
 

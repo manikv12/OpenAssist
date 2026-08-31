@@ -347,6 +347,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [themePreference, setThemePreference] = useState<ThemePreference>('system');
   const [systemDark, setSystemDark] = useState(true);
   const liveRef = useRef(live);
+  const lastLiveRefreshRef = useRef(-1);
   const tasksRef = useRef(tasks);
   const messagesRef = useRef(messages);
   const eventsRef = useRef(events);
@@ -711,6 +712,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   useEffect(() => {
     if (mode !== 'live' || !user) return;
     const controller = new AbortController();
+    const cached = liveRef.current;
+    const alreadyLoaded = view === 'accounts' || view === 'activity'
+      ? Boolean(cached.accounts)
+      : cached.data[view] !== undefined;
+    if (alreadyLoaded && liveRefreshKey === lastLiveRefreshRef.current) return;
+    lastLiveRefreshRef.current = liveRefreshKey;
     const timeout = window.setTimeout(() => {
       setLive((current) => ({ ...current, loading: true, error: null, warning: null }));
       const now = new Date();
@@ -730,6 +737,8 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       };
       const [toolName, args] = requestForView[view];
       void (async () => {
+        // Already loaded and not an explicit refresh: keep the cached view so
+        // navigating back is instant instead of re-hitting Google every time.
         const accountsPromise = liveRef.current.accounts
           ? Promise.resolve(liveRef.current.accounts)
           : invokeTool('workspace_list_accounts', {}, controller.signal);
@@ -1382,7 +1391,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 : view === 'work' && live.accounts && !live.error
                   ? <SecondBrainWorkspace source={live.data.work} loading={live.loading} warning={live.warning} onRefresh={() => setLiveRefreshKey((current) => current + 1)} onInvoke={invokeTool} />
                 : <LiveWorkspaceView view={view} live={live} query={search} selectedId={selectedId} ownerCode={ownerSetupCode} onOwnerCode={setOwnerSetupCode} onBootstrap={() => void completeOwnerSetup()} onReconnect={() => router.push('/api/workspace/connect')} onRetry={() => setLiveRefreshKey((current) => current + 1)} onOpenNote={(item) => void openLiveNote(item)} onOpenItem={(id, item) => { setSelectedId(id); setOpenLiveItem({ id, view, item }); }} />
-            ) : demoLoading ? <WorkspaceLoading title="Preparing your private demo workspace" detail="Loading isolated synthetic mail, tasks, and calendar…" /> : <>
+            ) : demoLoading ? <WorkspaceLoading title="Loading the demo workspace" /> : <>
               {view === 'today' && <TodayView messages={messages.filter((message) => message.unread)} tasks={tasks.filter((task) => !task.completed)} events={events.filter((event) => event.day === 'Today')} selectedId={selectedId} onSelect={setSelectedId} onNavigate={focusView} />}
               {view === 'inbox' && <InboxView messages={filteredMessages} selectedId={selectedId} onSelect={setSelectedId} onMarkRead={(message) => void invokeTool('workspace_set_mail_read_state', { account: message.account, messageIds: [message.id], state: 'read', scope: 'thread' })} />}
               {view === 'tasks' && <TasksView tasks={tasks} selectedId={selectedId} onSelect={(id) => { setSelectedId(id); const task = tasks.find((candidate) => candidate.id === id); if (task) setOpenLiveItem({ id, view: 'tasks', item: { ...task, _kind: 'Demo task' } }); }} onCreate={() => setEditor('task')} />}
@@ -1527,7 +1536,7 @@ function ThemePicker({ value, onChange }: { value: ThemePreference; onChange: (v
 
 function Sidebar({ view, user, items, onView, onSignOut }: { view: WorkspaceView; user: SiteUser; items: typeof NAVIGATION; onView: (view: WorkspaceView) => void; onSignOut: () => void }) {
   const owner = user?.access === 'owner';
-  return <aside className="min-w-0 border-r border-hairline px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-text-3">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`flex w-full items-center gap-3 rounded-xl border-l-2 px-3 py-2.5 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'border-brand bg-wash-strong text-ink' : 'border-transparent text-text-2 hover:bg-wash hover:text-ink'}`}><span className={`grid h-7 w-7 shrink-0 place-items-center rounded-lg ${view === item.view ? 'text-brand' : 'text-text-3'}`}><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-hairline pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Access</p><span className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] ${owner ? 'border-teal/20 bg-teal/10 text-teal-strong' : 'border-brand/20 bg-brand/10 text-brand'}`}>{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-text-3">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-text-2 transition hover:text-ink">Sign out</button></div></aside>;
+  return <aside className="min-w-0 border-r border-hairline px-5 py-6 max-xl:px-3 max-md:hidden"><div className="mb-8 flex items-center gap-3 px-2"><BrandMark /><div className="max-xl:hidden"><p className="font-semibold">OpenAssist</p><p className="text-xs text-text-3">Daily Workspace</p></div></div><nav aria-label="Primary workspace views"><ul className="space-y-1">{items.map((item) => <li key={item.view}><button onClick={() => onView(item.view)} aria-current={view === item.view ? 'page' : undefined} title={item.label} className={`relative flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm transition max-xl:justify-center max-xl:px-2 ${view === item.view ? 'font-medium text-ink before:absolute before:inset-y-1 before:left-0 before:w-[3px] before:rounded-full before:bg-brand max-xl:before:hidden' : 'text-text-3 hover:bg-wash hover:text-ink'}`}><span className={`grid h-5 w-5 shrink-0 place-items-center ${view === item.view ? 'text-ink' : 'text-text-4'}`}><ViewIcon view={item.view} className="h-4 w-4" /></span><span className="truncate max-xl:hidden">{item.label}</span></button></li>)}</ul></nav><div className="mt-8 border-t border-hairline pt-5 max-xl:hidden"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Access</p><span className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] ${owner ? 'border-teal/20 bg-teal/10 text-teal-strong' : 'border-brand/20 bg-brand/10 text-brand'}`}>{owner ? 'Private Live' : 'Judge Demo'}</span><p className="mt-3 text-xs leading-5 text-text-3">{owner ? `Owner · ${user?.email}` : 'Judge · isolated Demo only'}</p><button onClick={onSignOut} className="mt-3 text-xs font-medium text-text-2 transition hover:text-ink">Sign out</button></div></aside>;
 }
 
 function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, onRefresh }: { threads: VoiceThread[]; selectedId: string | null; loading: boolean; connected: boolean; onSelect: (threadId: string | null) => void; onRefresh: () => void }) {
@@ -1671,7 +1680,7 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
 type Selectable = { selectedId: string | null; onSelect: (id: string) => void };
 
 function BrandMark({ size = 'h-9 w-9' }: { size?: string }) {
-  return <span aria-hidden="true" className={`${size} block shrink-0 rounded-full bg-[url('/openassist-logo.svg')] bg-cover bg-center`} />;
+  return <span aria-hidden="true" className={`${size} block shrink-0 bg-[url('/openassist-logo.svg')] bg-contain bg-center bg-no-repeat`} />;
 }
 
 /** Stable per-sender colour so the same account always looks the same. */
@@ -2377,19 +2386,19 @@ function LiveWorkspaceView({ view, live, query, selectedId, ownerCode, onOwnerCo
   );
 }
 
-function WorkspaceLoading({ title = 'Organizing your live workspace', detail = 'Checking connected mail, tasks, and calendar securely…' }: { title?: string; detail?: string }) {
+function WorkspaceLoading({ title = 'Loading your workspace', detail }: { title?: string; detail?: string }) {
   return (
-    <section aria-label="Loading private workspace" aria-busy="true" className="space-y-5">
-      <div className="flex items-center gap-3 rounded-2xl border border-hairline bg-wash/60 px-4 py-3.5">
-        <span className="h-2 w-2 animate-pulse rounded-full bg-text-3" />
-        <div><p className="text-sm font-medium text-ink">{title}</p><p className="mt-0.5 text-xs text-text-4">{detail}</p></div>
-      </div>
-      <div className="grid gap-4 sm:grid-cols-3">
-        {[0, 1, 2].map((item) => <div key={item} className="h-24 animate-pulse rounded-2xl border border-hairline bg-wash/60" />)}
-      </div>
-      <div className="grid gap-5 xl:grid-cols-2">
-        {[0, 1].map((column) => <div key={column} className="overflow-hidden rounded-2xl border border-hairline bg-wash/60"><div className="h-16 border-b border-hairline bg-wash/60" /><div className="space-y-3 p-4">{[0, 1, 2].map((row) => <div key={row} className="h-14 animate-pulse rounded-xl bg-wash" />)}</div></div>)}
-      </div>
+    <section aria-label={title} aria-busy="true" className="space-y-2">
+      <span className="sr-only">{detail ?? title}</span>
+      {[0, 1, 2, 3, 4].map((row) => (
+        <div key={row} className="flex items-center gap-3 rounded-xl px-3.5 py-3" style={{ opacity: 1 - row * 0.16 }}>
+          <span className="h-8 w-8 shrink-0 animate-pulse rounded-full bg-wash-strong" />
+          <span className="min-w-0 flex-1 space-y-2">
+            <span className="block h-3 w-2/5 animate-pulse rounded bg-wash-strong" />
+            <span className="block h-3 w-4/5 animate-pulse rounded bg-wash" />
+          </span>
+        </div>
+      ))}
     </section>
   );
 }
@@ -2632,6 +2641,71 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
   );
 }
 
+/** Turn API status codes ("needsAction") into plain words. */
+function humanStatus(value: string): string {
+  const map: Record<string, string> = {
+    needsAction: 'Not started',
+    completed: 'Done',
+    inProgress: 'In progress',
+    cancelled: 'Cancelled',
+    confirmed: 'Confirmed',
+    tentative: 'Tentative',
+  };
+  if (map[value]) return map[value];
+  // camelCase / snake_case -> sentence case.
+  const spaced = value.replace(/[_-]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').trim();
+  return spaced ? spaced[0].toUpperCase() + spaced.slice(1).toLowerCase() : value;
+}
+
+/** Render a date the way a person reads it, never as a raw ISO timestamp. */
+function humanDate(value: string): string {
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+  const date = new Date(dateOnly ? `${value}T00:00:00` : value);
+  if (Number.isNaN(date.getTime())) return value;
+  const midnightUtc = /T00:00:00(?:\.000)?Z$/.test(value);
+  const day = liveDayLabel(dateOnly || midnightUtc ? value.slice(0, 10) : value);
+  if (dateOnly || midnightUtc) return day || date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return `${day} · ${time}`;
+}
+
+/**
+ * Split a note that carries inline numbered steps ("… 1. do this 2. do that")
+ * into a lead paragraph plus one entry per step. Untouched when there are no
+ * steps, so plain notes still render as a single block.
+ */
+function noteSegments(text: string): { lead: string; steps: string[] } {
+  const matches = [...text.matchAll(/(?:^|\s)(\d{1,2})[.)]\s+/g)];
+  // Only treat it as a list when the numbering actually starts at 1 and runs on.
+  const ordered = matches.filter((match, index) => Number(match[1]) === index + 1);
+  if (ordered.length < 2) return { lead: text.trim(), steps: [] };
+  const lead = text.slice(0, ordered[0].index).trim();
+  const steps = ordered.map((match, index) => {
+    const start = (match.index ?? 0) + match[0].length;
+    const end = index + 1 < ordered.length ? ordered[index + 1].index : text.length;
+    return text.slice(start, end).trim();
+  }).filter(Boolean);
+  return { lead, steps };
+}
+
+function NoteBody({ text }: { text: string }) {
+  const { lead, steps } = noteSegments(text);
+  if (!steps.length) return <p className="oa-wrap-anywhere text-sm leading-6 text-ink/90">{lead}</p>;
+  return (
+    <div className="min-w-0">
+      {lead && <p className="oa-wrap-anywhere text-sm leading-6 text-ink/90">{lead}</p>}
+      <ol className={`${lead ? 'mt-3' : ''} space-y-2`}>
+        {steps.map((step, index) => (
+          <li key={index} className="flex gap-2.5">
+            <span aria-hidden="true" className="mt-px w-4 shrink-0 text-right text-xs font-medium tabular-nums text-text-4">{index + 1}</span>
+            <span className="oa-wrap-anywhere min-w-0 flex-1 text-sm leading-6 text-ink/90">{step}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () => void }) {
   const item = value.item;
   const kind = displayText(item, ['_kind'], value.view === 'tasks' ? 'Task' : 'Workspace item');
@@ -2639,8 +2713,8 @@ function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () =
   const fields = [
     ['Account', displayText(item, ['account', '_account', 'email'], '')],
     ['List', displayText(item, ['list', 'taskListTitle', 'listTitle'], '')],
-    ['Due', displayText(item, ['due', 'dueDate'], '')],
-    ['Status', displayText(item, ['status'], '')],
+    ['Due', (() => { const raw = displayText(item, ['due', 'dueDate'], ''); return raw ? humanDate(raw) : ''; })()],
+    ['Status', (() => { const raw = displayText(item, ['status'], ''); return raw ? humanStatus(raw) : ''; })()],
     ['Notes', displayText(item, ['notes', 'description', 'snippet'], '')],
   ].filter((entry) => entry[1]);
   return (
@@ -2651,7 +2725,12 @@ function LiveItemReader({ value, onClose }: { value: OpenLiveItem; onClose: () =
           <button onClick={onClose} aria-label="Close details" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-hairline-strong text-text-2 transition hover:border-brand/35 hover:text-ink">×</button>
         </div>
         <dl className="mt-6 divide-y divide-hairline rounded-2xl border border-hairline bg-wash/60 px-4">
-          {fields.map(([label, text]) => <div key={label} className="grid gap-1 py-3 sm:grid-cols-[84px_1fr]"><dt className="text-xs font-medium text-text-3">{label}</dt><dd className="oa-wrap-anywhere text-sm leading-5 text-ink/90">{text}</dd></div>)}
+          {fields.map(([label, text]) => (
+            <div key={label} className="grid gap-1 py-3 sm:grid-cols-[84px_1fr]">
+              <dt className="text-xs font-medium text-text-3">{label}</dt>
+              <dd className="min-w-0">{label === 'Notes' ? <NoteBody text={text} /> : <span className="oa-wrap-anywhere text-sm leading-6 text-ink/90">{text}</span>}</dd>
+            </div>
+          ))}
         </dl>
         <p className="mt-4 text-xs leading-5 text-text-4">Loaded live from OpenAssist. This content is not copied into the site database.</p>
       </section>

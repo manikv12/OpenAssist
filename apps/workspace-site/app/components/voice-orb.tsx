@@ -172,7 +172,7 @@ export function VoiceOrb({
   phase,
   meter,
   size = 44,
-  colors = { low: '#241B44', mid: '#E0BC63', key: '#7C6BF0', rim: '#3FB9C6' },
+  colors = { low: '#6f9dff', mid: '#e9c76e', key: '#5ee0ae', rim: '#ff8bd2' },
 }: {
   phase: OrbPhase;
   meter: VoiceLevelMeter | null;
