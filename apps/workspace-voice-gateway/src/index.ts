@@ -709,7 +709,7 @@ export default {
       const url = new URL(request.url);
       if (request.method === 'GET' && url.pathname === '/health') {
         const funding = await resolveDemoFunding(env);
-        return json({ status: 'ok', containerRouting: 'isolated_per_user', cappedDemoConfigured: funding.available, sessionSeconds: funding.sessionSeconds, maxToolCalls: funding.maxToolCalls, dailySessionLimit: funding.dailySessionLimit, runtimeVersion: env.CODEX_RUNTIME_VERSION });
+        return json({ status: 'ok', containerRouting: 'owner_container_shared_with_judges', cappedDemoConfigured: funding.available, sessionSeconds: funding.sessionSeconds, maxToolCalls: funding.maxToolCalls, dailySessionLimit: funding.dailySessionLimit, runtimeVersion: env.CODEX_RUNTIME_VERSION });
       }
       return await handleAuthorized(request, env);
     } catch (error) {
