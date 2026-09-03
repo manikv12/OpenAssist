@@ -25,7 +25,7 @@ test('WebMCP annotations and visible approval previews are always registered', a
   assert.match(component, /untrustedContentHint: tool\.untrustedContent/);
   assert.match(component, /status: 'approval_required'/);
   assert.match(component, /A visible preview is open/);
-  assert.match(component, /Voice confirmation cannot approve it/);
+  assert.match(component, /Voice cannot approve this/);
 });
 
 test('judge readiness reports only the tools exposed in judge mode', async () => {
@@ -79,7 +79,8 @@ test('live task updates keep tags and live note queries filter returned note tit
 test('demo and owner Live mode remain separate', async () => {
   const component = await text('app/components/workspace-app.tsx');
   assert.match(component, /modeRef\.current === 'demo'/);
-  assert.match(component, /Private synthetic judge workspace · no Google data/);
+  assert.match(component, /Judge demo/);
+  assert.match(component, /Synthetic data/);
   assert.match(component, /ownerAccess &&/);
   assert.match(component, /Judge · isolated Demo only/);
   assert.match(component, /\/api\/demo\/tool/);
@@ -95,17 +96,33 @@ test('demo and owner Live mode remain separate', async () => {
   assert.match(component, /workspace_update_supply_cart/);
 });
 
-test('Shopify results render real images and show the two separate demo paths', async () => {
+test('Shopify results render real images and a compact safe demo task', async () => {
   const component = await text('app/components/workspace-app.tsx');
   const demoData = await text('lib/demo-data.ts');
   const storefront = await text('lib/shopify-storefront.ts');
 
-  assert.match(component, /Demo video · fixed story/);
-  assert.match(component, /Judge test · free sandbox/);
+  assert.match(component, /Prepare the Northstar security kit/);
+  assert.match(component, /No checkout/);
   assert.match(component, /product\.imageUrl/);
   assert.match(component, /alt=\{`\$\{product\.title\} product`\}/);
   assert.equal([...demoData.matchAll(/imageUrl: '\/catalog\/[a-z0-9-]+\.webp'/g)].length, 6);
   assert.match(storefront, /imageUrl: textValue\(image\.url \?\? image\.src\) \|\| curated\?\.imageUrl/);
+});
+
+test('judge screens keep the demo concise and make approved changes prominent', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  const styles = await text('app/globals.css');
+
+  assert.match(component, /Demo flow/);
+  assert.match(component, /Read priority/);
+  assert.match(component, /Prepare cart/);
+  assert.match(component, /Verify action/);
+  assert.match(component, /function groupActivity/);
+  assert.match(component, /\['write', 'Changes'\]/);
+  assert.match(component, /item\.count > 1/);
+  assert.doesNotMatch(component, /Reads happen immediately/);
+  assert.doesNotMatch(component, /Every action stays visible/);
+  assert.match(styles, /oa-activity-card\[data-kind='write'\]/);
 });
 
 test('live reads reuse one MCP session and ignore disconnected automatic-search accounts', async () => {

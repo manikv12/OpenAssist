@@ -378,6 +378,38 @@ button {
   background: color-mix(in srgb, var(--workspace-mode) 10%, var(--surface));
 }
 
+.oa-demo-step {
+  display: inline-flex;
+  min-height: 2.25rem;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid var(--hairline);
+  border-radius: 0.7rem;
+  background: var(--surface);
+  padding: 0.4rem 0.65rem;
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  font-weight: 600;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+
+.oa-demo-step span {
+  display: grid;
+  width: 1.2rem;
+  height: 1.2rem;
+  place-items: center;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand) 15%, transparent);
+  color: var(--brand-strong);
+  font-size: 0.62rem;
+}
+
+.oa-demo-step:hover {
+  border-color: color-mix(in srgb, var(--brand) 42%, var(--hairline));
+  background: color-mix(in srgb, var(--brand) 7%, var(--surface));
+  color: var(--foreground);
+}
+
 @media (max-width: 520px) {
   .oa-mode-strip { align-items: flex-start; flex-direction: column; gap: 0.45rem; }
 }
@@ -417,6 +449,45 @@ button {
 
 .oa-mail-snippet {
   color: var(--text-muted);
+}
+
+.oa-activity-item {
+  border: 1px solid transparent;
+}
+
+.oa-activity-item:hover {
+  border-color: var(--hairline-strong);
+  background: var(--wash);
+}
+
+.oa-activity-item[data-kind='write'] {
+  border-color: color-mix(in srgb, var(--brand) 24%, var(--hairline));
+  background: color-mix(in srgb, var(--brand) 7%, var(--surface));
+}
+
+.oa-activity-card {
+  border-color: var(--hairline);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+}
+
+.oa-activity-card[data-kind='read'] {
+  color: var(--text-secondary);
+}
+
+.oa-activity-card[data-kind='write'] {
+  border-color: color-mix(in srgb, var(--brand) 40%, var(--hairline));
+  background: color-mix(in srgb, var(--brand) 8%, var(--surface));
+  box-shadow: inset 3px 0 0 var(--brand);
+}
+
+.oa-activity-card__icon {
+  background: var(--wash-strong);
+  color: var(--text-muted);
+}
+
+.oa-activity-card[data-kind='write'] .oa-activity-card__icon {
+  background: var(--brand);
+  color: var(--brand-ink);
 }
 
 /* Voice stays present like an agent, without blocking the workspace. */

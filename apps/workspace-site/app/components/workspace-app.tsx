@@ -141,17 +141,17 @@ const NAVIGATION: { view: WorkspaceView; label: string; key: string; ownerOnly?:
   { view: 'activity', label: 'Activity', key: 'Y' },
 ];
 
-const VIEW_COPY: Record<WorkspaceView, { eyebrow: string; title: string; subtitle: string }> = {
-  today: { eyebrow: 'Today', title: 'Today', subtitle: 'Mail, tasks, and calendar in one calm view.' },
-  inbox: { eyebrow: 'Three demo accounts', title: 'Inbox', subtitle: 'Search every connected account without mixing identities.' },
-  tasks: { eyebrow: 'My Tasks · Upcoming · Backlog', title: 'Tasks', subtitle: 'Clear next actions with short notes and useful tags.' },
-  work: { eyebrow: 'Second brain · Agent queue', title: 'Work', subtitle: 'Capture ideas, shape projects, and let agents carry routine work forward.' },
-  calendar: { eyebrow: 'Agenda and week', title: 'Calendar', subtitle: 'Exact local times, account context, and visible reminders.' },
-  supplies: { eyebrow: 'Shopify · Synthetic store', title: 'Supplies', subtitle: 'Let the agent search a real dev-store catalog and prepare a cart—never checkout.' },
-  notes: { eyebrow: 'Google Drive', title: 'Notes', subtitle: 'Long reference material lives here, not inside task details.' },
-  memory: { eyebrow: 'Private Drive memory', title: 'Memory', subtitle: 'Only durable, user-approved facts—never raw email text.' },
-  accounts: { eyebrow: 'Routing and defaults', title: 'Accounts', subtitle: 'Friendly labels tell agents where new work belongs.' },
-  activity: { eyebrow: 'Transparent operations', title: 'Activity', subtitle: 'See what you, ChatGPT, and voice have read or changed.' },
+const VIEW_COPY: Record<WorkspaceView, { eyebrow: string; title: string }> = {
+  today: { eyebrow: 'Daily brief', title: 'Today' },
+  inbox: { eyebrow: 'All accounts', title: 'Inbox' },
+  tasks: { eyebrow: 'Open and upcoming', title: 'Tasks' },
+  work: { eyebrow: 'Projects and agents', title: 'Work' },
+  calendar: { eyebrow: 'Schedule', title: 'Calendar' },
+  supplies: { eyebrow: 'Shopify demo store', title: 'Supplies' },
+  notes: { eyebrow: 'Drive notes', title: 'Notes' },
+  memory: { eyebrow: 'Approved facts', title: 'Memory' },
+  accounts: { eyebrow: 'Connections', title: 'Accounts' },
+  activity: { eyebrow: 'Agent actions', title: 'Activity' },
 };
 
 const PAGE_SIZE = 8;
@@ -1407,9 +1407,9 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const copy = view === 'today'
     ? { ...VIEW_COPY.today, eyebrow: todayEyebrow }
     : mode === 'demo' && view === 'notes'
-    ? { eyebrow: 'Temporary demo notes', title: 'Notes', subtitle: 'Judge-created notes stay isolated from Google and expire automatically.' }
+    ? { eyebrow: 'Temporary demo notes', title: 'Notes' }
     : mode === 'demo' && view === 'memory'
-      ? { eyebrow: 'Temporary demo memory', title: 'Memory', subtitle: 'Safe synthetic preferences for testing agent decisions.' }
+      ? { eyebrow: 'Temporary demo memory', title: 'Memory' }
       : mode === 'live' && view === 'inbox'
         ? { ...VIEW_COPY.inbox, eyebrow: 'Connected Google accounts' }
       : VIEW_COPY[view];
@@ -1436,7 +1436,6 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 <div className="min-w-0">
                   <p className="truncate text-[11px] font-semibold uppercase tracking-[0.14em] text-text-3 sm:text-xs">{copy.eyebrow}</p>
                   <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">{copy.title}</h1>
-                  <p className="mt-1 max-w-prose text-sm leading-5 text-text-3 max-sm:hidden">{copy.subtitle}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <ThemePicker value={themePreference} onChange={chooseTheme} />
@@ -1455,7 +1454,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:border-brand/35 hover:text-ink">Reset demo</button>}
               </div>
             </header>
-            {mode === 'demo' && <div className="oa-mode-strip mt-4" data-mode="judge"><div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><div className="min-w-0"><p className="text-xs font-semibold text-ink">Isolated judge demo</p><p className="oa-wrap-anywhere mt-0.5 text-[11px] text-text-3">Private synthetic judge workspace · no Google data</p></div></div><span className="oa-wrap-anywhere text-[11px] text-text-3">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing isolated storage…'}</span></div>}
+            {mode === 'demo' && <div className="oa-mode-strip mt-4" data-mode="judge"><div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><p className="text-xs font-semibold text-ink">Judge demo</p><span className="rounded-full border border-accent/20 bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent-strong">Synthetic data</span></div><span className="oa-wrap-anywhere text-[11px] text-text-3">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing demo'}</span></div>}
             {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} toolCount={webMcpTools.length} />}
             <div key={view} className="oa-view-in py-7">
               {mode === 'live' ? (
@@ -1493,29 +1492,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
 
 function JudgeQuickStart({ onNavigate, toolCount }: { onNavigate: (view: WorkspaceView) => void; toolCount: number }) {
   return (
-    <section aria-labelledby="judge-quick-start" className="mt-4 overflow-hidden rounded-2xl border border-hairline bg-wash/60">
-      <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3.5 sm:px-5">
-        <div className="min-w-0">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Judge quick start</p>
-          <h2 id="judge-quick-start" className="mt-1 text-sm font-semibold text-ink">Ask ChatGPT to work with this visible workspace</h2>
-          <p className="mt-1 max-w-2xl text-xs leading-5 text-text-3">Reads happen immediately. Any change opens an exact preview here and waits for your approval.</p>
-        </div>
-        <span className="shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">{toolCount} WebMCP tools</span>
-      </div>
-      <div className="grid border-t border-hairline md:grid-cols-3">
-        <button type="button" onClick={() => onNavigate('inbox')} className="group px-4 py-3 text-left transition hover:bg-brand/5 focus-visible:bg-brand/5 focus-visible:outline-none sm:px-5 md:border-r md:border-hairline">
-          <span className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3 group-hover:text-brand">1 · Understand</span>
-          <span className="mt-1 block text-xs leading-5 text-text-2">“Show my daily brief and focus the most urgent unread message.”</span>
-        </button>
-        <button type="button" onClick={() => onNavigate('supplies')} className="group border-t border-hairline px-4 py-3 text-left transition hover:bg-brand/5 focus-visible:bg-brand/5 focus-visible:outline-none sm:px-5 md:border-r md:border-t-0 md:border-hairline">
-          <span className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3 group-hover:text-brand">2 · Find</span>
-          <span className="mt-1 block text-xs leading-5 text-text-2">“Find a USB-C Security Key and prepare one in the cart.”</span>
-        </button>
-        <button type="button" onClick={() => onNavigate('activity')} className="group border-t border-hairline px-4 py-3 text-left transition hover:bg-brand/5 focus-visible:bg-brand/5 focus-visible:outline-none sm:px-5 md:border-t-0">
-          <span className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3 group-hover:text-brand">3 · Verify</span>
-          <span className="mt-1 block text-xs leading-5 text-text-2">Approve the preview, then see the verified result in Activity.</span>
-        </button>
-      </div>
+    <section aria-labelledby="judge-quick-start" className="mt-4 flex flex-wrap items-center gap-2 rounded-2xl border border-hairline bg-wash/60 p-2.5">
+      <h2 id="judge-quick-start" className="sr-only">Judge demo flow</h2>
+      <span className="px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Demo flow</span>
+      <button type="button" onClick={() => onNavigate('inbox')} className="oa-demo-step"><span>1</span> Read priority</button>
+      <button type="button" onClick={() => onNavigate('supplies')} className="oa-demo-step"><span>2</span> Prepare cart</button>
+      <button type="button" onClick={() => onNavigate('activity')} className="oa-demo-step"><span>3</span> Verify action</button>
+      <span className="ml-auto shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">{toolCount} tools</span>
     </section>
   );
 }
@@ -1637,7 +1620,7 @@ function VoiceThreadPicker({ threads, selectedId, loading, connected, onSelect, 
           return <option key={thread.id} value={thread.id}>{label.slice(0, 90)}</option>;
         })}
       </select>
-      <p className="mt-2 text-[11px] leading-4 text-text-3">{connected ? 'Stop voice before changing conversations.' : selectedId ? 'Voice will continue this saved conversation.' : 'Voice will start a new saved conversation.'}</p>
+      <p className="mt-2 text-[10px] text-text-4">{connected ? 'Stop voice to switch' : selectedId ? 'Resume selected chat' : 'Start a new chat'}</p>
     </div>
   );
 }
@@ -1660,7 +1643,7 @@ function VoicePicker({ value, connected, onChange }: { value: RealtimeVoice; con
 
 function DemoVoiceChoice({ value, connected, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; policy: JudgeVoicePolicy; onChange: (access: DemoVoiceAccess) => void }) {
   const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
-    { id: 'subscription', title: 'Included judge voice', detail: 'Private synthetic demo · saved separately for this judge' },
+    { id: 'subscription', title: 'Included judge voice', detail: 'Private demo session' },
   ];
   return (
     <div role="radiogroup" aria-label="Demo voice access" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
@@ -1674,23 +1657,55 @@ function DemoVoiceChoice({ value, connected, onChange }: { value: DemoVoiceAcces
   );
 }
 
+type ActivityItem = (typeof DEMO_ACTIVITY)[number] & { count: number };
+
+function groupActivity(items: typeof DEMO_ACTIVITY): ActivityItem[] {
+  const grouped: ActivityItem[] = [];
+  const bySignature = new Map<string, ActivityItem>();
+  for (const item of items) {
+    const signature = `${item.actor}:${item.type}:${item.action}`;
+    const existing = bySignature.get(signature);
+    if (existing) {
+      existing.count += 1;
+      continue;
+    }
+    const next = { ...item, count: 1 };
+    grouped.push(next);
+    bySignature.set(signature, next);
+  }
+  return grouped;
+}
+
+function activityTitle(action: string): string {
+  const title = action.replace(/^(Read|Approved|Policy action):\s*/i, '');
+  const labels: Record<string, string> = {
+    'List workspace accounts': 'Checked connected accounts',
+    'Get daily brief': 'Built daily brief',
+    'Find tasks': 'Checked tasks',
+    'Search mail': 'Searched inboxes',
+    'List notes': 'Checked notes',
+    'List calendar': 'Checked calendar',
+  };
+  return labels[title] ?? title;
+}
+
 function ActivityRail({ activity, toast, voiceStatus, voiceStateLabel, voiceConnected, orbPhase, voiceMeter, onOpenVoice, onOpenActivity }: { activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voiceStateLabel: string; voiceConnected: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; onOpenVoice: () => void; onOpenActivity: () => void }) {
+  const groupedActivity = groupActivity(activity);
   return (
     <aside className="min-w-0 border-l border-hairline bg-transparent px-5 py-7 max-xl:hidden">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="truncate font-semibold">Workspace activity</h2>
-          <p className="mt-1 oa-clamp-1 text-xs text-text-3">Every action stays visible.</p>
+          <h2 className="truncate font-semibold">Agent activity</h2>
         </div>
         <span className="shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">WebMCP</span>
       </div>
       <div className="mt-6 space-y-1">
-        {activity.length ? activity.slice(0, 5).map((item) => (
-          <button key={item.id} onClick={onOpenActivity} className="block w-full rounded-xl px-3 py-2.5 text-left transition hover:bg-wash hover:shadow-[inset_0_0_0_1px_var(--hairline-strong)]">
-            <p className="oa-clamp-2 text-sm leading-5 text-ink/90">{item.action}</p>
-            <p className="mt-1 oa-clamp-1 text-xs text-text-4">{item.actor} · {item.time}</p>
+        {groupedActivity.length ? groupedActivity.slice(0, 5).map((item) => (
+          <button key={item.id} onClick={onOpenActivity} data-kind={item.type} className="oa-activity-item block w-full rounded-xl px-3 py-2.5 text-left transition">
+            <div className="flex items-start gap-2"><p className="oa-clamp-2 min-w-0 flex-1 text-sm leading-5 text-ink/90">{activityTitle(item.action)}</p>{item.count > 1 && <span className="rounded-full bg-wash-strong px-1.5 py-0.5 text-[9px] font-semibold text-text-2">×{item.count}</span>}</div>
+            <p className="mt-1 oa-clamp-1 text-xs text-text-4">{item.type === 'write' ? 'Changed' : 'Read'} · {item.actor} · {item.time}</p>
           </button>
-        )) : <div className="rounded-2xl border border-dashed border-hairline px-4 py-5 text-center"><p className="text-xs font-medium text-text-2">No session activity yet</p><p className="mt-1 text-[11px] leading-4 text-text-4">Reads and approved changes will appear here.</p></div>}
+        )) : <div className="rounded-2xl border border-dashed border-hairline px-4 py-5 text-center"><p className="text-xs font-medium text-text-2">No activity yet</p></div>}
       </div>
       <div className="mt-8 border-t border-hairline pt-6">
         <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Voice</p>
@@ -1703,9 +1718,8 @@ function ActivityRail({ activity, toast, voiceStatus, voiceStateLabel, voiceConn
           </span>
         </button>
       </div>
-      <div aria-live="polite" className="mt-7 rounded-2xl border border-hairline bg-wash p-4">
-        <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4"><span aria-hidden="true" className={`inline-block h-1.5 w-1.5 rounded-full ${toastSeverity(toast) === 'error' ? 'bg-danger' : toastSeverity(toast) === 'success' ? 'bg-success' : 'bg-text-4'}`} />Latest status</p>
-        <p className="mt-2 oa-clamp-3 text-xs leading-5 text-text-2">{toast}</p>
+      <div aria-live="polite" className="mt-7 rounded-xl border border-hairline bg-wash px-3 py-3">
+        <p className="flex items-start gap-2 text-xs leading-5 text-text-2"><span aria-hidden="true" className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${toastSeverity(toast) === 'error' ? 'bg-danger' : toastSeverity(toast) === 'success' ? 'bg-success' : 'bg-text-4'}`} /><span className="oa-clamp-2">{toast}</span></p>
       </div>
     </aside>
   );
@@ -1846,8 +1860,8 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
         </div>
 
         <div className="mt-3 grid gap-2 sm:grid-cols-2">
-          <div className="min-h-[72px] rounded-xl border border-hairline bg-wash/60 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-text-3">You</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.user || (connected ? 'Listening for your voice…' : 'Your live words will appear here.')}</p></div>
-          <div className="min-h-[72px] rounded-xl border border-accent/15 bg-accent/5 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.assistant || (connected ? 'Waiting to respond…' : 'The spoken answer will appear here.')}</p></div>
+          <div className="min-h-[72px] rounded-xl border border-hairline bg-wash/60 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-text-3">You</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.user || (connected ? 'Listening…' : 'Your words')}</p></div>
+          <div className="min-h-[72px] rounded-xl border border-accent/15 bg-accent/5 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.assistant || (connected ? 'Thinking…' : 'Agent response')}</p></div>
         </div>
         <p className="mt-1.5 text-center text-[9px] text-text-4">Live transcript only · not saved by the website</p>
 
@@ -1858,7 +1872,7 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
           </summary>
           <div className="grid gap-2 border-t border-hairline p-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} /><div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div></div>
         </details>
-        {mode === 'demo' && <p className="mt-2 rounded-lg border border-hairline bg-wash/60 px-3 py-2 text-[10px] leading-4 text-text-3">Uses only synthetic data and judge-safe WebMCP tools. Your session cannot access the owner Workspace.</p>}
+        {mode === 'demo' && <p className="mt-2 text-center text-[10px] font-medium text-accent-strong">Synthetic data only</p>}
         {prompt && <div className="mt-2 rounded-xl border border-brand/20 bg-brand/5 p-3"><p className="text-[11px] leading-4 text-text-2">Open the secure ChatGPT sign-in page, then enter this one-time code.</p><div className="mt-2 flex items-center gap-2"><a href={prompt.verificationUrl} target="_blank" rel="noreferrer" className="text-[11px] font-semibold text-brand underline underline-offset-4">Open sign-in</a><code className="ml-auto rounded-lg bg-field px-2.5 py-1.5 text-xs font-semibold tracking-[0.14em] text-ink">{prompt.userCode}</code></div></div>}
       </section>
     </aside>
@@ -1963,14 +1977,13 @@ function EmailRow({ id, item, selected, onOpen, onMarkRead }: {
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-start justify-between gap-3">
             <div className="min-w-0 flex-1">
-              <p className={`truncate text-sm ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}><bdi dir="auto">{senderLabel}</bdi></p>
-              {mailbox.email && mailbox.email !== senderLabel && <p dir="ltr" className="mt-0.5 truncate text-[11px] text-text-3">{mailbox.email}</p>}
+              <div className="flex min-w-0 items-center gap-2"><p className={`truncate text-sm ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}><bdi dir="auto">{senderLabel}</bdi></p>{message.urgent && <span className="shrink-0 rounded-full bg-danger/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-danger-strong">Important</span>}</div>
             </div>
             {message.time && <time className={`shrink-0 pt-0.5 text-[11px] font-medium tabular-nums ${message.unread ? 'text-brand-strong' : 'text-text-3'}`}>{message.time}</time>}
           </div>
           <p className={`mt-1.5 oa-clamp-1 text-[15px] leading-5 ${message.unread ? 'font-semibold text-ink' : 'font-medium text-text-2'}`}>{message.subject}</p>
-          {message.snippet && <p className="oa-mail-snippet mt-1 oa-clamp-2 text-[13px] leading-5 text-text-2">{message.snippet}</p>}
-          <div className="mt-2.5 flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-text-3">
+          {message.snippet && <p className="oa-mail-snippet mt-1 oa-clamp-1 text-[13px] leading-5 text-text-2">{message.snippet}</p>}
+          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-text-3">
             {message.account && <span className="max-w-full truncate rounded-md border border-hairline bg-wash px-2 py-0.5 text-text-2">{message.account}</span>}
             {message.hasAttachment && <span className="flex shrink-0 items-center gap-1"><PaperclipIcon />Attachment</span>}
             {onMarkRead && message.unread && <button type="button" onClick={(event) => { event.stopPropagation(); onMarkRead(); }} className="pointer-events-auto relative z-10 ml-auto min-h-11 shrink-0 rounded-lg border border-hairline-strong bg-surface px-3 py-2 text-[11px] font-medium text-text-2 transition hover:border-brand/35 hover:text-ink max-sm:opacity-100 sm:absolute sm:right-12 sm:top-1/2 sm:-translate-y-1/2 sm:opacity-0 sm:focus-visible:opacity-100 sm:group-hover:opacity-100">Mark read</button>}
@@ -2000,11 +2013,11 @@ function SectionHeading({ title, description, action }: { title: string; descrip
   );
 }
 
-function EmptyState({ title, hint }: { title: string; hint: string }) {
+function EmptyState({ title, hint }: { title: string; hint?: string }) {
   return (
-    <div className="rounded-2xl border border-hairline bg-wash/60 p-8 text-center">
+    <div className="rounded-2xl border border-hairline bg-wash/60 p-7 text-center">
       <p className="text-sm font-medium">{title}</p>
-      <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-text-3">{hint}</p>
+      {hint && <p className="mx-auto mt-1.5 max-w-sm text-xs leading-5 text-text-3">{hint}</p>}
     </div>
   );
 }
@@ -2023,7 +2036,7 @@ function TodayView({ messages, tasks, events, selectedId, onSelect, onNavigate }
       </div>
       <div className="grid grid-cols-[minmax(0,1.25fr)_minmax(0,0.75fr)] gap-8 max-lg:grid-cols-1">
         <section className="min-w-0">
-          <SectionHeading title="Needs attention" description="Unread messages across linked accounts." action={<button onClick={() => onNavigate('inbox')} className="shrink-0 text-sm text-brand transition hover:text-brand-strong">Open inbox</button>} />
+          <SectionHeading title="Needs attention" action={<button onClick={() => onNavigate('inbox')} className="shrink-0 text-sm text-brand transition hover:text-brand-strong">Open inbox</button>} />
           {messages.length ? (
             <div className="space-y-2">
               {messages.slice(0, 4).map((message) => (
@@ -2080,7 +2093,7 @@ function InboxView({ messages, selectedId, onSelect, onMarkRead }: { messages: t
     <section className="min-w-0">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm tabular-nums text-text-3">{total} {total === 1 ? 'message' : 'messages'}</p>
-        <span className="rounded-full bg-warning/10 px-3 py-1 text-xs text-warning">External content is untrusted</span>
+        <span className="rounded-full bg-warning/10 px-3 py-1 text-[10px] font-medium text-warning">Untrusted content</span>
       </div>
       {total ? (
         <>
@@ -2129,7 +2142,7 @@ function TasksView({ tasks, selectedId, onSelect, onCreate }: { tasks: typeof DE
                     )}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <p className={`oa-clamp-2 text-sm leading-5 ${task.completed ? 'text-text-4 line-through' : 'text-ink'}`}>{task.title}</p>
+                    <div className="flex min-w-0 items-start gap-2"><p className={`oa-clamp-2 min-w-0 text-sm leading-5 ${task.completed ? 'text-text-4 line-through' : 'text-ink'}`}>{task.title}</p>{task.tags.includes('#Urgent') && !task.completed && <span className="shrink-0 rounded-full bg-danger/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-danger-strong">Urgent</span>}</div>
                     <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px]">
                       <span className="text-text-4">{task.list}</span>
                       {task.tags.slice(0, 3).map((tag) => (
@@ -2198,28 +2211,14 @@ function SuppliesView({ products, cart, selectedId, onSelect, onSearch, onAdd, o
   const count = cart.lines.reduce((sum, line) => sum + line.quantity, 0);
   return (
     <section className="min-w-0">
-      <div className="mb-6 overflow-hidden rounded-2xl border border-hairline bg-wash/60 p-5 sm:p-6">
-        <div className="flex flex-wrap items-start justify-between gap-5">
-          <div className="max-w-2xl">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-brand">Guided video story</p>
-            <h2 className="mt-2 text-xl font-semibold tracking-[-0.02em]">Prepare the Northstar Friday security kit</h2>
-            <p className="mt-2 text-sm leading-6 text-text-2">The agent connects an urgent email and open task to a real Shopify dev-store search, then prepares a synthetic cart only after approval.</p>
-          </div>
-          <div className="min-w-[180px] rounded-2xl border border-hairline-strong bg-field px-4 py-3">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">Prepared cart</p>
-            <p className="mt-1 text-2xl font-semibold tabular-nums">{count}</p>
-            <p className="text-xs text-text-3">{count === 1 ? 'item' : 'items'} · {cart.currency} {cart.total.toFixed(2)}</p>
-          </div>
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-hairline bg-wash/60 px-5 py-4">
+        <div className="min-w-0">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Demo task</p>
+          <h2 className="mt-1 truncate text-base font-semibold">Prepare the Northstar security kit</h2>
         </div>
-        <div className="mt-5 grid gap-3 border-t border-hairline pt-5 md:grid-cols-2">
-          <div className="rounded-2xl border border-brand/20 bg-field p-4">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Demo video · fixed story</p>
-            <p className="mt-2 text-sm text-ink/90">Find the urgent security work, search for a USB-C Security Key, preview the cart change, approve it, and show the verified result.</p>
-          </div>
-          <div className="rounded-2xl border border-hairline-strong bg-field p-4">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-3">Judge test · free sandbox</p>
-            <p className="mt-2 text-sm text-ink/90">Search any of the six products, prepare a separate cart, clear it, and reset the full workspace without touching another judge.</p>
-          </div>
+        <div className="flex shrink-0 items-baseline gap-2 rounded-xl border border-hairline-strong bg-field px-3 py-2">
+          <span className="text-xl font-semibold tabular-nums">{count}</span>
+          <span className="text-xs text-text-3">{cart.currency} {cart.total.toFixed(2)}</span>
         </div>
       </div>
 
@@ -2230,7 +2229,7 @@ function SuppliesView({ products, cart, selectedId, onSelect, onSearch, onAdd, o
 
       <div className="mb-3 flex items-center justify-between gap-3">
         <p className="text-sm text-text-3">{products.length} Shopify {products.length === 1 ? 'result' : 'results'}</p>
-        <span className="rounded-full bg-warning/10 px-3 py-1 text-[11px] text-warning">Catalog text is untrusted</span>
+        <span className="rounded-full bg-warning/10 px-3 py-1 text-[10px] font-medium text-warning">Untrusted catalog</span>
       </div>
       {products.length ? <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1 2xl:grid-cols-3">
         {products.map((product) => (
@@ -2251,8 +2250,8 @@ function SuppliesView({ products, cart, selectedId, onSelect, onSearch, onAdd, o
       </div> : <EmptyState title="No supplies found." hint="Try a broader search, or reset the judge demo." />}
 
       <div className="mt-7 rounded-2xl border border-hairline bg-wash/60 p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3"><div><p className="font-medium">Judge-isolated cart</p><p className="mt-1 text-xs text-text-3">Each judge gets a separate Shopify cart pointer. Checkout and payment tools are never exposed.</p></div>{cart.lines.length > 0 && <button onClick={onClear} className="rounded-xl border border-danger/25 px-3 py-2 text-xs text-danger-strong transition hover:border-danger/50">Clear cart</button>}</div>
-        {cart.lines.length ? <div className="mt-4 space-y-2">{cart.lines.map((line) => <div key={line.id} className="flex items-center justify-between gap-4 rounded-xl border border-hairline bg-field px-4 py-3"><div className="min-w-0"><p className="truncate text-sm">{line.title}</p><p className="mt-0.5 text-xs text-text-3">Quantity {line.quantity}</p></div><p className="shrink-0 text-sm font-medium text-brand">{line.currency} {(line.price * line.quantity).toFixed(2)}</p></div>)}</div> : <p className="mt-4 text-sm text-text-3">Nothing prepared yet. Ask the agent to find a security key or travel kit.</p>}
+        <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><p className="font-medium">Prepared cart</p><span className="rounded-full border border-accent/20 bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent-strong">No checkout</span></div>{cart.lines.length > 0 && <button onClick={onClear} className="rounded-xl border border-danger/25 px-3 py-2 text-xs text-danger-strong transition hover:border-danger/50">Clear cart</button>}</div>
+        {cart.lines.length ? <div className="mt-4 space-y-2">{cart.lines.map((line) => <div key={line.id} className="flex items-center justify-between gap-4 rounded-xl border border-hairline bg-field px-4 py-3"><div className="min-w-0"><p className="truncate text-sm">{line.title}</p><p className="mt-0.5 text-xs text-text-3">Qty {line.quantity}</p></div><p className="shrink-0 text-sm font-medium text-brand">{line.currency} {(line.price * line.quantity).toFixed(2)}</p></div>)}</div> : <p className="mt-4 text-sm text-text-3">Cart is empty.</p>}
       </div>
     </section>
   );
@@ -2282,7 +2281,7 @@ function NotesView({ mode, notes, onCreate, onOpen }: { mode: Mode; notes: typeo
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="notes" onPage={setPage} />
         </>
       ) : <EmptyState title="No notes yet." hint="Notes hold long reference material that would clutter a task." />}
-      <p className="mt-7 max-w-2xl text-sm leading-6 text-text-3">{mode === 'demo' ? 'These synthetic notes are isolated to this browser session and automatically removed after 24 hours.' : 'OpenAssist creates a Drive note only when reference material is genuinely too long for a task. Short actions stay as clean Google Tasks.'}</p>
+      <p className="mt-5 text-[11px] text-text-4">{mode === 'demo' ? 'Temporary demo storage' : 'Stored in Drive'}</p>
     </section>
   );
 }
@@ -2292,7 +2291,7 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
   return (
     <section className="min-w-0">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <p className="oa-clamp-1 text-sm text-text-3">Strict quality gate · no raw email stored</p>
+        <span className="rounded-full border border-success/20 bg-success/5 px-3 py-1 text-[10px] font-medium text-success-strong">Approved facts only</span>
         <button onClick={onRemember} className="shrink-0 rounded-xl border border-brand/30 px-4 py-2 text-sm text-brand transition hover:border-brand/60 hover:text-brand-strong">Remember a fact</button>
       </div>
       {total ? (
@@ -2310,10 +2309,7 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
           <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="facts" onPage={setPage} />
         </>
       ) : <EmptyState title="No saved facts." hint="Durable preferences appear here once you approve them." />}
-      <div className="mt-7 rounded-2xl border border-hairline bg-wash p-5">
-        <p className="font-medium">Storage boundary</p>
-        <p className="mt-2 text-sm leading-6 text-text-3">{mode === 'demo' ? 'Synthetic memory is stored only in this isolated Cloudflare demo workspace and expires after 24 hours.' : 'Memory text lives in one private Google Drive document. The website stores only its encrypted connection and document pointer.'}</p>
-      </div>
+      <p className="mt-5 text-[11px] text-text-4">{mode === 'demo' ? 'Temporary demo memory' : 'Private Drive memory'}</p>
     </section>
   );
 }
@@ -2321,10 +2317,7 @@ function MemoryView({ mode, memory, onRemember }: { mode: Mode; memory: typeof D
 function AccountsView({ mode, accounts }: { mode: Mode; accounts: DemoAccount[] }) {
   return (
     <section className="min-w-0">
-      <div className="mb-6 rounded-2xl border border-hairline bg-wash p-5">
-        <p className="text-sm font-medium">{mode === 'demo' ? 'Synthetic accounts' : 'Owner connection required'}</p>
-        <p className="mt-2 text-sm leading-6 text-text-3">{mode === 'demo' ? 'These are safe sample identities. Judge actions never touch your Google accounts and are removed automatically.' : 'Google credentials remain managed by Composio. OpenAssist never receives the Google refresh token.'}</p>
-      </div>
+      <div className="mb-5 flex items-center justify-between gap-3"><span className="rounded-full border border-hairline-strong bg-wash px-3 py-1 text-[10px] font-medium text-text-2">{mode === 'demo' ? 'Synthetic accounts' : 'Private connections'}</span><span className="text-xs tabular-nums text-text-3">{accounts.length} connected</span></div>
       {accounts.length ? (
         <div className="space-y-3">
           {accounts.map((account, index) => (
@@ -2589,7 +2582,7 @@ function LiveWorkspaceView({ view, live, query, selectedId, ownerCode, onOwnerCo
   return (
     <section className="min-w-0">
       <div className="oa-mode-strip mb-6" data-mode="owner">
-        <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><div className="min-w-0"><p className="text-xs font-semibold text-ink">Private live</p><p className="mt-0.5 oa-clamp-2 text-[11px] leading-5 text-text-3">Connected Google data · nothing below is copied into the site database.</p></div></div>
+        <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><p className="text-xs font-semibold text-ink">Private live</p><span className="rounded-full border border-teal/20 bg-teal/10 px-2 py-0.5 text-[10px] font-medium text-teal-strong">Google connected</span></div>
         <button onClick={onReconnect} className="shrink-0 rounded-lg border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:text-ink">Connection</button>
       </div>
       {live.warning && <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-warning/20 bg-warning/5 px-4 py-3 text-sm text-warning-strong"><span>Refresh failed. Showing the last loaded Workspace data.</span><button onClick={onRetry} className="rounded-lg border border-warning/25 px-3 py-1.5 text-xs font-semibold text-brand-strong">Retry</button></div>}
@@ -2639,9 +2632,9 @@ function LiveTodayDashboard({ rows, selectedId, onOpenItem }: { rows: Array<Reco
   const tasks = rows.filter((item) => item._kind === 'Task');
   const events = rows.filter((item) => item._kind === 'Calendar');
   const sections = [
-    { id: 'mail', label: 'Needs attention', detail: 'Unread across connected Gmail accounts', rows: mail.slice(0, 5), empty: 'No unread mail needs attention.' },
-    { id: 'tasks', label: 'Next actions', detail: 'Open tasks from your default Tasks account', rows: tasks.slice(0, 5), empty: 'Your active task list is clear.' },
-    { id: 'calendar', label: 'On your calendar', detail: 'Events scheduled for today', rows: events.slice(0, 5), empty: 'No events are scheduled today.' },
+    { id: 'mail', label: 'Needs attention', rows: mail.slice(0, 5), empty: 'No unread mail.' },
+    { id: 'tasks', label: 'Next actions', rows: tasks.slice(0, 5), empty: 'No open tasks.' },
+    { id: 'calendar', label: 'Calendar', rows: events.slice(0, 5), empty: 'No events today.' },
   ];
 
   return (
@@ -2667,7 +2660,6 @@ function LiveTodayDashboard({ rows, selectedId, onOpenItem }: { rows: Array<Reco
                 <h2 id={`today-${section.id}`} className="text-sm font-semibold text-ink">{section.label}</h2>
                 <span className="rounded-full border border-hairline bg-wash px-2 py-0.5 text-[10px] font-semibold tabular-nums text-text-2">{section.rows.length}</span>
               </div>
-              <p className="mt-1 text-[11px] leading-5 text-text-4">{section.detail}</p>
             </header>
             {section.rows.length ? (
               <div className="divide-y divide-hairline">
@@ -2702,29 +2694,42 @@ function LiveTodayDashboard({ rows, selectedId, onOpenItem }: { rows: Array<Reco
 }
 
 function ActivityView({ mode, activity, owner = false, onVoicePolicyChanged }: { mode: Mode; activity: typeof DEMO_ACTIVITY; owner?: boolean; onVoicePolicyChanged?: () => void }) {
-  const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(activity, PAGE_SIZE, activity.length);
+  const [filter, setFilter] = useState<'all' | 'write' | 'read'>('all');
+  const grouped = useMemo(() => groupActivity(activity), [activity]);
+  const visible = useMemo(() => filter === 'all' ? grouped : grouped.filter((item) => item.type === filter), [filter, grouped]);
+  const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(visible, PAGE_SIZE, `${filter}-${grouped.length}`);
   return (
     <section className="min-w-0">
       {mode === 'live' && owner && <JudgeVoiceAdmin onChanged={onVoicePolicyChanged} />}
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2" role="group" aria-label="Filter activity">
+          {([['all', 'All'], ['write', 'Changes'], ['read', 'Reads']] as const).map(([value, label]) => (
+            <button key={value} type="button" onClick={() => setFilter(value)} aria-pressed={filter === value} className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${filter === value ? 'bg-brand text-brand-ink' : 'bg-wash text-text-2 hover:bg-wash-strong hover:text-ink'}`}>{label}</button>
+          ))}
+        </div>
+        <div className="flex items-center gap-3 text-[11px] text-text-3"><span><b className="text-brand-strong">{grouped.filter((item) => item.type === 'write').length}</b> changes</span><span>{grouped.filter((item) => item.type === 'read').length} reads</span></div>
+      </div>
       {total ? (
         <>
           <div className="space-y-2">
             {pageItems.map((item) => (
-              <HaloRow key={item.id} id={item.id} selected={false}>
+              <article key={item.id} id={`workspace-item-${item.id}`} data-kind={item.type} className="oa-activity-card rounded-xl border px-4 py-3.5">
                 <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <p className="oa-clamp-2 text-sm">{item.action}</p>
-                    <p className="mt-1 oa-clamp-1 text-xs text-text-3">{item.actor} · {item.type === 'write' ? 'Approved write' : 'Read only'}</p>
+                  <div className="flex min-w-0 flex-1 items-start gap-3">
+                    <span aria-hidden="true" className="oa-activity-card__icon mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg text-xs font-bold">{item.type === 'write' ? '✓' : '↗'}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start gap-2"><p className="oa-clamp-2 min-w-0 text-sm font-medium">{activityTitle(item.action)}</p>{item.count > 1 && <span className="shrink-0 rounded-full bg-wash-strong px-2 py-0.5 text-[10px] font-semibold text-text-2">×{item.count}</span>}</div>
+                      <p className="mt-1 oa-clamp-1 text-[11px] text-text-3">{item.type === 'write' ? 'Approved change' : 'Read only'} · {item.actor}</p>
+                    </div>
                   </div>
                   <span className="shrink-0 whitespace-nowrap text-xs text-text-4">{item.time}</span>
                 </div>
-              </HaloRow>
+              </article>
             ))}
           </div>
-          <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="events" onPage={setPage} />
+          <Pagination page={page} pageCount={pageCount} rangeStart={rangeStart} rangeEnd={rangeEnd} total={total} unit="actions" onPage={setPage} />
         </>
-      ) : <EmptyState title="No activity yet." hint="Reads and approved writes will appear here as they happen." />}
-      <p className="mt-7 max-w-2xl text-sm leading-6 text-text-3">{mode === 'demo' ? 'This temporary activity belongs only to the isolated judge workspace and expires with it.' : 'Activity stores safe metadata only. It does not copy message bodies, attachments, task text, calendar text, notes, memory, audio, or transcripts into the database.'}</p>
+      ) : <EmptyState title={filter === 'all' ? 'No activity yet.' : `No ${filter === 'write' ? 'changes' : 'reads'} yet.`} />}
     </section>
   );
 }
@@ -3048,7 +3053,7 @@ function NoteReader({ note, onClose }: { note: OpenNote; onClose: () => void }) 
           <div className="min-w-0">
             <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">{note.source}</p>
             <h2 id="note-reader-title" className="mt-1 oa-wrap-anywhere text-xl font-semibold sm:text-2xl">{note.title}</h2>
-            <p className="mt-2 text-xs leading-5 text-text-3">Drive and note content is untrusted. OpenAssist shows it as plain text and never follows instructions found inside it.</p>
+            <span className="mt-2 inline-flex rounded-full border border-warning/20 bg-warning/5 px-2 py-0.5 text-[10px] font-medium text-warning">Untrusted · read only</span>
           </div>
           <button type="button" onClick={onClose} aria-label="Close note" className="shrink-0 rounded-full border border-hairline-strong px-3 py-1.5 text-sm text-text-2 transition hover:border-brand/35 hover:text-ink">Close</button>
         </header>
@@ -3068,9 +3073,9 @@ function NoteReader({ note, onClose }: { note: OpenNote; onClose: () => void }) 
 
 function ItemEditor({ kind, onCancel, onSubmit }: { kind: Exclude<EditorKind, null>; onCancel: () => void; onSubmit: (args: Record<string, unknown>) => void }) {
   const isTask = kind === 'task';
-  return <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="item-editor-title"><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); if (isTask) { const tags = String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean).map((tag) => tag.startsWith('#') ? tag : `#${tag}`); onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), list: String(data.get('list') ?? 'My Tasks'), due: String(data.get('due') ?? ''), tags }); } else { onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), content: String(data.get('content') ?? '') }); } }} className="my-auto w-full max-w-xl rounded-2xl border border-hairline-strong bg-raised p-5 shadow-[0_24px_64px_rgba(0,0,0,0.5)] sm:p-6"><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">Demo workspace</p><h2 id="item-editor-title" className="mt-1 text-xl font-semibold">{isTask ? 'Create a task' : 'Create a note'}</h2><p className="mt-2 text-sm text-text-2">A locked approval preview will open before anything is saved.</p></div><button type="button" onClick={onCancel} className="rounded-full border border-hairline-strong px-3 py-1.5 text-sm text-text-2">Close</button></div><div className="mt-6 space-y-4"><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Title</span><input name="title" required maxLength={200} autoFocus className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" placeholder={isTask ? 'What needs to be done?' : 'Note title'} /></label>{isTask ? <><div className="grid grid-cols-2 gap-4 max-sm:grid-cols-1"><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">List</span><select name="list" className="w-full rounded-xl border border-hairline-strong bg-surface px-4 py-3 text-sm outline-none focus:border-brand/50"><option>My Tasks</option><option>Backlog</option></select></label><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Due date</span><input name="due" type="date" className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" /></label></div><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Tags</span><input name="tags" maxLength={240} className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" placeholder="Launch, Work" /></label></> : <label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Content</span><textarea name="content" required maxLength={20000} rows={9} className="w-full resize-y rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm leading-6 outline-none focus:border-brand/50" placeholder="Add useful reference material…" /></label>}</div><div className="mt-6 flex justify-end gap-3 max-sm:flex-col-reverse"><button type="button" onClick={onCancel} className="rounded-xl border border-hairline-strong px-4 py-2.5 text-sm transition hover:border-hairline-strong">Cancel</button><button type="submit" className="oa-btn-primary rounded-xl px-5 py-2.5 text-sm font-semibold">Review before saving</button></div></form></div>;
+  return <div className="fixed inset-0 z-[60] grid place-items-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="item-editor-title"><form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); if (isTask) { const tags = String(data.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean).map((tag) => tag.startsWith('#') ? tag : `#${tag}`); onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), list: String(data.get('list') ?? 'My Tasks'), due: String(data.get('due') ?? ''), tags }); } else { onSubmit({ account: 'Main', title: String(data.get('title') ?? ''), content: String(data.get('content') ?? '') }); } }} className="my-auto w-full max-w-xl rounded-2xl border border-hairline-strong bg-raised p-5 shadow-[0_24px_64px_rgba(0,0,0,0.5)] sm:p-6"><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">Demo workspace</p><h2 id="item-editor-title" className="mt-1 text-xl font-semibold">{isTask ? 'Create a task' : 'Create a note'}</h2></div><button type="button" onClick={onCancel} className="rounded-full border border-hairline-strong px-3 py-1.5 text-sm text-text-2">Close</button></div><div className="mt-6 space-y-4"><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Title</span><input name="title" required maxLength={200} autoFocus className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" placeholder={isTask ? 'What needs to be done?' : 'Note title'} /></label>{isTask ? <><div className="grid grid-cols-2 gap-4 max-sm:grid-cols-1"><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">List</span><select name="list" className="w-full rounded-xl border border-hairline-strong bg-surface px-4 py-3 text-sm outline-none focus:border-brand/50"><option>My Tasks</option><option>Backlog</option></select></label><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Due date</span><input name="due" type="date" className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" /></label></div><label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Tags</span><input name="tags" maxLength={240} className="w-full rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm outline-none focus:border-brand/50" placeholder="Launch, Work" /></label></> : <label className="block"><span className="mb-2 block text-xs font-medium text-text-2">Content</span><textarea name="content" required maxLength={20000} rows={9} className="w-full resize-y rounded-xl border border-hairline-strong bg-field px-4 py-3 text-sm leading-6 outline-none focus:border-brand/50" placeholder="Add useful reference material…" /></label>}</div><div className="mt-6 flex justify-end gap-3 max-sm:flex-col-reverse"><button type="button" onClick={onCancel} className="rounded-xl border border-hairline-strong px-4 py-2.5 text-sm transition hover:border-hairline-strong">Cancel</button><button type="submit" className="oa-btn-primary rounded-xl px-5 py-2.5 text-sm font-semibold">Review</button></div></form></div>;
 }
 
 function ApprovalDrawer({ action, onCancel, onApprove }: { action: PendingAction; onCancel: () => void; onApprove: () => void }) {
-  return <aside className="oa-approval-dock" aria-labelledby="approval-title"><div className="oa-approval-dock__panel"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-warning">Approval required</p><h2 id="approval-title" className="mt-1 oa-wrap-anywhere text-base font-semibold">{action.title}</h2><p className="mt-1 text-xs leading-5 text-text-2">Review this exact change while the workspace remains visible.</p></div><button onClick={onCancel} aria-label="Cancel approval" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-hairline-strong text-lg text-text-2 transition hover:border-brand/35 hover:text-ink">×</button></div><dl className="mt-3 max-h-[26vh] space-y-1.5 overflow-y-auto rounded-xl bg-field p-3">{compactArgs(action.args).map(({ key, value }) => <div key={key} className="grid grid-cols-[minmax(72px,96px)_minmax(0,1fr)] gap-2 text-xs max-sm:grid-cols-1 max-sm:gap-0.5"><dt className="oa-wrap-anywhere text-text-3">{key}</dt><dd className="oa-wrap-anywhere text-ink/90">{value}</dd></div>)}</dl>{action.destructive ? <p className="mt-3 rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs leading-5 text-danger-strong">A screen tap is required. Voice confirmation cannot approve it.</p> : <p className="mt-3 text-xs leading-5 text-text-2">Tap Approve or say “confirm” while this preview is active.</p>}<div className="mt-3 flex justify-end gap-2"><button onClick={onCancel} className="rounded-lg border border-hairline-strong px-3.5 py-2 text-xs transition hover:border-hairline-strong">Cancel</button><button onClick={onApprove} className={`rounded-lg px-4 py-2 text-xs font-semibold ${action.destructive ? 'bg-danger text-brand-ink' : 'oa-btn-primary'}`}>Approve</button></div></div></aside>;
+  return <aside className="oa-approval-dock" aria-labelledby="approval-title"><div className="oa-approval-dock__panel"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-warning">Approve change</p><h2 id="approval-title" className="mt-1 oa-wrap-anywhere text-base font-semibold">{action.title}</h2></div><button onClick={onCancel} aria-label="Cancel approval" className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-hairline-strong text-lg text-text-2 transition hover:border-brand/35 hover:text-ink">×</button></div><dl className="mt-3 max-h-[26vh] space-y-1.5 overflow-y-auto rounded-xl bg-field p-3">{compactArgs(action.args).map(({ key, value }) => <div key={key} className="grid grid-cols-[minmax(72px,96px)_minmax(0,1fr)] gap-2 text-xs max-sm:grid-cols-1 max-sm:gap-0.5"><dt className="oa-wrap-anywhere text-text-3">{key}</dt><dd className="oa-wrap-anywhere text-ink/90">{value}</dd></div>)}</dl>{action.destructive ? <p className="mt-3 rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs leading-5 text-danger-strong">Screen tap required. Voice cannot approve this.</p> : <p className="mt-3 text-xs text-text-2">Tap Approve or say “confirm”.</p>}<div className="mt-3 flex justify-end gap-2"><button onClick={onCancel} className="rounded-lg border border-hairline-strong px-3.5 py-2 text-xs transition hover:border-hairline-strong">Cancel</button><button onClick={onApprove} className={`rounded-lg px-4 py-2 text-xs font-semibold ${action.destructive ? 'bg-danger text-brand-ink' : 'oa-btn-primary'}`}>Approve</button></div></div></aside>;
 }

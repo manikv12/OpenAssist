@@ -19,11 +19,11 @@ test('Second Brain is an owner-only Work view with the five intended sections', 
   for (const label of ['Capture', 'Projects', 'Knowledge', 'Agent work', 'Memory sources']) {
     assert.match(work, new RegExp(`label: '${label}'`));
   }
-  assert.match(work, /never conversation history/);
-  assert.match(work, /Device IDs stay stable when a Mac is renamed/);
+  assert.match(work, /Approved memory sources/);
+  assert.match(work, /No chat history/);
   assert.match(work, /Inbox — organize later/);
   assert.match(work, /stage: selectedProject \? 'backlog' : 'inbox'/);
-  assert.match(work, /Organize captured ideas/);
+  assert.match(work, /Organize inbox/);
   assert.match(work, /workspace_organize_inbox_item/);
   assert.match(work, /Add to Google Tasks/);
   assert.match(work, /In Google Tasks/);

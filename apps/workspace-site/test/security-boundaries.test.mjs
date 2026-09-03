@@ -233,7 +233,7 @@ test('notes open through the read tool and render untrusted content as plain tex
   const mcp = await read('lib/mcp-client.ts');
   assert.match(app, /invokeTool\('workspace_read_note'/);
   assert.match(app, /function NoteReader/);
-  assert.match(app, /Drive and note content is untrusted/);
+  assert.match(app, /Untrusted · read only/);
   assert.match(app, /<pre className=/);
   assert.doesNotMatch(app, /dangerouslySetInnerHTML/);
   assert.match(mcp, /list_google_workspace_notes/);
@@ -302,7 +302,7 @@ test('demo judges use an isolated shared-auth subscription route with funded fal
   const demoStore = await read('lib/demo-store.ts');
 
   assert.match(app, /Included judge voice/);
-  assert.match(app, /Private synthetic demo/);
+  assert.match(app, /Synthetic data only/);
   assert.match(app, /useState<DemoVoiceAccess>\('subscription'\)/);
   assert.match(app, /response\.function_call_arguments\.done/);
   assert.match(app, /voiceToolCountRef\.current > toolLimit/);
