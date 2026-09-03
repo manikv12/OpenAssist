@@ -19,8 +19,8 @@ assert.doesNotMatch(server, /thread\/realtime\/start[\s\S]{0,500}\bmodel\s*:/);
 assert.match(dockerfile, /ARG CODEX_VERSION=0\.150\.1/);
 assert.equal(packageJson.dependencies.ws, '8.21.0');
 assert.equal(toolNames.length, 43);
-assert.ok(realtimeVoices.some((voice) => voice.id === 'marin'));
-assert.ok(realtimeVoices.some((voice) => voice.id === 'cedar'));
+assert.equal(realtimeVoices[0]?.id, 'sol');
+assert.deepEqual(realtimeVoices.map((voice) => voice.id), ['sol', 'arbor', 'breeze', 'cove', 'ember', 'juniper', 'maple', 'spruce', 'vale']);
 
 const authenticatedCanaryPassed = process.env.VOICE_AUTH_CANARY_PASSED === '1';
 const report = {

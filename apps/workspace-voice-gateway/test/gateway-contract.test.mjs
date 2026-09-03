@@ -161,7 +161,8 @@ test('the selected realtime voice reaches both subscription and funded sessions'
   const server = await read('container/server.mjs');
   const options = JSON.parse(await read('container/realtime-voices.json'));
 
-  assert.deepEqual(options.map((voice) => voice.id), ['marin', 'cedar', 'coral', 'sage', 'verse', 'ash', 'sol']);
+  assert.deepEqual(options.map((voice) => voice.id), ['sol', 'arbor', 'breeze', 'cove', 'ember', 'juniper', 'maple', 'spruce', 'vale']);
+  assert.match(worker, /DEFAULT_REALTIME_VOICE = 'sol'/);
   assert.match(worker, /parseRealtimeVoice\(body\.voice\)/);
   assert.match(worker, /voice === 'sol'/);
   assert.match(worker, /output: \{ voice \}/);

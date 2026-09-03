@@ -271,6 +271,7 @@ test('voice selection and visible audio states are wired through every session p
   const ownerSession = await read('app/api/voice/session/route.ts');
   const demoSubscription = await read('app/api/demo/voice/subscription/session/route.ts');
   const demoCapped = await read('app/api/demo/voice/capped/session/route.ts');
+  const voices = await read('lib/realtime-voices.ts');
 
   assert.match(app, /openassist-realtime-voice/);
   assert.match(app, /function VoicePicker/);
@@ -285,6 +286,9 @@ test('voice selection and visible audio states are wired through every session p
   assert.match(orb, /--oa-orb-scale/);
   assert.match(styles, /oa-voice-state-dot--speaking/);
   assert.match(styles, /oa-orb--error/);
+  assert.match(voices, /DEFAULT_REALTIME_VOICE: RealtimeVoice = 'sol'/);
+  assert.match(voices, /id: 'sol'/);
+  assert.doesNotMatch(voices, /id: 'marin'/);
   for (const route of [ownerSession, demoSubscription, demoCapped]) {
     assert.match(route, /parseRealtimeVoice\(body\.voice\)/);
     assert.match(route, /voice/);

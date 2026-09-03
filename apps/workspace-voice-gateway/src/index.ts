@@ -30,7 +30,7 @@ const DEMO_FUNDING_OBJECT_KEY = 'admin/judge-voice-funding.enc';
 const DEFAULT_DAILY_SESSION_LIMIT = 25;
 const DEFAULT_DEMO_SECONDS = 300;
 const DEFAULT_DEMO_TOOL_LIMIT = 12;
-const DEFAULT_REALTIME_VOICE = 'marin';
+const DEFAULT_REALTIME_VOICE = 'sol';
 const REALTIME_VOICE_IDS = new Set<string>(realtimeVoiceOptions.map((voice) => voice.id));
 
 function parseRealtimeVoice(value: unknown): string {
