@@ -16,7 +16,7 @@ export async function POST(request: Request): Promise<Response> {
       request,
       demoVoiceUserId(session.workspaceId),
       '/session/stop',
-      { method: 'POST', body: '{}' },
+      { method: 'POST', body: JSON.stringify({ sessionId }) },
       'demo',
     );
     if (sessionId) await stopJudgeVoiceSession('subscription_session', sessionId, toolCalls);

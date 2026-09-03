@@ -196,6 +196,16 @@ function subscriptionAuthObjectKey(env: Env, payload: GatewayToken): string {
   return configured;
 }
 
+function subscriptionContainerUserHash(env: Env, payload: GatewayToken): string {
+  if (payload.access !== 'demo') return payload.userHash;
+  const objectKey = configuredDemoSubscriptionAuthObjectKey(env);
+  const ownerHash = objectKey?.match(/^chatgpt-auth\/([A-Za-z0-9_-]{32,128})\.enc$/)?.[1];
+  if (!ownerHash) {
+    throw new Response('Included judge voice is not configured.', { status: 503 });
+  }
+  return ownerHash;
+}
+
 function threadStateObjectKey(userHash: string): string {
   return `codex-thread-state/${userHash}.enc`;
 }
@@ -535,7 +545,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
       method: 'GET',
       headers,
     });
-    return voiceContainer(env, payload.userHash).fetch(internal);
+    return voiceContainer(env, subscriptionContainerUserHash(env, payload)).fetch(internal);
   }
 
   const payload = await requireSiteToken(request, env);
@@ -555,9 +565,10 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     return stopDemoRealtimeCall(request, env, payload);
   }
 
-  const container = voiceContainer(env, payload.userHash);
+  const containerUserHash = subscriptionContainerUserHash(env, payload);
+  const container = voiceContainer(env, containerUserHash);
   const objectKey = subscriptionAuthObjectKey(env, payload);
-  await container.bindThreadOwner(payload.userHash);
+  await container.bindThreadOwner(containerUserHash);
 
   if (request.method === 'POST' && url.pathname === '/auth/start') {
     if (payload.access === 'demo') {
@@ -594,15 +605,22 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === 'POST' && url.pathname === '/disconnect') {
+    if (payload.access === 'demo') {
+      const body = await readJson(request);
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+      await containerJson(container, env, '/session/stop', { sessionId }).catch(() => undefined);
+      return json({ status: 'reset' });
+    }
     await checkpointThreadState(container, env, payload.userHash).catch(() => undefined);
-    if (payload.access === 'owner') await deleteOwnerAndDemoAuth(env, payload, objectKey);
+    await deleteOwnerAndDemoAuth(env, payload, objectKey);
     await env.VOICE_AUTH.delete(threadStateObjectKey(payload.userHash));
     await containerJson(container, env, '/disconnect', {}).catch(() => undefined);
     await container.stop('SIGTERM').catch(() => undefined);
-    return json({ status: payload.access === 'demo' ? 'reset' : 'disconnected' });
+    return json({ status: 'disconnected' });
   }
 
   if (request.method === 'GET' && url.pathname === '/threads') {
+    if (payload.access === 'demo') return json({ status: 'ready', threads: [] });
     const saved = await env.VOICE_AUTH.get(objectKey);
     if (!saved) return json({ status: 'auth_required', message: 'Connect your ChatGPT subscription to see saved conversations.' }, { status: 409 });
     const authJson = await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY);
@@ -616,7 +634,13 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   if (request.method === 'POST' && url.pathname === '/session/stop') {
     const saved = await env.VOICE_AUTH.head(objectKey);
     if (!saved) return json({ status: 'disconnected' });
-    await checkpointThreadState(container, env, payload.userHash);
+    if (payload.access === 'demo') {
+      const body = await readJson(request);
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+      await containerJson(container, env, '/session/stop', { sessionId });
+      return json({ status: 'saved' });
+    }
+    await checkpointThreadState(container, env, containerUserHash);
     return json({ status: 'saved' });
   }
 
@@ -629,12 +653,15 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (threadId != null && (typeof threadId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(threadId))) {
       throw new Response('The selected voice conversation is invalid.', { status: 400 });
     }
+    if (payload.access === 'demo' && threadId != null) {
+      throw new Response('Judge voice always starts a private temporary conversation.', { status: 400 });
+    }
     const saved = await env.VOICE_AUTH.get(objectKey);
     if (!saved) return json({ status: 'auth_required', message: 'Connect your ChatGPT subscription for voice first.' }, { status: 409 });
     const authJson = await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY);
     if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
     JSON.parse(authJson);
-    await restoreThreadState(container, env, payload.userHash);
+    if (payload.access === 'owner') await restoreThreadState(container, env, containerUserHash);
     let result: Record<string, unknown>;
     try {
       result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId, voice, access: payload.access });

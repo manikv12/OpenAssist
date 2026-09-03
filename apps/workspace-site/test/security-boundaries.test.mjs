@@ -305,6 +305,7 @@ test('demo judges use an isolated shared-auth subscription route with funded fal
   const gatewayClient = await read('lib/voice-gateway.ts');
   const cappedSession = await read('app/api/demo/voice/capped/session/route.ts');
   const subscriptionSession = await read('app/api/demo/voice/subscription/session/route.ts');
+  const subscriptionStop = await read('app/api/demo/voice/subscription/session/stop/route.ts');
   const subscriptionAuth = await read('app/api/demo/voice/subscription/auth/start/route.ts');
   const demoStore = await read('lib/demo-store.ts');
 
@@ -317,6 +318,7 @@ test('demo judges use an isolated shared-auth subscription route with funded fal
   assert.match(gatewayClient, /access: 'owner' \| 'demo'/);
   assert.match(cappedSession, /requireDemoAccess\(request\)/);
   for (const source of [subscriptionSession, subscriptionAuth]) assert.match(source, /requireDemoAccess\(request\)/);
+  assert.match(subscriptionStop, /JSON\.stringify\(\{ sessionId \}\)/);
   for (const source of [cappedSession, subscriptionSession, subscriptionAuth]) {
     assert.match(source, /getOrCreateDemoSession/);
     assert.match(source, /demoVoiceUserId/);

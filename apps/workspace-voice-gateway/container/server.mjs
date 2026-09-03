@@ -492,7 +492,7 @@ class AppServer {
       environments: [],
       selectedCapabilityRoots: [],
       serviceName: 'OpenAssist Workspace Voice',
-      ephemeral: false,
+      ephemeral: this.session.access === 'demo',
       baseInstructions: instructions.baseInstructions,
       developerInstructions: instructions.developerInstructions,
       dynamicTools: this.dynamicTools(),
@@ -720,6 +720,13 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/threads/export') {
       await stopActiveSession('Voice conversation saved.');
       sendJson(response, 200, { status: 'ready', snapshot: await exportThreadState() });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/session/stop') {
+      const body = await readJson(request);
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+      if (sessionId && sessionId === activeSessionId) await stopActiveSession('Voice stopped by the user.');
+      sendJson(response, 200, { status: 'stopped' });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/disconnect') {
