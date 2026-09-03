@@ -20,6 +20,7 @@ interface Env {
   CODEX_RUNTIME_VERSION: string;
   OPENAI_API_KEY?: string;
   DEMO_REALTIME_MODEL?: string;
+  DEMO_SUBSCRIPTION_AUTH_OBJECT_KEY?: string;
 }
 
 const AUTH_LIMIT = 256_000;
@@ -179,6 +180,15 @@ async function containerJson(
 
 function authObjectKey(userHash: string): string {
   return `chatgpt-auth/${userHash}.enc`;
+}
+
+function subscriptionAuthObjectKey(env: Env, payload: GatewayToken): string {
+  if (payload.access !== 'demo') return authObjectKey(payload.userHash);
+  const configured = env.DEMO_SUBSCRIPTION_AUTH_OBJECT_KEY?.trim() ?? '';
+  if (!/^chatgpt-auth\/[A-Za-z0-9_-]{32,128}\.enc$/.test(configured)) {
+    throw new Response('Included judge voice is not configured.', { status: 503 });
+  }
+  return configured;
 }
 
 function threadStateObjectKey(userHash: string): string {
@@ -510,10 +520,15 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   }
 
   const container = voiceContainer(env, payload.userHash);
-  const objectKey = authObjectKey(payload.userHash);
+  const objectKey = subscriptionAuthObjectKey(env, payload);
   await container.bindThreadOwner(payload.userHash);
 
   if (request.method === 'POST' && url.pathname === '/auth/start') {
+    if (payload.access === 'demo') {
+      const saved = await env.VOICE_AUTH.head(objectKey);
+      if (!saved) throw new Response('Included judge voice is temporarily unavailable.', { status: 503 });
+      return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
+    }
     const result = await containerJson(container, env, '/auth/start', {});
     return json({ status: 'pending', verificationUrl: result.verificationUrl, userCode: result.userCode, expiresInSeconds: result.expiresInSeconds });
   }
@@ -521,6 +536,9 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   if (request.method === 'GET' && url.pathname === '/auth/status') {
     const saved = await env.VOICE_AUTH.head(objectKey);
     if (saved) return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
+    if (payload.access === 'demo') {
+      return json({ status: 'unavailable', message: 'Included judge voice is temporarily unavailable.' }, { status: 503 });
+    }
     const result = await containerJson(container, env, '/auth/status');
     if (result.status !== 'ready' || typeof result.authJson !== 'string') {
       return json({
@@ -537,11 +555,11 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
 
   if (request.method === 'POST' && url.pathname === '/disconnect') {
     await checkpointThreadState(container, env, payload.userHash).catch(() => undefined);
-    await env.VOICE_AUTH.delete(objectKey);
+    if (payload.access === 'owner') await env.VOICE_AUTH.delete(objectKey);
     await env.VOICE_AUTH.delete(threadStateObjectKey(payload.userHash));
     await containerJson(container, env, '/disconnect', {}).catch(() => undefined);
     await container.stop('SIGTERM').catch(() => undefined);
-    return json({ status: 'disconnected' });
+    return json({ status: payload.access === 'demo' ? 'reset' : 'disconnected' });
   }
 
   if (request.method === 'GET' && url.pathname === '/threads') {

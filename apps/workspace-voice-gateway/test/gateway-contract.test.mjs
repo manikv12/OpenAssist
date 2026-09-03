@@ -100,6 +100,21 @@ test('refreshed ChatGPT subscription auth is re-encrypted by the Worker', async 
   assert.match(worker, /saveEncryptedAuth\(env, objectKey, refreshedAuth\.authJson\)/);
 });
 
+test('judge voice shares only the owner auth source while state and tools stay isolated', async () => {
+  const worker = await read('src/index.ts');
+  const server = await read('container/server.mjs');
+  assert.match(worker, /DEMO_SUBSCRIPTION_AUTH_OBJECT_KEY\?: string/);
+  assert.match(worker, /function subscriptionAuthObjectKey/);
+  assert.match(worker, /payload\.access !== 'demo'/);
+  assert.match(worker, /subscriptionAuthObjectKey\(env, payload\)/);
+  assert.match(worker, /voiceContainer\(env, payload\.userHash\)/);
+  assert.match(worker, /restoreThreadState\(container, env, payload\.userHash\)/);
+  assert.match(worker, /checkpointThreadState\(container, env, payload\.userHash\)/);
+  assert.match(worker, /if \(payload\.access === 'owner'\) await env\.VOICE_AUTH\.delete\(objectKey\)/);
+  assert.match(worker, /payload\.access === 'demo' \? 'reset' : 'disconnected'/);
+  assert.match(server, /this\.access === 'owner' \? !tool\.demoOnly : !tool\.ownerOnly/);
+});
+
 test('pending device sign-in keeps its code available across status checks', async () => {
   const worker = await read('src/index.ts');
   const server = await read('container/server.mjs');

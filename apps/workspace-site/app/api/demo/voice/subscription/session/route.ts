@@ -2,12 +2,12 @@ import { attachDemoCookie, getOrCreateDemoSession } from '../../../../../../lib/
 import { assertSameOrigin, json, readJsonObject, safeRoute } from '../../../../../../lib/http';
 import { activateJudgeVoiceSession, failJudgeVoiceEvent, reserveJudgeVoiceSession } from '../../../../../../lib/judge-voice-store';
 import { parseRealtimeVoice } from '../../../../../../lib/realtime-voices';
-import { requireOwner } from '../../../../../../lib/server-auth';
+import { requireDemoAccess } from '../../../../../../lib/server-auth';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireOwner();
+    await requireDemoAccess(request);
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const body = await readJsonObject(request, 310_000);

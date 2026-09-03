@@ -157,16 +157,16 @@ test('the page is gated and demo APIs require owner or signed judge access', asy
     'app/api/demo/voice/status/route.ts',
     'app/api/demo/voice/capped/session/route.ts',
     'app/api/demo/voice/capped/stop/route.ts',
+    'app/api/demo/voice/subscription/auth/start/route.ts',
+    'app/api/demo/voice/subscription/auth/status/route.ts',
+    'app/api/demo/voice/subscription/session/route.ts',
+    'app/api/demo/voice/subscription/session/stop/route.ts',
+    'app/api/demo/voice/subscription/threads/route.ts',
   ];
   for (const route of sharedDemoRoutes) assert.match(await read(route), /await requireDemoAccess\(request\)/, route);
 
   const ownerOnlySubscriptionRoutes = [
-    'app/api/demo/voice/subscription/auth/start/route.ts',
-    'app/api/demo/voice/subscription/auth/status/route.ts',
     'app/api/demo/voice/subscription/auth/disconnect/route.ts',
-    'app/api/demo/voice/subscription/session/route.ts',
-    'app/api/demo/voice/subscription/session/stop/route.ts',
-    'app/api/demo/voice/subscription/threads/route.ts',
   ];
   for (const route of ownerOnlySubscriptionRoutes) assert.match(await read(route), /await requireOwner\(\)/, route);
 });
@@ -293,7 +293,7 @@ test('owner access is Live-only while judge access is Demo-only', async () => {
   assert.match(app, /Ready with \$\{voiceLabel\(restored\)\}/);
 });
 
-test('demo judges use only the server-funded route while subscription routes remain owner-only', async () => {
+test('demo judges use an isolated shared-auth subscription route with funded fallback', async () => {
   const app = await read('app/components/workspace-app.tsx');
   const gatewayClient = await read('lib/voice-gateway.ts');
   const cappedSession = await read('app/api/demo/voice/capped/session/route.ts');
@@ -301,14 +301,15 @@ test('demo judges use only the server-funded route while subscription routes rem
   const subscriptionAuth = await read('app/api/demo/voice/subscription/auth/start/route.ts');
   const demoStore = await read('lib/demo-store.ts');
 
-  assert.match(app, /Funded judge demo/);
-  assert.match(app, /Included access/);
+  assert.match(app, /Included judge voice/);
+  assert.match(app, /Private synthetic demo/);
+  assert.match(app, /useState<DemoVoiceAccess>\('subscription'\)/);
   assert.match(app, /response\.function_call_arguments\.done/);
   assert.match(app, /voiceToolCountRef\.current > toolLimit/);
   assert.match(app, /Funded demo voice session ended/);
   assert.match(gatewayClient, /access: 'owner' \| 'demo'/);
   assert.match(cappedSession, /requireDemoAccess\(request\)/);
-  for (const source of [subscriptionSession, subscriptionAuth]) assert.match(source, /requireOwner\(\)/);
+  for (const source of [subscriptionSession, subscriptionAuth]) assert.match(source, /requireDemoAccess\(request\)/);
   for (const source of [cappedSession, subscriptionSession, subscriptionAuth]) {
     assert.match(source, /getOrCreateDemoSession/);
     assert.match(source, /demoVoiceUserId/);

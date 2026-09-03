@@ -1,12 +1,12 @@
 import { attachDemoCookie, getOrCreateDemoSession } from '../../../../../../../lib/demo-session';
 import { assertSameOrigin, safeRoute } from '../../../../../../../lib/http';
 import { recordJudgeVoiceSignIn } from '../../../../../../../lib/judge-voice-store';
-import { requireOwner } from '../../../../../../../lib/server-auth';
+import { requireDemoAccess } from '../../../../../../../lib/server-auth';
 import { callVoiceGateway, demoVoiceUserId } from '../../../../../../../lib/voice-gateway';
 
 export async function POST(request: Request): Promise<Response> {
   return safeRoute(async () => {
-    await requireOwner();
+    await requireDemoAccess(request);
     assertSameOrigin(request);
     const session = await getOrCreateDemoSession(request);
     const response = await callVoiceGateway(

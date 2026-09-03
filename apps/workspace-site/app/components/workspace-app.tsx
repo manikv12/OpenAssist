@@ -313,7 +313,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [toast, setToast] = useState(() => ownerAccess
     ? 'Private Live Workspace ready.'
     : `Judge Demo ready · ${webMcpTools.length} WebMCP tools available.`);
-  const [voiceStatus, setVoiceStatus] = useState('Ready to check compatibility');
+  const [voiceStatus, setVoiceStatus] = useState(ownerAccess ? 'Ready to check compatibility' : 'Included judge voice is ready to start');
   const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(DEFAULT_REALTIME_VOICE);
   const [activeVoice, setActiveVoice] = useState<RealtimeVoice | null>(null);
   const [voicePanelOpen, setVoicePanelOpen] = useState(false);
@@ -324,7 +324,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const [voiceThreads, setVoiceThreads] = useState<VoiceThread[]>([]);
   const [selectedVoiceThreadId, setSelectedVoiceThreadId] = useState<string | null>(null);
   const [voiceThreadsLoading, setVoiceThreadsLoading] = useState(false);
-  const [demoVoiceAccess, setDemoVoiceAccess] = useState<DemoVoiceAccess>('capped');
+  const [demoVoiceAccess, setDemoVoiceAccess] = useState<DemoVoiceAccess>('subscription');
   const [cappedVoiceAvailable, setCappedVoiceAvailable] = useState<boolean | null>(null);
   const [judgeVoicePolicy, setJudgeVoicePolicy] = useState<JudgeVoicePolicy>({
     available: false,
@@ -1038,7 +1038,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
       const subscription = currentMode === 'live' || currentAccess === 'subscription';
       const subscriptionBase = currentMode === 'demo' ? '/api/demo/voice/subscription' : '/api/voice';
       if (!subscription && voiceForSession === 'sol') {
-        throw new Error('Sol is available with My ChatGPT. Select My ChatGPT or choose another funded-demo voice.');
+        throw new Error('Sol is available with the included judge voice.');
       }
       if (subscription) {
         setVoiceStatus('Checking your ChatGPT subscription sign-in…');
@@ -1243,12 +1243,12 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     const next = !voiceMuted;
     voiceStreamRef.current?.getAudioTracks().forEach((track) => { track.enabled = !next; });
     setVoiceMuted(next);
-    setVoiceStatus(next ? 'Microphone muted' : activeVoiceKindRef.current === 'demo_capped' ? 'Listening · capped synthetic demo' : 'Listening through your ChatGPT subscription');
+    setVoiceStatus(next ? 'Microphone muted' : activeVoiceKindRef.current === 'demo_capped' ? 'Listening · capped synthetic demo' : modeRef.current === 'demo' ? 'Listening in the isolated judge demo' : 'Listening through your ChatGPT subscription');
   }, [voiceMuted]);
 
   const selectDemoVoiceAccess = useCallback((access: DemoVoiceAccess) => {
     if (access === 'capped' && cappedVoiceAvailable === false) {
-      setVoiceStatus('Quick demo voice is not enabled. Use My ChatGPT or the ChatGPT in-app browser.');
+      setVoiceStatus('Quick demo voice is not enabled. Use the included judge voice.');
       return;
     }
     if (voiceConnected) stopVoice('Voice stopped before changing access.');
@@ -1259,7 +1259,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     setSelectedVoiceThreadId(null);
     setVoiceStatus(access === 'capped'
       ? `Ready for a funded ${Math.ceil(judgeVoicePolicy.sessionSeconds / 60)}-minute synthetic demo`
-      : 'Ready to connect your own ChatGPT subscription');
+      : 'Included judge voice is ready to start');
     if (access === 'subscription') void refreshVoiceThreads(true);
   }, [cappedVoiceAvailable, judgeVoicePolicy.sessionSeconds, refreshVoiceThreads, stopVoice, voiceConnected]);
 
@@ -1658,16 +1658,16 @@ function VoicePicker({ value, connected, onChange }: { value: RealtimeVoice; con
   );
 }
 
-function DemoVoiceChoice({ value, connected, cappedAvailable, policy, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; policy: JudgeVoicePolicy; onChange: (access: DemoVoiceAccess) => void }) {
+function DemoVoiceChoice({ value, connected, onChange }: { value: DemoVoiceAccess; connected: boolean; cappedAvailable: boolean | null; policy: JudgeVoicePolicy; onChange: (access: DemoVoiceAccess) => void }) {
   const choices: Array<{ id: DemoVoiceAccess; title: string; detail: string }> = [
-    { id: 'capped', title: 'Funded judge demo', detail: `Included access · ${Math.ceil(policy.sessionSeconds / 60)} min · ${policy.maxToolCalls} tools` },
+    { id: 'subscription', title: 'Included judge voice', detail: 'Private synthetic demo · saved separately for this judge' },
   ];
   return (
     <div role="radiogroup" aria-label="Demo voice access" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
       {choices.map((choice) => (
-        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected || (choice.id === 'capped' && cappedAvailable === false)} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 ${value === choice.id ? 'border-brand/45 bg-brand/10 shadow-[0_0_18px_rgba(224,188,99,0.06)]' : 'border-hairline bg-wash/60 hover:border-brand/25'}`}>
+        <button key={choice.id} type="button" role="radio" aria-checked={value === choice.id} disabled={connected} onClick={() => onChange(choice.id)} className={`rounded-xl border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-45 ${value === choice.id ? 'border-brand/45 bg-brand/10 shadow-[0_0_18px_rgba(224,188,99,0.06)]' : 'border-hairline bg-wash/60 hover:border-brand/25'}`}>
           <span className={`block text-xs font-semibold ${value === choice.id ? 'text-brand-strong' : 'text-text-2'}`}>{choice.title}</span>
-          <span className="mt-0.5 block text-[10px] leading-4 text-text-4">{choice.id === 'capped' && cappedAvailable === false ? 'Not enabled in this deployment' : choice.detail}</span>
+          <span className="mt-0.5 block text-[10px] leading-4 text-text-4">{choice.detail}</span>
         </button>
       ))}
     </div>
@@ -1856,9 +1856,9 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
             <span>Voice &amp; conversation</span>
             <span aria-hidden="true" className="oa-voice-dock__chevron text-text-3">⌄</span>
           </summary>
-          <div className="grid gap-2 border-t border-hairline p-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} />{mode === 'live' && <div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div>}</div>
+          <div className="grid gap-2 border-t border-hairline p-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} /><div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div></div>
         </details>
-        {mode === 'demo' && demoVoiceAccess === 'capped' && <p className="mt-2 rounded-lg border border-hairline bg-wash/60 px-3 py-2 text-[10px] leading-4 text-text-3">Uses only synthetic data. The server key is never sent to this browser.</p>}
+        {mode === 'demo' && <p className="mt-2 rounded-lg border border-hairline bg-wash/60 px-3 py-2 text-[10px] leading-4 text-text-3">Uses only synthetic data and judge-safe WebMCP tools. Your session cannot access the owner Workspace.</p>}
         {prompt && <div className="mt-2 rounded-xl border border-brand/20 bg-brand/5 p-3"><p className="text-[11px] leading-4 text-text-2">Open the secure ChatGPT sign-in page, then enter this one-time code.</p><div className="mt-2 flex items-center gap-2"><a href={prompt.verificationUrl} target="_blank" rel="noreferrer" className="text-[11px] font-semibold text-brand underline underline-offset-4">Open sign-in</a><code className="ml-auto rounded-lg bg-field px-2.5 py-1.5 text-xs font-semibold tracking-[0.14em] text-ink">{prompt.userCode}</code></div></div>}
       </section>
     </aside>
@@ -2865,7 +2865,7 @@ function JudgeVoiceAdmin({ onChanged }: { onChanged?: () => void }) {
                 ].map(([label, value]) => <div key={String(label)} className="rounded-xl border border-hairline bg-wash/60 px-3 py-3"><p className="text-lg font-semibold tabular-nums">{value}</p><p className="mt-0.5 text-[10px] uppercase tracking-[0.14em] text-text-4">{label}</p></div>)}
               </div>
               <div className="mt-4 max-h-56 space-y-1 overflow-y-auto pr-1">
-                {usage.recent.length ? usage.recent.map((event) => <div key={event.eventId} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 text-xs transition hover:bg-wash/60"><div className="min-w-0"><p className="truncate text-text-2">{event.judgeLabel} · {event.kind === 'funded_session' ? 'Funded' : event.kind === 'subscription_session' ? 'My ChatGPT' : 'Sign-in'}</p><p className="mt-0.5 text-[10px] text-text-4">{new Date(event.startedAt).toLocaleString()} · {event.toolCalls} tools</p></div><span className={`shrink-0 text-[10px] font-semibold uppercase ${event.status === 'failed' ? 'text-danger-strong' : event.status === 'active' ? 'text-success-strong' : 'text-text-3'}`}>{event.status}</span></div>) : <p className="py-5 text-center text-xs text-text-4">No judge voice use yet.</p>}
+                {usage.recent.length ? usage.recent.map((event) => <div key={event.eventId} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 text-xs transition hover:bg-wash/60"><div className="min-w-0"><p className="truncate text-text-2">{event.judgeLabel} · {event.kind === 'funded_session' ? 'Funded' : event.kind === 'subscription_session' ? 'Included judge voice' : 'Sign-in'}</p><p className="mt-0.5 text-[10px] text-text-4">{new Date(event.startedAt).toLocaleString()} · {event.toolCalls} tools</p></div><span className={`shrink-0 text-[10px] font-semibold uppercase ${event.status === 'failed' ? 'text-danger-strong' : event.status === 'active' ? 'text-success-strong' : 'text-text-3'}`}>{event.status}</span></div>) : <p className="py-5 text-center text-xs text-text-4">No judge voice use yet.</p>}
               </div>
             </> : <p className="mt-5 text-xs text-text-4">Usage has not loaded yet.</p>}
             <p className="mt-4 border-t border-hairline pt-4 text-[11px] leading-5 text-text-4">Only session counts, time, tool counts, and safe error codes are stored. No audio, transcript, prompt, tool arguments, or Workspace content is saved.</p>
