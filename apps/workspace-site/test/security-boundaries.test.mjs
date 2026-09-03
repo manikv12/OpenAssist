@@ -228,6 +228,13 @@ test('voice errors are shown instead of being mislabeled as pending', async () =
   assert.match(app, /if \(!authResponse\.ok\) throw new Error\(auth\.error \?\? auth\.message/);
 });
 
+test('voice sign-in is not blocked by an expired Workspace data connection', async () => {
+  const app = await read('app/components/workspace-app.tsx');
+  const connectVoice = app.slice(app.indexOf('const connectVoice = useCallback'), app.indexOf('const toggleVoiceMute'));
+  assert.doesNotMatch(connectVoice, /invokeTool\('workspace_list_accounts'/);
+  assert.match(connectVoice, /fetch\(`\$\{subscriptionBase\}\/auth\/status`/);
+});
+
 test('notes open through the read tool and render untrusted content as plain text', async () => {
   const app = await read('app/components/workspace-app.tsx');
   const mcp = await read('lib/mcp-client.ts');

@@ -1032,16 +1032,13 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
     try {
       const voiceForSession = selectedVoiceRef.current;
       setVoiceTranscript({ user: '', assistant: '' });
-      setVoiceStatus(currentMode === 'live' ? 'Checking your private Workspace connection…' : 'Checking the synthetic demo workspace…');
-      await invokeTool('workspace_list_accounts', {});
-
       const subscription = currentMode === 'live' || currentAccess === 'subscription';
       const subscriptionBase = currentMode === 'demo' ? '/api/demo/voice/subscription' : '/api/voice';
+      setVoiceStatus(subscription ? 'Checking your ChatGPT subscription sign-in…' : 'Preparing the synthetic demo voice…');
       if (!subscription && voiceForSession === 'sol') {
         throw new Error('Sol is available with the included judge voice.');
       }
       if (subscription) {
-        setVoiceStatus('Checking your ChatGPT subscription sign-in…');
         let authResponse = await fetch(`${subscriptionBase}/auth/status`, { cache: 'no-store' });
         let auth = (await authResponse.json()) as { status?: string; message?: string; error?: string; verificationUrl?: string; userCode?: string };
         if (!authResponse.ok && auth.status !== 'pending') {
