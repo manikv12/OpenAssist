@@ -80,7 +80,7 @@ test('demo and owner Live mode remain separate', async () => {
   const component = await text('app/components/workspace-app.tsx');
   assert.match(component, /modeRef\.current === 'demo'/);
   assert.match(component, /Judge demo/);
-  assert.match(component, /Synthetic data/);
+  assert.match(component, /synthetic data/i);
   assert.match(component, /ownerAccess &&/);
   assert.match(component, /Judge · isolated Demo only/);
   assert.match(component, /\/api\/demo\/tool/);
@@ -113,10 +113,11 @@ test('judge screens keep the demo concise and make approved changes prominent', 
   const component = await text('app/components/workspace-app.tsx');
   const styles = await text('app/globals.css');
 
-  assert.match(component, /Demo flow/);
+  assert.match(component, /Try WebMCP/);
   assert.match(component, /Read priority/);
   assert.match(component, /Prepare cart/);
-  assert.match(component, /Verify action/);
+  assert.match(component, /Review changes/);
+  assert.doesNotMatch(component, /\{toolCount\} tools/);
   assert.match(component, /function groupActivity/);
   assert.match(component, /\['write', 'Changes'\]/);
   assert.match(component, /item\.count > 1/);
@@ -146,7 +147,8 @@ test('owner workspace removes stale date and fake Live activity, and filters loa
   assert.doesNotMatch(component, /Thursday · August 27/);
   assert.match(component, /ownerAccess \? \[\] : DEMO_ACTIVITY/);
   assert.match(component, /Object\.values\(item\)\.some/);
-  assert.match(component, /placeholder=\{view === 'work' \? 'Use Knowledge search below' : 'Filter this view'\}/);
+  assert.match(component, /SEARCHABLE_VIEWS\.has\(view\)/);
+  assert.match(component, /placeholder="Filter this view"/);
   assert.match(component, /function LiveTodayDashboard/);
   assert.match(component, /function WorkspaceLoading/);
 });
@@ -173,7 +175,20 @@ test('initial Live loading reuses the account ref and navigation clears stale fi
   assert.match(component, /const accountsPromise = liveRef\.current\.accounts/);
   assert.doesNotMatch(component, /\[invokeTool, live\.accounts, liveRefreshKey/);
   assert.match(component, /No connected Gmail account\|Connect the required Google service\|Gmail is disconnected/);
-  assert.match(component, /<JudgeQuickStart onNavigate=\{focusView\} toolCount=\{webMcpTools\.length\}/);
+  assert.match(component, /<JudgeQuickStart onNavigate=\{focusView\} resetLabel=/);
+});
+
+test('workspace keeps one readable content column and one floating voice entry point', async () => {
+  const component = await text('app/components/workspace-app.tsx');
+  const styles = await text('app/globals.css');
+  const render = component.slice(component.indexOf('return (\n    <main data-theme='), component.indexOf('function JudgeQuickStart'));
+
+  assert.match(render, /grid-cols-\[224px_minmax\(0,1fr\)\]/);
+  assert.match(render, /max-w-\[1160px\]/);
+  assert.doesNotMatch(render, /<ActivityRail/);
+  assert.match(render, /<VoiceLauncher/);
+  assert.match(styles, /\.oa-voice-launcher/);
+  assert.match(styles, /width: min\(460px/);
 });
 
 test('daily brief limits unread metadata work while keeping every enabled account', async () => {

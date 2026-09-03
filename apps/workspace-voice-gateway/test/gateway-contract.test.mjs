@@ -100,17 +100,30 @@ test('refreshed ChatGPT subscription auth is re-encrypted by the Worker', async 
   assert.match(worker, /saveEncryptedAuth\(env, objectKey, refreshedAuth\.authJson\)/);
 });
 
+test('revoked subscription auth is removed and requires a clear reconnect', async () => {
+  const worker = await read('src/index.ts');
+  assert.match(worker, /token_revoked\|invalidated oauth token/);
+  assert.match(worker, /payload\.access === 'owner'\) await deleteOwnerAndDemoAuth\(env, payload, objectKey\)/);
+  assert.match(worker, /else await env\.VOICE_AUTH\.delete\(objectKey\)/);
+  assert.match(worker, /ChatGPT subscription sign-in expired\. Reconnect ChatGPT to continue\./);
+  assert.match(worker, /Included judge voice needs the owner to reconnect ChatGPT\./);
+});
+
 test('judge voice shares only the owner auth source while state and tools stay isolated', async () => {
   const worker = await read('src/index.ts');
   const server = await read('container/server.mjs');
   assert.match(worker, /DEMO_SUBSCRIPTION_AUTH_OBJECT_KEY\?: string/);
   assert.match(worker, /function subscriptionAuthObjectKey/);
+  assert.match(worker, /function configuredDemoSubscriptionAuthObjectKey/);
+  assert.match(worker, /mirrorStoredOwnerAuthForDemo\(env, payload, objectKey\)/);
+  assert.match(worker, /mirrorOwnerAuthForDemo\(env, payload, result\.authJson\)/);
+  assert.match(worker, /deleteOwnerAndDemoAuth\(env, payload, objectKey\)/);
   assert.match(worker, /payload\.access !== 'demo'/);
   assert.match(worker, /subscriptionAuthObjectKey\(env, payload\)/);
   assert.match(worker, /voiceContainer\(env, payload\.userHash\)/);
   assert.match(worker, /restoreThreadState\(container, env, payload\.userHash\)/);
   assert.match(worker, /checkpointThreadState\(container, env, payload\.userHash\)/);
-  assert.match(worker, /if \(payload\.access === 'owner'\) await env\.VOICE_AUTH\.delete\(objectKey\)/);
+  assert.match(worker, /if \(payload\.access === 'owner'\) await deleteOwnerAndDemoAuth\(env, payload, objectKey\)/);
   assert.match(worker, /payload\.access === 'demo' \? 'reset' : 'disconnected'/);
   assert.match(server, /this\.access === 'owner' \? !tool\.demoOnly : !tool\.ownerOnly/);
 });
@@ -154,10 +167,14 @@ test('the selected realtime voice reaches both subscription and funded sessions'
 
 test('Codex realtime transcripts are forwarded to the visible Site voice panel', async () => {
   const server = await read('container/server.mjs');
+  assert.match(server, /thread\/realtime\/started/);
   assert.match(server, /thread\/realtime\/transcript\/delta/);
   assert.match(server, /thread\/realtime\/transcript\/done/);
   assert.match(server, /thread\/realtime\/error/);
   assert.match(server, /type: 'transcript'/);
+  assert.match(server, /waiter\.reject\(new Error\(errorMessage\)\)/);
+  assert.match(server, /realtimeSessionId: null/);
+  assert.match(server, /Realtime started without a session ID/);
 });
 
 test('the funded demo fallback is server-side, synthetic-only, and uses the exact visible tools', async () => {

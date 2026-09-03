@@ -302,7 +302,7 @@ test('demo judges use an isolated shared-auth subscription route with funded fal
   const demoStore = await read('lib/demo-store.ts');
 
   assert.match(app, /Included judge voice/);
-  assert.match(app, /Synthetic data only/);
+  assert.match(app, /synthetic data/i);
   assert.match(app, /useState<DemoVoiceAccess>\('subscription'\)/);
   assert.match(app, /response\.function_call_arguments\.done/);
   assert.match(app, /voiceToolCountRef\.current > toolLimit/);

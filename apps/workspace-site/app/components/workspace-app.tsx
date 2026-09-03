@@ -1416,7 +1416,7 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
   const resolvedTheme = themePreference === 'system' ? (systemDark ? 'dark' : 'light') : themePreference;
   return (
     <main data-theme={resolvedTheme} data-workspace-mode={mode === 'live' ? 'owner' : 'judge'} className="oa-app-shell min-h-screen text-ink">
-      <div className="mx-auto grid min-h-screen w-full max-w-[1800px] grid-cols-[238px_minmax(0,1fr)_minmax(300px,340px)] max-xl:grid-cols-[84px_minmax(0,1fr)] max-md:grid-cols-1">
+      <div className="mx-auto grid min-h-screen w-full max-w-[1600px] grid-cols-[224px_minmax(0,1fr)] max-xl:grid-cols-[80px_minmax(0,1fr)] max-md:grid-cols-1">
         <Sidebar view={view} user={user} items={visibleNavigation} onView={focusView} onSignOut={() => void signOut()} />
         <section id={`view-${view}`} className="min-w-0 pb-[calc(88px+env(safe-area-inset-bottom))] md:pb-10">
           <div className="flex items-center justify-between gap-3 border-b border-hairline px-5 py-3.5 md:hidden">
@@ -1430,33 +1430,26 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             <div className="flex shrink-0 items-center gap-2"><span className="oa-mobile-mode-badge rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]">{mode === 'live' ? 'Private Live' : 'Judge Demo'}</span><button onClick={() => void signOut()} className="text-[10px] font-medium text-text-3">Sign out</button></div>
           </div>
 
-          <div className="px-5 pt-5 sm:px-8 sm:pt-6 lg:px-12">
+          <div className="mx-auto w-full max-w-[1160px] px-5 pt-5 sm:px-8 sm:pt-7 lg:px-10">
             <header className="relative pb-5"><div aria-hidden="true" className="oa-header-divider" />
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
                   <p className="truncate text-[11px] font-semibold uppercase tracking-[0.14em] text-text-3 sm:text-xs">{copy.eyebrow}</p>
                   <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">{copy.title}</h1>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <ThemePicker value={themePreference} onChange={chooseTheme} />
-                  <button onClick={() => setVoicePanelOpen(true)} aria-label={`Open voice · ${voiceStateLabel}`} title={`Open voice · ${voiceStateLabel}`} className="group grid shrink-0 place-items-center rounded-full opacity-90 transition duration-150 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/50">
-                    <VoiceOrb phase={orbPhase} meter={voiceMeter} size={48} />
-                  </button>
-                </div>
+                <ThemePicker value={themePreference} onChange={chooseTheme} />
               </div>
 
-              <div className="mt-4 flex flex-wrap items-center gap-2.5">
-                <label className="relative min-w-0 flex-1 basis-full sm:basis-auto sm:max-w-xs">
+              {(SEARCHABLE_VIEWS.has(view) || mode === 'demo') && <div className="mt-4 flex flex-wrap items-center gap-2.5">
+                {SEARCHABLE_VIEWS.has(view) && <label className="relative min-w-0 flex-1 basis-full sm:basis-auto sm:max-w-xs">
                   <span className="sr-only">Search current view</span>
-                  <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={view === 'work' ? 'Use Knowledge search below' : 'Filter this view'} disabled={view === 'work'} className="w-full min-w-0 rounded-xl border border-hairline-strong bg-wash px-3 py-2 text-sm outline-none transition placeholder:text-text-4 focus:border-brand/50 focus:ring-2 focus:ring-brand/10 disabled:cursor-not-allowed disabled:opacity-45" />
-                </label>
-                {ownerAccess && <span className="shrink-0 rounded-xl border border-teal/20 bg-teal/10 px-3 py-2 text-xs font-semibold text-teal-strong xl:hidden">Private Live</span>}
+                  <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter this view" className="w-full min-w-0 rounded-xl border border-hairline-strong bg-wash px-3 py-2 text-sm outline-none transition placeholder:text-text-4 focus:border-brand/50 focus:ring-2 focus:ring-brand/10" />
+                </label>}
                 {mode === 'demo' && <button onClick={() => void resetDemo()} className="shrink-0 rounded-xl border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:border-brand/35 hover:text-ink">Reset demo</button>}
-              </div>
+              </div>}
             </header>
-            {mode === 'demo' && <div className="oa-mode-strip mt-4" data-mode="judge"><div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><p className="text-xs font-semibold text-ink">Judge demo</p><span className="rounded-full border border-accent/20 bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent-strong">Synthetic data</span></div><span className="oa-wrap-anywhere text-[11px] text-text-3">{demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Preparing demo'}</span></div>}
-            {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} toolCount={webMcpTools.length} />}
-            <div key={view} className="oa-view-in py-7">
+            {mode === 'demo' && view === 'today' && <JudgeQuickStart onNavigate={focusView} resetLabel={demoExpiresAt ? `Resets ${new Date(demoExpiresAt).toLocaleDateString()}` : 'Synthetic demo'} />}
+            <div key={view} className="oa-view-in py-6 sm:py-7">
               {mode === 'live' ? (
               view === 'activity'
                 ? <ActivityView mode={mode} activity={activity} owner={Boolean(user?.owner)} onVoicePolicyChanged={refreshJudgeVoicePolicy} />
@@ -1477,28 +1470,29 @@ export function WorkspaceApp({ user }: { user: SiteUser }) {
             </div>
           </div>
         </section>
-        <ActivityRail activity={activity} toast={toast} voiceStatus={voiceStatus} voiceStateLabel={voiceStateLabel} voiceConnected={voiceConnected} orbPhase={orbPhase} voiceMeter={voiceMeter} onOpenVoice={() => setVoicePanelOpen(true)} onOpenActivity={() => focusView('activity')} />
       </div>
+      <VoiceLauncher connected={voiceConnected} phase={orbPhase} meter={voiceMeter} stateLabel={voiceStateLabel} onOpen={() => setVoicePanelOpen(true)} />
       {voicePanelOpen && <VoiceStage mode={mode} demoVoiceAccess={demoVoiceAccess} cappedVoiceAvailable={cappedVoiceAvailable} judgeVoicePolicy={judgeVoicePolicy} status={voiceStatus} stateLabel={voiceStateLabel} prompt={voicePrompt} connected={voiceConnected} muted={voiceMuted} selectedVoice={selectedVoice} activeVoice={activeVoice} phase={orbPhase} meter={voiceMeter} transcript={voiceTranscript} threads={voiceThreads} selectedThreadId={selectedVoiceThreadId} threadsLoading={voiceThreadsLoading} onClose={() => setVoicePanelOpen(false)} onVoice={connectVoice} onMute={toggleVoiceMute} onVoiceChange={selectVoice} onDemoVoiceAccess={selectDemoVoiceAccess} onSelectThread={setSelectedVoiceThreadId} onRefreshThreads={() => void refreshVoiceThreads()} />}
       {pending && <ApprovalDrawer action={pending} onCancel={() => { setPending(null); setToast('Preview cancelled. Nothing changed.'); }} onApprove={() => void approve('tap')} />}
       {editor && <ItemEditor kind={editor} onCancel={() => setEditor(null)} onSubmit={(args) => submitEditor(editor, args)} />}
       {openNote && <NoteReader note={openNote} onClose={() => setOpenNote(null)} />}
       {openLiveItem && <LiveItemReader value={openLiveItem} onClose={closeLiveItem} />}
-      <div aria-live="polite" className={`fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 z-30 w-[min(92vw,460px)] -translate-x-1/2 rounded-2xl border bg-surface/95 px-4 py-3 text-center text-xs leading-5 shadow-[0_18px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-opacity duration-500 xl:hidden md:bottom-5 ${toastFaded ? 'pointer-events-none opacity-0' : 'opacity-100'} ${toastSeverity(toast) === 'error' ? 'border-danger/30 text-danger-strong' : toastSeverity(toast) === 'success' ? 'border-success/25 text-text-2' : 'border-hairline-strong text-text-2'}`}>{toast}</div>
+      <div aria-live="polite" className={`fixed bottom-[calc(5.25rem+env(safe-area-inset-bottom))] left-1/2 z-30 w-[min(88vw,400px)] -translate-x-1/2 rounded-xl border bg-surface/95 px-3.5 py-2.5 text-center text-xs leading-5 shadow-[0_14px_44px_rgba(0,0,0,0.32)] backdrop-blur-xl transition-opacity duration-500 md:bottom-5 ${toastFaded ? 'pointer-events-none opacity-0' : 'opacity-100'} ${toastSeverity(toast) === 'error' ? 'border-danger/30 text-danger-strong' : toastSeverity(toast) === 'success' ? 'border-success/25 text-text-2' : 'border-hairline-strong text-text-2'}`}>{toast}</div>
       <MobileNavigation view={view} items={visibleNavigation} onView={focusView} />
     </main>
   );
 }
 
-function JudgeQuickStart({ onNavigate, toolCount }: { onNavigate: (view: WorkspaceView) => void; toolCount: number }) {
+const SEARCHABLE_VIEWS = new Set<WorkspaceView>(['inbox', 'tasks', 'supplies', 'notes', 'memory', 'accounts', 'activity']);
+
+function JudgeQuickStart({ onNavigate, resetLabel }: { onNavigate: (view: WorkspaceView) => void; resetLabel: string }) {
   return (
-    <section aria-labelledby="judge-quick-start" className="mt-4 flex flex-wrap items-center gap-2 rounded-2xl border border-hairline bg-wash/60 p-2.5">
-      <h2 id="judge-quick-start" className="sr-only">Judge demo flow</h2>
-      <span className="px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Demo flow</span>
-      <button type="button" onClick={() => onNavigate('inbox')} className="oa-demo-step"><span>1</span> Read priority</button>
-      <button type="button" onClick={() => onNavigate('supplies')} className="oa-demo-step"><span>2</span> Prepare cart</button>
-      <button type="button" onClick={() => onNavigate('activity')} className="oa-demo-step"><span>3</span> Verify action</button>
-      <span className="ml-auto shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">{toolCount} tools</span>
+    <section aria-labelledby="judge-quick-start" className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-accent/20 bg-accent/5 px-3 py-2.5">
+      <h2 id="judge-quick-start" className="mr-1 text-xs font-semibold text-ink">Try WebMCP</h2>
+      <button type="button" onClick={() => onNavigate('inbox')} className="oa-demo-step">Read priority</button>
+      <button type="button" onClick={() => onNavigate('supplies')} className="oa-demo-step">Prepare cart</button>
+      <button type="button" onClick={() => onNavigate('activity')} className="oa-demo-step">Review changes</button>
+      <span className="ml-auto shrink-0 text-[10px] text-text-4">{resetLabel}</span>
     </section>
   );
 }
@@ -1689,39 +1683,15 @@ function activityTitle(action: string): string {
   return labels[title] ?? title;
 }
 
-function ActivityRail({ activity, toast, voiceStatus, voiceStateLabel, voiceConnected, orbPhase, voiceMeter, onOpenVoice, onOpenActivity }: { activity: typeof DEMO_ACTIVITY; toast: string; voiceStatus: string; voiceStateLabel: string; voiceConnected: boolean; orbPhase: OrbPhase; voiceMeter: VoiceLevelMeter | null; onOpenVoice: () => void; onOpenActivity: () => void }) {
-  const groupedActivity = groupActivity(activity);
+function VoiceLauncher({ connected, phase, meter, stateLabel, onOpen }: { connected: boolean; phase: OrbPhase; meter: VoiceLevelMeter | null; stateLabel: string; onOpen: () => void }) {
   return (
-    <aside className="min-w-0 border-l border-hairline bg-transparent px-5 py-7 max-xl:hidden">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h2 className="truncate font-semibold">Agent activity</h2>
-        </div>
-        <span className="shrink-0 rounded-full border border-accent/20 bg-accent/10 px-2.5 py-1 text-[10px] font-semibold text-accent-strong">WebMCP</span>
-      </div>
-      <div className="mt-6 space-y-1">
-        {groupedActivity.length ? groupedActivity.slice(0, 5).map((item) => (
-          <button key={item.id} onClick={onOpenActivity} data-kind={item.type} className="oa-activity-item block w-full rounded-xl px-3 py-2.5 text-left transition">
-            <div className="flex items-start gap-2"><p className="oa-clamp-2 min-w-0 flex-1 text-sm leading-5 text-ink/90">{activityTitle(item.action)}</p>{item.count > 1 && <span className="rounded-full bg-wash-strong px-1.5 py-0.5 text-[9px] font-semibold text-text-2">×{item.count}</span>}</div>
-            <p className="mt-1 oa-clamp-1 text-xs text-text-4">{item.type === 'write' ? 'Changed' : 'Read'} · {item.actor} · {item.time}</p>
-          </button>
-        )) : <div className="rounded-2xl border border-dashed border-hairline px-4 py-5 text-center"><p className="text-xs font-medium text-text-2">No activity yet</p></div>}
-      </div>
-      <div className="mt-8 border-t border-hairline pt-6">
-        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-4">Voice</p>
-        <button onClick={onOpenVoice} className="group mt-3 flex w-full items-center gap-3 rounded-xl border border-hairline bg-wash/60 px-3 py-3 text-left transition hover:border-hairline-strong hover:bg-wash focus-visible:outline-none">
-          <VoiceOrb phase={orbPhase} meter={voiceMeter} size={56} />
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-medium">{voiceConnected ? 'Voice is active' : 'Open voice'}</span>
-            <span className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-hairline bg-wash px-2 py-0.5 text-[10px] font-semibold text-text-2"><span className={`oa-voice-state-dot oa-voice-state-dot--${orbPhase}`} />{voiceStateLabel}</span>
-            <span className="mt-0.5 block oa-clamp-2 text-xs leading-4 text-text-3">{voiceStatus}</span>
-          </span>
-        </button>
-      </div>
-      <div aria-live="polite" className="mt-7 rounded-xl border border-hairline bg-wash px-3 py-3">
-        <p className="flex items-start gap-2 text-xs leading-5 text-text-2"><span aria-hidden="true" className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${toastSeverity(toast) === 'error' ? 'bg-danger' : toastSeverity(toast) === 'success' ? 'bg-success' : 'bg-text-4'}`} /><span className="oa-clamp-2">{toast}</span></p>
-      </div>
-    </aside>
+    <button type="button" onClick={onOpen} aria-label={`Open voice. ${stateLabel}`} title={`Open voice. ${stateLabel}`} className="oa-voice-launcher group">
+      <VoiceOrb phase={phase} meter={meter} size={52} />
+      <span className="oa-voice-launcher__label">
+        <span className="block text-xs font-semibold text-ink">{connected ? 'Voice active' : 'Open voice'}</span>
+        <span className="mt-0.5 flex items-center gap-1.5 text-[10px] text-text-3"><span className={`oa-voice-state-dot oa-voice-state-dot--${phase}`} />{stateLabel}</span>
+      </span>
+    </button>
   );
 }
 
@@ -1756,7 +1726,7 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
 
   const placeDock = useCallback((x: number, y: number, persist = true) => {
     const rect = dockRef.current?.getBoundingClientRect();
-    const width = rect?.width ?? 560;
+    const width = rect?.width ?? 460;
     const height = rect?.height ?? 560;
     const margin = 16;
     const next = {
@@ -1844,9 +1814,9 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
           </div>
         </div>
 
-        <div className="mt-3 grid grid-cols-[88px_minmax(0,1fr)] items-center gap-4 max-sm:grid-cols-[72px_minmax(0,1fr)] max-sm:gap-3">
-          <div role={desktop ? 'button' : undefined} tabIndex={desktop ? 0 : -1} aria-label={desktop ? 'Move voice panel by dragging the orb or using arrow keys' : undefined} title={desktop ? 'Drag to move voice' : undefined} onPointerDown={beginDrag} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onKeyDown={moveByKeyboard} className="oa-voice-orb-handle relative grid h-[88px] w-[88px] place-items-center rounded-full max-sm:h-[72px] max-sm:w-[72px]">
-            <VoiceOrb phase={phase} meter={meter} size={72} />
+        <div className="mt-3 grid grid-cols-[76px_minmax(0,1fr)] items-center gap-3 max-sm:grid-cols-[68px_minmax(0,1fr)]">
+          <div role={desktop ? 'button' : undefined} tabIndex={desktop ? 0 : -1} aria-label={desktop ? 'Move voice panel by dragging the orb or using arrow keys' : undefined} title={desktop ? 'Drag to move voice' : undefined} onPointerDown={beginDrag} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onKeyDown={moveByKeyboard} className="oa-voice-orb-handle relative grid h-[76px] w-[76px] place-items-center rounded-full max-sm:h-[68px] max-sm:w-[68px]">
+            <VoiceOrb phase={phase} meter={meter} size={62} />
             <span className="absolute -bottom-1 inline-flex items-center gap-1 rounded-full border border-hairline-strong bg-surface/95 px-2 py-0.5 text-[9px] font-semibold text-ink/90"><span className={`oa-voice-state-dot oa-voice-state-dot--${phase}`} />{stateLabel}</span>
           </div>
           <div className="min-w-0">
@@ -1860,8 +1830,8 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
         </div>
 
         <div className="mt-3 grid gap-2 sm:grid-cols-2">
-          <div className="min-h-[72px] rounded-xl border border-hairline bg-wash/60 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-text-3">You</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.user || (connected ? 'Listening…' : 'Your words')}</p></div>
-          <div className="min-h-[72px] rounded-xl border border-accent/15 bg-accent/5 px-3 py-2.5"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist</p><p className="mt-1 oa-clamp-3 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.assistant || (connected ? 'Thinking…' : 'Agent response')}</p></div>
+          <div className="min-h-[64px] rounded-xl border border-hairline bg-wash/60 px-3 py-2"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-text-3">You</p><p className="mt-1 oa-clamp-2 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.user || (connected ? 'Listening…' : 'Your words')}</p></div>
+          <div className="min-h-[64px] rounded-xl border border-accent/15 bg-accent/5 px-3 py-2"><p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-accent-strong">OpenAssist</p><p className="mt-1 oa-clamp-2 oa-wrap-anywhere text-xs leading-5 text-ink/90">{transcript.assistant || (connected ? 'Thinking…' : 'Agent response')}</p></div>
         </div>
         <p className="mt-1.5 text-center text-[9px] text-text-4">Live transcript only · not saved by the website</p>
 
@@ -1872,7 +1842,7 @@ function VoiceStage({ mode, demoVoiceAccess, cappedVoiceAvailable, judgeVoicePol
           </summary>
           <div className="grid gap-2 border-t border-hairline p-3 sm:grid-cols-2">{mode === 'demo' && <DemoVoiceChoice value={demoVoiceAccess} connected={connected} cappedAvailable={cappedVoiceAvailable} policy={judgeVoicePolicy} onChange={onDemoVoiceAccess} />}<VoicePicker value={selectedVoice} connected={connected} onChange={onVoiceChange} /><div className="sm:col-span-2"><VoiceThreadPicker threads={threads} selectedId={selectedThreadId} loading={threadsLoading} connected={connected} onSelect={onSelectThread} onRefresh={onRefreshThreads} /></div></div>
         </details>
-        {mode === 'demo' && <p className="mt-2 text-center text-[10px] font-medium text-accent-strong">Synthetic data only</p>}
+        {mode === 'demo' && <p className="mt-2 text-center text-[10px] font-medium text-accent-strong">Judge demo uses synthetic data</p>}
         {prompt && <div className="mt-2 rounded-xl border border-brand/20 bg-brand/5 p-3"><p className="text-[11px] leading-4 text-text-2">Open the secure ChatGPT sign-in page, then enter this one-time code.</p><div className="mt-2 flex items-center gap-2"><a href={prompt.verificationUrl} target="_blank" rel="noreferrer" className="text-[11px] font-semibold text-brand underline underline-offset-4">Open sign-in</a><code className="ml-auto rounded-lg bg-field px-2.5 py-1.5 text-xs font-semibold tracking-[0.14em] text-ink">{prompt.userCode}</code></div></div>}
       </section>
     </aside>
@@ -2581,9 +2551,9 @@ function LiveWorkspaceView({ view, live, query, selectedId, ownerCode, onOwnerCo
 
   return (
     <section className="min-w-0">
-      <div className="oa-mode-strip mb-6" data-mode="owner">
-        <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="oa-mode-strip__dot" /><p className="text-xs font-semibold text-ink">Private live</p><span className="rounded-full border border-teal/20 bg-teal/10 px-2 py-0.5 text-[10px] font-medium text-teal-strong">Google connected</span></div>
-        <button onClick={onReconnect} className="shrink-0 rounded-lg border border-hairline-strong px-3 py-2 text-xs text-text-2 transition hover:text-ink">Connection</button>
+      <div className="mb-5 flex items-center justify-between gap-3 border-b border-hairline pb-3">
+        <p className="flex min-w-0 items-center gap-2 text-xs text-text-3"><span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-teal" /><span className="truncate">Private workspace connected</span></p>
+        <button onClick={onReconnect} className="shrink-0 text-xs font-medium text-brand transition hover:text-brand-strong">Manage connection</button>
       </div>
       {live.warning && <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-warning/20 bg-warning/5 px-4 py-3 text-sm text-warning-strong"><span>Refresh failed. Showing the last loaded Workspace data.</span><button onClick={onRetry} className="rounded-lg border border-warning/25 px-3 py-1.5 text-xs font-semibold text-brand-strong">Retry</button></div>}
       {view === 'today' ? (
@@ -2694,7 +2664,7 @@ function LiveTodayDashboard({ rows, selectedId, onOpenItem }: { rows: Array<Reco
 }
 
 function ActivityView({ mode, activity, owner = false, onVoicePolicyChanged }: { mode: Mode; activity: typeof DEMO_ACTIVITY; owner?: boolean; onVoicePolicyChanged?: () => void }) {
-  const [filter, setFilter] = useState<'all' | 'write' | 'read'>('all');
+  const [filter, setFilter] = useState<'all' | 'write' | 'read'>('write');
   const grouped = useMemo(() => groupActivity(activity), [activity]);
   const visible = useMemo(() => filter === 'all' ? grouped : grouped.filter((item) => item.type === filter), [filter, grouped]);
   const { page, pageCount, pageItems, rangeStart, rangeEnd, total, setPage } = usePagination(visible, PAGE_SIZE, `${filter}-${grouped.length}`);

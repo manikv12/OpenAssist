@@ -182,10 +182,15 @@ function authObjectKey(userHash: string): string {
   return `chatgpt-auth/${userHash}.enc`;
 }
 
+function configuredDemoSubscriptionAuthObjectKey(env: Env): string | null {
+  const configured = env.DEMO_SUBSCRIPTION_AUTH_OBJECT_KEY?.trim() ?? '';
+  return /^chatgpt-auth\/[A-Za-z0-9_-]{32,128}\.enc$/.test(configured) ? configured : null;
+}
+
 function subscriptionAuthObjectKey(env: Env, payload: GatewayToken): string {
   if (payload.access !== 'demo') return authObjectKey(payload.userHash);
-  const configured = env.DEMO_SUBSCRIPTION_AUTH_OBJECT_KEY?.trim() ?? '';
-  if (!/^chatgpt-auth\/[A-Za-z0-9_-]{32,128}\.enc$/.test(configured)) {
+  const configured = configuredDemoSubscriptionAuthObjectKey(env);
+  if (!configured) {
     throw new Response('Included judge voice is not configured.', { status: 503 });
   }
   return configured;
@@ -193,6 +198,12 @@ function subscriptionAuthObjectKey(env: Env, payload: GatewayToken): string {
 
 function threadStateObjectKey(userHash: string): string {
   return `codex-thread-state/${userHash}.enc`;
+}
+
+async function isRevokedChatGptAuth(error: unknown): Promise<boolean> {
+  if (!(error instanceof Response)) return false;
+  const message = await error.clone().text().catch(() => '');
+  return /(?:token_revoked|invalidated oauth token)/i.test(message);
 }
 
 async function saveEncryptedAuth(env: Env, objectKey: string, authJson: unknown): Promise<void> {
@@ -205,6 +216,31 @@ async function saveEncryptedAuth(env: Env, objectKey: string, authJson: unknown)
     httpMetadata: { contentType: 'application/octet-stream' },
     customMetadata: { version: '1' },
   });
+}
+
+async function mirrorOwnerAuthForDemo(env: Env, payload: GatewayToken, authJson: string): Promise<void> {
+  if (payload.access !== 'owner') return;
+  const demoObjectKey = configuredDemoSubscriptionAuthObjectKey(env);
+  const ownerObjectKey = authObjectKey(payload.userHash);
+  if (!demoObjectKey || demoObjectKey === ownerObjectKey) return;
+  await saveEncryptedAuth(env, demoObjectKey, authJson);
+}
+
+async function mirrorStoredOwnerAuthForDemo(env: Env, payload: GatewayToken, objectKey: string): Promise<void> {
+  if (payload.access !== 'owner') return;
+  const saved = await env.VOICE_AUTH.get(objectKey);
+  if (!saved) return;
+  const authJson = await decryptAuth(await saved.text(), env.VOICE_AUTH_ENCRYPTION_KEY);
+  if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
+  JSON.parse(authJson);
+  await mirrorOwnerAuthForDemo(env, payload, authJson);
+}
+
+async function deleteOwnerAndDemoAuth(env: Env, payload: GatewayToken, objectKey: string): Promise<void> {
+  await env.VOICE_AUTH.delete(objectKey);
+  if (payload.access !== 'owner') return;
+  const demoObjectKey = configuredDemoSubscriptionAuthObjectKey(env);
+  if (demoObjectKey && demoObjectKey !== objectKey) await env.VOICE_AUTH.delete(demoObjectKey);
 }
 
 async function saveEncryptedThreadState(env: Env, userHash: string, snapshot: unknown): Promise<void> {
@@ -526,7 +562,7 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
   if (request.method === 'POST' && url.pathname === '/auth/start') {
     if (payload.access === 'demo') {
       const saved = await env.VOICE_AUTH.head(objectKey);
-      if (!saved) throw new Response('Included judge voice is temporarily unavailable.', { status: 503 });
+      if (!saved) throw new Response('Voice setup is incomplete. The owner needs to reconnect ChatGPT once.', { status: 503 });
       return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
     }
     const result = await containerJson(container, env, '/auth/start', {});
@@ -535,9 +571,12 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
 
   if (request.method === 'GET' && url.pathname === '/auth/status') {
     const saved = await env.VOICE_AUTH.head(objectKey);
-    if (saved) return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
+    if (saved) {
+      await mirrorStoredOwnerAuthForDemo(env, payload, objectKey);
+      return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
+    }
     if (payload.access === 'demo') {
-      return json({ status: 'unavailable', message: 'Included judge voice is temporarily unavailable.' }, { status: 503 });
+      return json({ status: 'unavailable', message: 'Voice setup is incomplete. The owner needs to reconnect ChatGPT once.' }, { status: 503 });
     }
     const result = await containerJson(container, env, '/auth/status');
     if (result.status !== 'ready' || typeof result.authJson !== 'string') {
@@ -550,12 +589,13 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
       });
     }
     await saveEncryptedAuth(env, objectKey, result.authJson);
+    await mirrorOwnerAuthForDemo(env, payload, result.authJson);
     return json({ status: 'ready', runtimeVersion: env.CODEX_RUNTIME_VERSION });
   }
 
   if (request.method === 'POST' && url.pathname === '/disconnect') {
     await checkpointThreadState(container, env, payload.userHash).catch(() => undefined);
-    if (payload.access === 'owner') await env.VOICE_AUTH.delete(objectKey);
+    if (payload.access === 'owner') await deleteOwnerAndDemoAuth(env, payload, objectKey);
     await env.VOICE_AUTH.delete(threadStateObjectKey(payload.userHash));
     await containerJson(container, env, '/disconnect', {}).catch(() => undefined);
     await container.stop('SIGTERM').catch(() => undefined);
@@ -595,12 +635,26 @@ async function handleAuthorized(request: Request, env: Env): Promise<Response> {
     if (authJson.length > AUTH_LIMIT) throw new Response('Saved ChatGPT sign-in data is invalid.', { status: 400 });
     JSON.parse(authJson);
     await restoreThreadState(container, env, payload.userHash);
-    const result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId, voice, access: payload.access });
+    let result: Record<string, unknown>;
+    try {
+      result = await containerJson(container, env, '/session/start', { sdp, authJson, threadId, voice, access: payload.access });
+    } catch (error) {
+      if (!(await isRevokedChatGptAuth(error))) throw error;
+      if (payload.access === 'owner') await deleteOwnerAndDemoAuth(env, payload, objectKey);
+      else await env.VOICE_AUTH.delete(objectKey);
+      throw new Response(
+        payload.access === 'demo'
+          ? 'Included judge voice needs the owner to reconnect ChatGPT.'
+          : 'ChatGPT subscription sign-in expired. Reconnect ChatGPT to continue.',
+        { status: 401 },
+      );
+    }
     const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
     const answerSdp = typeof result.sdp === 'string' ? result.sdp : '';
     if (!sessionId || !answerSdp) throw new Response('The subscription realtime compatibility check did not return audio.', { status: 503 });
     const refreshedAuth = await containerJson(container, env, '/auth/snapshot');
     await saveEncryptedAuth(env, objectKey, refreshedAuth.authJson);
+    if (typeof refreshedAuth.authJson === 'string') await mirrorOwnerAuthForDemo(env, payload, refreshedAuth.authJson);
     const socketToken = await signGatewayToken({
       version: 1,
       purpose: 'voice_tool_socket',

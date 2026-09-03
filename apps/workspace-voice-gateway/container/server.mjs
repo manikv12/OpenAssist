@@ -317,6 +317,13 @@ class AppServer {
 
   async handleServerMessage(message) {
     const params = message.params && typeof message.params === 'object' ? message.params : {};
+    if (message.method === 'thread/realtime/started') {
+      if (this.sdpWaiter) {
+        this.sdpWaiter.started = true;
+        this.sdpWaiter.hasSessionId = typeof params.realtimeSessionId === 'string' && params.realtimeSessionId.length > 0;
+      }
+      return;
+    }
     if (message.method === 'thread/realtime/sdp') {
       const sdp = typeof params.sdp === 'string' ? params.sdp : typeof params.answer === 'string' ? params.answer : '';
       if (sdp && this.sdpWaiter) {
@@ -340,7 +347,16 @@ class AppServer {
       return;
     }
     if (message.method === 'thread/realtime/error') {
-      this.session.send({ type: 'voice_error', message: typeof params.message === 'string' ? params.message : 'The realtime voice service returned an error.' });
+      const errorMessage = typeof params.message === 'string' && params.message.trim()
+        ? params.message.trim()
+        : 'The realtime voice service returned an error.';
+      this.session.send({ type: 'voice_error', message: errorMessage });
+      if (this.sdpWaiter) {
+        const waiter = this.sdpWaiter;
+        this.sdpWaiter = null;
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(errorMessage));
+      }
       return;
     }
     if (message.id != null && message.method === 'item/tool/call') {
@@ -485,14 +501,21 @@ class AppServer {
     if (!validThreadId(threadId)) throw new Error(requestedThreadId ? 'Codex could not resume that voice conversation.' : 'Codex did not create a saved voice conversation.');
     const sdpPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.sdpWaiter?.timer === timer) this.sdpWaiter = null;
-        reject(new Error('Subscription realtime did not return a WebRTC answer.'));
+        const waiter = this.sdpWaiter?.timer === timer ? this.sdpWaiter : null;
+        if (waiter) this.sdpWaiter = null;
+        const startupState = waiter?.started
+          ? waiter.hasSessionId
+            ? ' Realtime started with a session ID, but no SDP arrived.'
+            : ' Realtime started without a session ID.'
+          : ' No realtime started event arrived.';
+        reject(new Error(`Subscription realtime did not return a WebRTC answer.${startupState}`));
       }, 45_000);
-      this.sdpWaiter = { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject, timer };
+      this.sdpWaiter = { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject, timer, started: false, hasSessionId: false };
     });
     try {
       await this.request('thread/realtime/start', {
         threadId,
+        realtimeSessionId: null,
         outputModality: 'audio',
         voice,
         version: 'v3',

@@ -380,13 +380,13 @@ button {
 
 .oa-demo-step {
   display: inline-flex;
-  min-height: 2.25rem;
+  min-height: 2rem;
   align-items: center;
   gap: 0.45rem;
   border: 1px solid var(--hairline);
   border-radius: 0.7rem;
   background: var(--surface);
-  padding: 0.4rem 0.65rem;
+  padding: 0.3rem 0.6rem;
   color: var(--text-secondary);
   font-size: 0.72rem;
   font-weight: 600;
@@ -491,6 +491,41 @@ button {
 }
 
 /* Voice stays present like an agent, without blocking the workspace. */
+.oa-voice-launcher {
+  position: fixed;
+  z-index: 60;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  display: flex;
+  min-height: 4.25rem;
+  align-items: center;
+  gap: 0.65rem;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  padding: 0.45rem 0.85rem 0.45rem 0.45rem;
+  color: var(--foreground);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(18px) saturate(1.08);
+  transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+}
+
+.oa-voice-launcher:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--brand) 36%, var(--hairline));
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.38);
+}
+
+.oa-voice-launcher:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--brand) 62%, transparent);
+  outline-offset: 3px;
+}
+
+.oa-voice-launcher__label {
+  min-width: 5.5rem;
+  text-align: left;
+}
+
 .oa-voice-dock {
   position: fixed;
   z-index: 70;
@@ -547,21 +582,15 @@ button {
 
 @media (min-width: 768px) {
   .oa-voice-dock {
-    right: auto;
+    right: 1.25rem;
     bottom: 1.25rem;
-    left: 50%;
-    width: min(560px, calc(100vw - 2rem));
-    transform: translateX(-50%);
+    left: auto;
+    width: min(460px, calc(100vw - 2rem));
+    transform: none;
   }
 
   .oa-voice-dock.is-positioned {
-    width: min(560px, calc(100vw - 2rem));
-  }
-}
-
-@media (min-width: 1280px) {
-  .oa-voice-dock {
-    left: calc(50% - 50px);
+    width: min(460px, calc(100vw - 2rem));
   }
 }
 
@@ -581,6 +610,17 @@ button {
 }
 
 @media (max-width: 767px) {
+  .oa-voice-launcher {
+    right: 0.75rem;
+    bottom: calc(5rem + env(safe-area-inset-bottom));
+    min-height: 3.75rem;
+    padding: 0.35rem;
+  }
+
+  .oa-voice-launcher__label {
+    display: none;
+  }
+
   .oa-voice-dock__panel {
     max-height: calc(100dvh - 6rem - env(safe-area-inset-top));
     overscroll-behavior: contain;
