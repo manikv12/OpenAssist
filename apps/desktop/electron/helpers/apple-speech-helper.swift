@@ -1,7 +1,13 @@
 import AVFoundation
 import CoreAudio
+import Darwin
 import Foundation
 import Speech
+
+// Dictation start is latency-critical UI. Without an explicit QoS the helper
+// runs at default priority and gets starved when the machine is busy, which
+// turns the shortcut-to-listening delay from ~0.3s into multiple seconds.
+pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
 
 private let launchArguments = Array(CommandLine.arguments.dropFirst())
 private let sessionDirectory = launchArguments.first { !$0.hasPrefix("-") }
@@ -23,6 +29,10 @@ private func argumentValue(after flag: String) -> String? {
 private let selectedMicrophoneUID = argumentValue(after: "--microphone-uid")
 private let wakePhrase = argumentValue(after: "--wake-word")
 private let parentProcessID = argumentValue(after: "--parent-pid").flatMap { Int32($0) }
+
+// Epoch ms the app wrote into start-recording.json; lets ready.json report the
+// true go-signal → recording latency for the timing log.
+private var goSignalEpochMs: Double?
 
 private func normalizedWakeText(_ value: String) -> String {
     let lowercased = value.lowercased()
@@ -281,7 +291,10 @@ private final class AudioFileCapture: NSObject {
 
     func start() {
         do {
+            let startBegan = Date()
+            let wasPrewarmed = recorder != nil
             try prepare()
+            let preparedAt = Date()
             guard let recorder else {
                 throw NSError(
                     domain: "OpenAssistVoiceCapture",
@@ -294,10 +307,18 @@ private final class AudioFileCapture: NSObject {
                 emit(["type": "error", "message": "Could not start microphone recording."])
                 exit(2)
             }
+            let recordedAt = Date()
             meterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
                 self?.emitLevel()
             }
-            emit(["type": "ready", "message": "recording"])
+            var payload: [String: String] = ["type": "ready", "message": "recording"]
+            payload["prewarmed"] = wasPrewarmed ? "1" : "0"
+            payload["prepareMs"] = String(Int(preparedAt.timeIntervalSince(startBegan) * 1000))
+            payload["recordMs"] = String(Int(recordedAt.timeIntervalSince(preparedAt) * 1000))
+            if let goSignalEpochMs {
+                payload["goToReadyMs"] = String(Int(Date().timeIntervalSince1970 * 1000 - goSignalEpochMs))
+            }
+            emit(payload)
         } catch {
             microphoneSelection.restore()
             emit(["type": "error", "message": error.localizedDescription])
@@ -567,8 +588,16 @@ if shouldRecordAudioFile {
                 // start-recording.json — or a stop file / parent death ends us.
                 // Prepare the default-device recorder now so the shortcut only
                 // needs to call record(). An explicitly selected microphone may
-                // require a system route switch, so keep that on the start path.
-                if selectedMicrophoneUID == nil && !shouldPreferExternalMicrophone {
+                // require a system route switch, so keep that on the start path —
+                // unless that microphone already IS the default (no switch needed),
+                // which is the common case and saves the whole prepare cost.
+                let routeSwitchNeeded: Bool = {
+                    guard let targetUID = selectedMicrophoneUID else { return shouldPreferExternalMicrophone }
+                    guard let selectedDeviceID = MicrophoneManager.deviceID(forUID: targetUID),
+                          let currentDefault = MicrophoneManager.defaultInputDeviceID() else { return true }
+                    return selectedDeviceID != currentDefault
+                }()
+                if !routeSwitchNeeded {
                     do {
                         try capture.prepare()
                     } catch {
@@ -586,6 +615,11 @@ if shouldRecordAudioFile {
                         exit(0)
                     }
                     if FileManager.default.fileExists(atPath: startPath) {
+                        if let data = FileManager.default.contents(atPath: startPath),
+                           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let startedAt = object["startedAt"] as? Double {
+                            goSignalEpochMs = startedAt
+                        }
                         capture.start()
                         beginStopWatch()
                         return true

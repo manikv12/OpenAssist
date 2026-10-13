@@ -101,16 +101,127 @@ export function normalizeCodexVersion(value: unknown) {
   return match?.[1] || "";
 }
 
+// Full version parse INCLUDING the prerelease suffix (normalizeCodexVersion
+// strips it): "0.149.0-alpha.4.3" must lose to "0.150.1" but also to plain
+// "0.149.0" (a stable release outranks its own alphas).
+export function parseCodexVersionParts(value: unknown): { base: number[]; prerelease: number[] | null } | null {
+  const match = String(value ?? "").match(/(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?/);
+  if (!match) return null;
+  const base = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (!match[4]) return { base, prerelease: null };
+  const prerelease = match[4]
+    .split(".")
+    .filter((part) => /^\d+$/.test(part))
+    .map(Number);
+  return { base, prerelease };
+}
+
+export function compareCodexVersions(a: unknown, b: unknown): number {
+  const left = parseCodexVersionParts(a);
+  const right = parseCodexVersionParts(b);
+  if (!left && !right) return 0;
+  if (!left) return -1;
+  if (!right) return 1;
+  for (let index = 0; index < 3; index += 1) {
+    if (left.base[index] !== right.base[index]) return left.base[index] - right.base[index];
+  }
+  if (!left.prerelease && !right.prerelease) return 0;
+  if (!left.prerelease) return 1;
+  if (!right.prerelease) return -1;
+  const length = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = left.prerelease[index] ?? 0;
+    const rightPart = right.prerelease[index] ?? 0;
+    if (leftPart !== rightPart) return leftPart - rightPart;
+  }
+  return 0;
+}
+
+// The subscription voice protocol tracks ChatGPT's server, so among the
+// installed Codex builds the NEWEST one is the one that speaks the live
+// protocol. A fixed preference order goes stale: in 2026-08 every installed
+// 0.149.x build (bundled ChatGPT alpha included) was rejected with
+// "Field `session.model` is not allowed" and only the newer 0.150.1 worked.
+export function pickNewestCodexRuntime(
+  candidates: Array<{ path?: string | null; version?: string | null }>
+): string {
+  let bestPath = "";
+  let bestVersion = "";
+  for (const candidate of candidates) {
+    const candidatePath = candidate.path?.trim();
+    if (!candidatePath) continue;
+    const version = candidate.version?.trim() ?? "";
+    if (!bestPath || compareCodexVersions(version, bestVersion) > 0) {
+      bestPath = candidatePath;
+      bestVersion = version;
+    }
+  }
+  return bestPath;
+}
+
 export function selectCodexSubscriptionRuntime(input: {
   override?: string;
   chatGPTBundled?: string;
   codexBundled?: string;
   regular: string;
 }) {
+  // The ChatGPT-bundled runtime MUST stay first: the realtime voice protocol
+  // tracks ChatGPT's server, and the bundled alpha (e.g. 0.149.0-alpha.x) is
+  // the build verified against it. Preferring the npm CLI here broke voice
+  // with `Field session.model is not allowed` — the stable CLI still sends a
+  // field the server rejects.
   return input.override?.trim()
     || input.chatGPTBundled?.trim()
     || input.codexBundled?.trim()
-    || input.regular;
+    || input.regular?.trim()
+    || "codex";
+}
+
+// These direct endpoint helpers are retained for the opt-in compatibility probe.
+// The production bridge sends its SDP offer to app-server with the WebRTC
+// transport, so the installed Codex build owns endpoint negotiation and auth.
+export const codexSubscriptionRealtimeCallURL =
+  "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
+
+export function validateCodexSubscriptionRealtimeCallURL(
+  value: unknown = codexSubscriptionRealtimeCallURL
+) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:"
+      && url.hostname.toLowerCase() === "chatgpt.com"
+      && url.pathname === "/backend-api/codex/realtime/calls";
+  } catch {
+    return false;
+  }
+}
+
+export function codexSubscriptionCallIDFromLocation(value: unknown) {
+  const location = String(value || "").trim();
+  if (!location) return "";
+  try {
+    const url = new URL(location, codexSubscriptionRealtimeCallURL);
+    if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "chatgpt.com") return "";
+    return url.pathname
+      .split("/")
+      .reverse()
+      .find((segment) => {
+        if (segment.startsWith("rtc_") && segment.length > 4) return true;
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment);
+      }) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function codexSubscriptionDirectCallHeaders(auth: CodexSubscriptionAuthContext) {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${auth.accessToken}`,
+    Accept: "application/sdp",
+    "Content-Type": "application/sdp"
+  };
+  if (auth.accountID) headers["ChatGPT-Account-Id"] = auth.accountID;
+  return headers;
 }
 
 // WebRTC SDP is line-oriented and the Codex parser expects the final CRLF.

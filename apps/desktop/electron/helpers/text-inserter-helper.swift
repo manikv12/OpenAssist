@@ -372,6 +372,12 @@ func sendPasteViaAppleScriptKeystroke() -> Bool {
 }
 
 func sendPasteViaCGEvent() -> Bool {
+    // Without Accessibility, posted CGEvents are silently discarded by macOS —
+    // the post APIs still "succeed". Preflight so we never report a paste that
+    // never happened.
+    guard CGPreflightPostEventAccess() else {
+        return false
+    }
     guard let source = CGEventSource(stateID: .combinedSessionState) ?? CGEventSource(stateID: .hidSystemState) else {
         return false
     }
@@ -448,6 +454,12 @@ do {
     if arguments.strategy == "transient-paste" {
         if insertByTransientPaste(text) {
             finish(ok: true, method: "transient-paste")
+        }
+        if !CGPreflightPostEventAccess() {
+            // Ask macOS to show its own grant prompt so a fresh install
+            // surfaces the Accessibility request instead of failing silently.
+            CGRequestPostEventAccess()
+            finish(ok: false, method: "transient-paste", error: "Accessibility permission is not granted, so paste keystrokes are blocked. Enable Open Assist under System Settings > Privacy & Security > Accessibility.")
         }
         finish(ok: false, method: "transient-paste", error: "Could not paste into the focused app.")
     }

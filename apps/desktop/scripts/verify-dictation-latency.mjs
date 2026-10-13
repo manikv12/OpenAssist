@@ -24,6 +24,11 @@ const stopConfigured = main.slice(
 );
 assert.match(
   stopConfigured,
+  /pendingTranscriptTargetApplication = targetApplication/,
+  "Dictation stop must preserve the exact app captured when the shortcut started."
+);
+assert.match(
+  stopConfigured,
   /refreshFrontmostApplicationSnapshot\(\)/,
   "Dictation stop must capture the frontmost app in parallel with transcription."
 );
@@ -45,6 +50,20 @@ assert.match(
 );
 assert.match(
   insert,
+  /const capturedTarget = pendingTranscriptTargetApplication/,
+  "Transcript insertion must prefer the app captured at shortcut key-down."
+);
+assert.match(
+  insert,
+  /insertTranscriptInOpenAssistRenderer\(trimmed\)/,
+  "Open Assist must insert through its renderer instead of sending synthetic keystrokes to itself."
+);
+assert.ok(
+  insert.indexOf("typeTextForTarget") < insert.indexOf("pasteTextWithTransientClipboard"),
+  "Transcript insertion must type directly before using clipboard paste as a fallback."
+);
+assert.match(
+  insert,
   /target\.pid !== frontmost\?\.pid/,
   "insertTranscriptText must skip activation (and its 180ms delay) when the target is already frontmost."
 );
@@ -61,6 +80,70 @@ assert.doesNotMatch(
   app,
   /await window\.openAssistElectron\?\.addTranscriptHistory\?\.\(transcript\);/,
   "Saving transcript history must not be awaited before pasting."
+);
+assert.match(
+  app,
+  /dictationTargetRef\.current = captureFocusedAppField\(\)\s*\?\? \(document\.hasFocus\(\) \? connectedEditableTargetSnapshot\(lastEditableTargetRef\.current\) : null\)/,
+  "Dictation must remember the exact Open Assist field and cursor where recording started — but only while the Open Assist window is focused, so global-hotkey dictation from another app pastes there instead of the composer."
+);
+assert.match(
+  app,
+  /const inAppDefaultAllowed = Boolean\(dictationTarget\) \|\| document\.hasFocus\(\);/,
+  "The composer/note default insert must be gated on window focus so external-app dictation reaches the native paste path."
+);
+assert.match(
+  app,
+  /inAppDefaultAllowed && insertTranscriptIntoComposer\(transcript, dictationTarget\)/,
+  "The composer must not swallow transcripts dictated into another app."
+);
+assert.match(
+  app,
+  /lastEditableTargetRef\.current = snapshot/,
+  "Open Assist must continuously remember the last real editable field before its voice UI changes focus."
+);
+assert.match(
+  app,
+  /const targetField = rememberedTarget[\s\S]*?connectedEditableTargetSnapshot\(lastEditableTargetRef\.current\)/,
+  "Returned transcripts must prefer the saved dictation cursor over the field focused after capture."
+);
+assert.match(
+  app,
+  /insertTranscriptIntoComposer\(transcript, dictationTarget\)[\s\S]*?insertTextIntoAppFieldSnapshot\(transcript, dictationTarget\)/,
+  "Finished dictation must update the React composer directly before trying generic field insertion."
+);
+assert.match(
+  app,
+  /onInsertTranscriptInApp\?\.\(/,
+  "The renderer must listen for paste-last requests from the installed app shortcut."
+);
+assert.match(
+  app,
+  /data-openassist-composer="true"/,
+  "The main composer must be an explicit fallback target for internal transcript insertion."
+);
+assert.match(
+  app,
+  /const insertTranscriptIntoComposer = useCallback\([\s\S]*?setComposerText\(nextValue\)/,
+  "Internal composer insertion must update React state directly instead of relying on a synthetic input event."
+);
+assert.match(
+  app,
+  /if \(snapshot && !rememberedComposer\) return false;/,
+  "Composer insertion must not steal dictation captured from another OpenAssist field."
+);
+const rendererInsertion = app.slice(
+  app.indexOf("onInsertTranscriptInApp?.("),
+  app.indexOf("onVoiceShortcut?.(")
+);
+assert.match(
+  rendererInsertion,
+  /insertTranscriptIntoComposer\(text, targetField\)[\s\S]*?insertTextIntoAppFieldSnapshot\(text, targetField\)/,
+  "Paste-last must prefer the direct React composer path while retaining generic app-field support."
+);
+assert.match(
+  main,
+  /openassist:insert-transcript-in-app-result/,
+  "The main process must wait for renderer confirmation before reporting that internal paste succeeded."
 );
 
 console.log("Dictation latency guards verified.");
@@ -81,8 +164,23 @@ assert.match(
 );
 assert.match(
   speechHelper,
-  /if selectedMicrophoneUID == nil && !shouldPreferExternalMicrophone[\s\S]*?try capture\.prepare\(\)/,
-  "The armed default-microphone helper must prepare AVAudioRecorder before the shortcut press."
+  /let routeSwitchNeeded[\s\S]*?if !routeSwitchNeeded[\s\S]*?try capture\.prepare\(\)/,
+  "The armed helper must prepare AVAudioRecorder before the shortcut press whenever no mic route switch is needed."
+);
+assert.match(
+  speechHelper,
+  /pthread_set_qos_class_self_np\(QOS_CLASS_USER_INTERACTIVE, 0\)/,
+  "The helper must raise its QoS so dictation start is not starved under system load."
+);
+assert.match(
+  main,
+  /deferVoiceCaptureDirectoryCleanup\(\);/,
+  "Start paths must defer old-session disk cleanup off the latency-sensitive path."
+);
+assert.match(
+  main,
+  /watcher = fs\.watch\(sessionDirectory, \(\) => check\(\)\);/,
+  "waitForVoiceFile must react to the helper's file instantly via fs.watch, with polling as fallback."
 );
 assert.match(
   main,

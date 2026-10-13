@@ -58,6 +58,14 @@ build_helper \
   "-" \
   -framework AVFoundation -framework CoreAudio -framework Speech
 
+build_helper \
+  "Open Assist Shortcut Monitor" \
+  "shortcut-monitor-helper" \
+  "shortcut-monitor-helper.swift" \
+  "shortcut-monitor-helper-info.plist" \
+  "-" \
+  -framework AppKit
+
 /usr/bin/swiftc \
   -target arm64-apple-macos14.0 \
   -framework CoreImage \

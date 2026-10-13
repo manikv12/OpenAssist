@@ -756,6 +756,7 @@ export type SettingsSnapshot = {
   realtimeMaskedOpenAIAPIKey: string;
   realtimeOpenAIModel: string;
   realtimeOpenAIVoice: string;
+  realtimeCodexVoice: string;
   realtimeVoiceProvider: string;
   codexSubscriptionVoiceAvailable: boolean;
   codexSubscriptionVoiceStatus: "ready" | "signed_out" | "unsupported_version" | "not_available" | "rate_limited" | "endpoint_changed";
@@ -1112,6 +1113,8 @@ export type OpenAssistAppState = {
   activeThreadID?: string;
   activeProjectID?: string;
   activeNoteID?: string;
+  /** False while the backend is streaming the remainder of the thread list. */
+  threadListComplete?: boolean;
 };
 
 export type ConnectorProvider = "google" | "apple" | "local";
@@ -1388,6 +1391,7 @@ export type SettingsUpdateKey =
   | "realtimeVoiceEnabled"
   | "realtimeOpenAIModel"
   | "realtimeOpenAIVoice"
+  | "realtimeCodexVoice"
   | "realtimeVoiceProvider"
   | "realtimeGeminiModel"
   | "realtimeGeminiVoice"
@@ -1563,6 +1567,15 @@ export type KnowledgeStatus = {
   tokenConfigured: boolean;
   server?: Record<string, unknown>;
   pendingRequests: KnowledgeWriteRequest[];
+};
+
+export type SecondBrainOwnerRunnerStatus = {
+  enabled: boolean;
+  running: boolean;
+  paused: boolean;
+  reason: string;
+  lastOutcome?: { status: string; runId?: string; blockerCode?: string; reason?: string; error?: string };
+  lastError?: string;
 };
 
 export type PlannerDigestLeftover = {

@@ -148,9 +148,13 @@ textarea {
 
 .app-shell {
   width: 100%;
+  max-width: 100vw;
   height: 100%;
   display: grid;
-  grid-template-columns: var(--sidebar-width) 1fr;
+  /* A plain `1fr` still honors a child's intrinsic minimum width. Long tool
+     commands could therefore widen the content track past the Electron
+     window. Keep the main track shrinkable and contain the overflow here. */
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.028), transparent 22%),
     linear-gradient(180deg,
@@ -186,6 +190,8 @@ textarea {
 }
 
 .app-shell > * {
+  min-width: 0;
+  max-width: 100%;
   position: relative;
   z-index: 1;
 }
@@ -3235,6 +3241,33 @@ textarea {
   font-size: 12px;
 }
 
+/* Soft "goo" reveal when the AI-generated title lands in the top bar: the new
+   text melts in from a blur, settles down, and letter-spacing tightens. Only
+   plays when the title changes for the SAME thread (see titleRevealKey). */
+.topbar-title strong.title-goo-reveal {
+  animation: topbar-title-goo-reveal 0.85s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes topbar-title-goo-reveal {
+  0% {
+    opacity: 0;
+    filter: blur(10px);
+    transform: translateY(5px) scale(0.97);
+    letter-spacing: 0.1em;
+  }
+  55% {
+    opacity: 1;
+    filter: blur(2px);
+    letter-spacing: 0.03em;
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0) scale(1);
+    letter-spacing: normal;
+  }
+}
+
 .topbar.topbar-centered {
   grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr);
 }
@@ -3452,7 +3485,10 @@ textarea {
 }
 
 .chat-scroll {
+  width: 100%;
+  max-width: 100%;
   min-height: 0;
+  min-width: 0;
   flex: 1;
   overflow: auto;
   overflow-x: hidden;
@@ -3488,6 +3524,8 @@ textarea {
 
 .chat-stack {
   width: min(900px, max(0px, calc(100% - 72px)));
+  max-width: 100%;
+  min-width: 0;
   margin: 0 auto;
   display: grid;
   gap: 24px;
@@ -3580,6 +3618,8 @@ textarea {
 
 .message-row {
   position: relative;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   display: flex;
   gap: 12px;
@@ -3616,6 +3656,8 @@ textarea {
 
 .delegated-task-card {
   width: min(720px, calc(100% - 36px));
+  max-width: 100%;
+  min-width: 0;
   margin: 6px 0 10px 30px;
   display: grid;
   grid-template-columns: 24px minmax(0, 1fr);
@@ -4108,6 +4150,7 @@ textarea {
   --assistant-inline-code-bg: color-mix(in srgb, var(--assistant-markdown-accent) 14%, transparent);
   width: min(810px, 100%);
   max-width: min(810px, 100%);
+  min-width: 0;
   color: color-mix(in srgb, var(--text) 98%, white 2%);
   font-family: var(--theme-ui-font, var(--font));
   font-size: calc(var(--ui-font-size, 13px) + 1.7px);
@@ -4125,7 +4168,10 @@ textarea {
 }
 
 .assistant-markdown-shell {
+  min-width: 0;
+  max-width: 100%;
   overflow: visible;
+  overflow-wrap: anywhere;
   color: var(--text);
   font-size: inherit;
   line-height: 1.66;
@@ -4226,6 +4272,8 @@ textarea {
 
 .assistant-markdown-shell code.inline-code,
 .assistant-markdown-shell code:not(pre code) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
   padding: 1.5px 5.5px 2px;
   border-radius: 4px;
   border: 0.55px solid color-mix(in srgb, var(--assistant-markdown-accent) 24%, var(--line));
@@ -4249,11 +4297,14 @@ textarea {
 }
 
 .assistant-markdown-shell .note-code-block-wrapper {
+  max-width: 100%;
   margin: 12px 0 14px;
 }
 
 .assistant-markdown-shell .note-mermaid-preview {
+  max-width: 100%;
   margin: 12px 0 14px;
+  overflow: auto;
 }
 
 .assistant-markdown-shell table {
@@ -4439,6 +4490,8 @@ textarea {
 
 .checkpoint-card {
   width: min(720px, 100%);
+  max-width: 100%;
+  min-width: 0;
   margin: 14px 0 8px;
   overflow: hidden;
   border-radius: 9px;
@@ -4589,10 +4642,14 @@ textarea {
 }
 
 .checkpoint-diff {
+  max-width: 100%;
+  min-width: 0;
   border-top: 1px solid rgba(255, 255, 255, 0.055);
 }
 
 .checkpoint-diff pre {
+  width: 100%;
+  max-width: 100%;
   max-height: 280px;
   margin: 0;
   overflow: auto;
@@ -4603,12 +4660,16 @@ textarea {
   font-size: 10.8px;
   line-height: 1.45;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .work-card {
   --work-accent: var(--provider-codex);
   position: relative;
   width: min(760px, 100%);
+  max-width: 100%;
+  min-width: 0;
   margin: 10px 0 14px 0;
   overflow: hidden;
   border-radius: 10px;
@@ -4678,6 +4739,8 @@ textarea {
   --provider-color: var(--provider-codex);
   --provider-gradient: var(--provider-codex-gradient);
   width: min(900px, 100%);
+  max-width: 100%;
+  min-width: 0;
   margin: 10px 0 18px 0;
   color: var(--provider-color);
 }
@@ -4796,6 +4859,8 @@ textarea {
 
 .work-summary-toggle {
   display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
   align-items: center;
   gap: 8px;
   min-height: 26px;
@@ -4844,6 +4909,8 @@ textarea {
 
 .work-summary-details {
   display: grid;
+  min-width: 0;
+  max-width: 100%;
   gap: 8px;
   overflow: hidden;
   padding: 10px 0 0 0;
@@ -4852,6 +4919,8 @@ textarea {
 .completed-turn-group {
   margin: 14px 0 20px 0;
   width: min(810px, 100%);
+  max-width: 100%;
+  min-width: 0;
 }
 
 .completed-turn-mark {
@@ -4914,6 +4983,8 @@ textarea {
 
 .completed-turn-group .completed-turn-details {
   display: grid;
+  min-width: 0;
+  max-width: 100%;
   gap: 8px;
   overflow: hidden;
   margin-left: 0;
@@ -4926,6 +4997,8 @@ textarea {
   display: grid;
   gap: 2px;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   padding: 0;
 }
@@ -5148,6 +5221,7 @@ textarea {
   padding: 8px 10px;
   max-height: 220px;
   overflow: auto;
+  max-width: 100%;
   border-radius: 7px;
   border: 1px solid var(--line, rgba(255, 255, 255, 0.06));
   background: rgba(5, 7, 11, 0.5);
@@ -5157,6 +5231,7 @@ textarea {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .work-summary-step.has-preview {
@@ -5402,6 +5477,8 @@ textarea {
 
 .work-card-body {
   display: grid;
+  min-width: 0;
+  max-width: 100%;
   gap: 7px;
   overflow: hidden;
   padding: 1px 12px 11px 43px;
@@ -7232,6 +7309,8 @@ textarea {
 }
 
 .thinking-message {
+  max-width: 100%;
+  min-width: 0;
   margin: 2px 0 4px;
 }
 
@@ -7253,6 +7332,8 @@ textarea {
 .thinking-summary-line {
   margin: 6px 0 12px 0;
   width: min(720px, 100%);
+  max-width: 100%;
+  min-width: 0;
 }
 
 .thinking-summary-line-embedded {
@@ -7405,6 +7486,8 @@ textarea {
 
 .thinking-collapse-inner {
   overflow: hidden;
+  max-width: 100%;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -7440,6 +7523,8 @@ textarea {
   --activity-accent: var(--provider-codex);
   --activity-bg: rgba(255, 255, 255, 0.032);
   width: min(690px, calc(100% - 36px));
+  max-width: 100%;
+  min-width: 0;
   margin: 4px 0 8px 30px;
   overflow: hidden;
   border-radius: 9px;
@@ -7593,11 +7678,15 @@ textarea {
 }
 
 .activity-detail {
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   border-top: 1px solid rgba(255, 255, 255, 0.065);
 }
 
 .activity-detail pre {
+  width: 100%;
+  max-width: 100%;
   max-height: 190px;
   margin: 0;
   overflow: auto;
@@ -7609,6 +7698,7 @@ textarea {
   line-height: 1.44;
   white-space: pre-wrap;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .activity-generated-image {
@@ -7672,6 +7762,8 @@ textarea {
 }
 
 .message-artifacts {
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -7684,6 +7776,8 @@ textarea {
   align-items: center;
   gap: 11px;
   width: min(100%, 720px);
+  max-width: 100%;
+  min-width: 0;
   padding: 8px;
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.085);
@@ -7699,6 +7793,8 @@ textarea {
   align-items: center;
   gap: 11px;
   width: min(100%, 720px);
+  max-width: 100%;
+  min-width: 0;
   padding: 8px;
   border-radius: 12px;
   border: 1px dashed rgba(255, 255, 255, 0.12);
@@ -11958,6 +12054,347 @@ textarea {
   display: contents;
 }
 
+/* Large planner tasks stay easy to scan. The editor keeps the full task in
+   place, but hides everything after the title until the user opens it. */
+.planner-editor .rich-note-tiptap .oa-planner-item.planner-collapsible-task.is-collapsed
+  > ul[data-type="taskList"]
+  > li[data-type="taskItem"]
+  > div
+  > :not(:first-child),
+.planner-editor .rich-note-tiptap .oa-planner-item.planner-collapsible-task.is-collapsed
+  > ul[data-type="taskList"]
+  > li[data-checked]
+  > div
+  > :not(:first-child) {
+  display: none !important;
+}
+
+.planner-editor .rich-note-tiptap .oa-planner-item.planner-collapsible-task
+  > ul[data-type="taskList"]
+  > li[data-type="taskItem"]
+  > div
+  > p:first-child,
+.planner-editor .rich-note-tiptap .oa-planner-item.planner-collapsible-task
+  > ul[data-type="taskList"]
+  > li[data-checked]
+  > div
+  > p:first-child {
+  position: relative;
+  padding-right: 70px;
+}
+
+.planner-editor .rich-note-tiptap .planner-task-expand-toggle {
+  display: inline-flex;
+  align-items: center;
+  position: absolute;
+  top: 2px;
+  right: 0;
+  min-height: 22px;
+  margin: 0;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 12%, transparent);
+  border-radius: 6px;
+  color: color-mix(in srgb, var(--theme-foreground, #e6edf3) 64%, transparent);
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 3.5%, transparent);
+  box-shadow: none;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: 0;
+  line-height: 1;
+  vertical-align: 1px;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+
+.planner-editor .rich-note-tiptap .planner-task-expand-toggle:hover,
+.planner-editor .rich-note-tiptap .planner-task-expand-toggle:focus-visible {
+  border-color: color-mix(in srgb, var(--theme-foreground, #e6edf3) 18%, transparent);
+  color: color-mix(in srgb, var(--theme-foreground, #e6edf3) 76%, transparent);
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 5%, transparent);
+  box-shadow: none;
+  outline: none;
+}
+
+.planner-task-drawer-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 10015;
+  pointer-events: none;
+}
+
+.planner-task-detail-drawer {
+  --planner-task-accent: var(--gold, #f0a51a);
+  position: absolute;
+  top: 68px;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  width: min(430px, calc(100vw - 390px));
+  min-width: 350px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 12%, transparent);
+  border-radius: 8px;
+  color: var(--text, rgba(244, 247, 250, 0.86));
+  background: color-mix(in srgb, var(--theme-background, #0d1117) 97%, var(--theme-foreground, #e6edf3) 3%);
+  box-shadow:
+    0 18px 48px rgba(0, 0, 0, 0.32),
+    0 0 0 1px color-mix(in srgb, var(--theme-foreground, #e6edf3) 3%, transparent);
+  pointer-events: auto;
+}
+
+.planner-task-detail-drawer::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--planner-task-accent) 38%, transparent);
+  pointer-events: none;
+}
+
+.planner-task-detail-head {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 10px;
+  min-height: 58px;
+  padding: 10px 12px 10px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 9%, transparent);
+  background: color-mix(in srgb, var(--theme-background, #0d1117) 78%, transparent);
+}
+
+.planner-task-detail-symbol,
+.planner-task-detail-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
+.planner-task-detail-symbol {
+  color: color-mix(in srgb, var(--planner-task-accent) 45%, var(--theme-foreground, #e6edf3) 55%);
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 4%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-foreground, #e6edf3) 8%, transparent);
+}
+
+.planner-task-detail-head > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.planner-task-detail-head strong {
+  color: var(--text-strong, rgba(250, 252, 255, 0.96));
+  font-size: 13px;
+  font-weight: 690;
+  letter-spacing: 0;
+}
+
+.planner-task-detail-head small {
+  overflow: hidden;
+  color: var(--muted, rgba(230, 235, 242, 0.55));
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planner-task-detail-close {
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 10%, transparent);
+  color: var(--muted, rgba(230, 235, 242, 0.55));
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 4%, transparent);
+  cursor: pointer;
+}
+
+.planner-task-detail-close:hover,
+.planner-task-detail-close:focus-visible {
+  color: var(--text-strong, rgba(250, 252, 255, 0.96));
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 8%, transparent);
+  outline: none;
+}
+
+.planner-task-detail-scroll {
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 18px 24px;
+  scrollbar-gutter: stable;
+}
+
+.planner-task-detail-summary h2 {
+  margin: 10px 0 16px;
+  color: var(--text-strong, rgba(250, 252, 255, 0.96));
+  font-size: 20px;
+  font-weight: 680;
+  line-height: 1.32;
+  letter-spacing: 0;
+}
+
+.planner-task-detail-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.planner-task-detail-context > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  color: var(--muted, rgba(230, 235, 242, 0.58));
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 5%, transparent);
+  font-size: 10.5px;
+  font-weight: 620;
+}
+
+.planner-task-detail-progress {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px 12px;
+  margin-bottom: 22px;
+  color: var(--muted, rgba(230, 235, 242, 0.58));
+  font-size: 11px;
+  font-weight: 590;
+}
+
+.planner-task-detail-progress strong {
+  color: color-mix(in srgb, var(--planner-task-accent) 48%, var(--theme-foreground, #e6edf3) 52%);
+  font-size: 11px;
+}
+
+.planner-task-detail-progress > div {
+  grid-column: 1 / -1;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 8%, transparent);
+}
+
+.planner-task-detail-progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--planner-task-accent) 62%, var(--theme-foreground, #e6edf3) 38%);
+  transition: width 180ms ease;
+}
+
+.planner-task-detail-section {
+  padding: 18px 0 2px;
+  border-top: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 8%, transparent);
+}
+
+.planner-task-detail-section + .planner-task-detail-section {
+  margin-top: 16px;
+}
+
+.planner-task-detail-section > h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 12px;
+  color: var(--text-strong, rgba(250, 252, 255, 0.92));
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0;
+}
+
+.planner-task-detail-section > h3 > span {
+  color: var(--muted, rgba(230, 235, 242, 0.5));
+  font-size: 10px;
+}
+
+.planner-task-detail-markdown,
+.planner-task-detail-markdown .assistant-markdown {
+  color: var(--text, rgba(244, 247, 250, 0.78));
+  font-size: 12.5px;
+  line-height: 1.58;
+}
+
+.planner-task-detail-markdown :first-child { margin-top: 0; }
+.planner-task-detail-markdown :last-child { margin-bottom: 0; }
+
+.planner-task-detail-steps > div {
+  border-top: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 7%, transparent);
+}
+
+.planner-task-detail-step {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  width: 100%;
+  padding: 10px 2px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 7%, transparent);
+  color: var(--text, rgba(244, 247, 250, 0.8));
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+}
+
+.planner-task-detail-step:hover {
+  color: var(--text-strong, rgba(250, 252, 255, 0.96));
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 3%, transparent);
+}
+
+.planner-task-detail-step-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  margin-top: 1px;
+  border: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 24%, transparent);
+  border-radius: 5px;
+  color: color-mix(in srgb, var(--theme-background, #0d1117) 86%, black);
+}
+
+.planner-task-detail-step.is-done .planner-task-detail-step-check {
+  border-color: var(--planner-task-accent);
+  background: var(--planner-task-accent);
+}
+
+.planner-task-detail-step.is-done > span:last-child {
+  color: var(--muted, rgba(230, 235, 242, 0.48));
+  text-decoration: line-through;
+}
+
+.planner-task-detail-step:disabled { cursor: default; }
+
+.planner-task-detail-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 11px 16px;
+  border-top: 1px solid color-mix(in srgb, var(--theme-foreground, #e6edf3) 8%, transparent);
+  color: var(--muted, rgba(230, 235, 242, 0.56));
+  background: color-mix(in srgb, var(--theme-background, #0d1117) 76%, transparent);
+  font-size: 10.5px;
+}
+
+.planner-task-detail-foot span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@media (max-width: 820px) {
+  .planner-task-detail-drawer {
+    top: 62px;
+    right: 8px;
+    bottom: 8px;
+    width: min(430px, calc(100vw - 16px));
+    min-width: 0;
+  }
+}
+
 .planner-conflict-backdrop {
   position: fixed;
   inset: 0;
@@ -13377,7 +13814,10 @@ textarea {
 .markdown-preview-surface .markdown-table-wrap {
   margin: 16px 0 18px;
   max-width: 100%;
-  overflow: hidden;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
   border-radius: 10px;
   border: 1px solid color-mix(in srgb, var(--thread-note-accent, var(--theme-accent, var(--gold))) 16%, color-mix(in srgb, var(--theme-foreground, #e6edf3) 7%, transparent));
   background:
@@ -23689,6 +24129,18 @@ mark.find-highlight.find-active {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.settings-subsection {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--theme-foreground, #e6edf3) 3%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-foreground, #e6edf3) 7%, transparent);
+}
+
+.settings-subsection .account-line {
+  overflow-wrap: anywhere;
 }
 
 .storage-cleanup-card .field-label {
