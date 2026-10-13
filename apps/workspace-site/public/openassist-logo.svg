@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <defs>
+    <radialGradient id="oa-bg" cx="38%" cy="34%" r="82%">
+      <stop offset="0%" stop-color="#20283A"/>
+      <stop offset="56%" stop-color="#0A1120"/>
+      <stop offset="100%" stop-color="#020305"/>
+    </radialGradient>
+    <linearGradient id="oa-gold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#F4DE99"/>
+      <stop offset="40%" stop-color="#D8B45A"/>
+      <stop offset="64%" stop-color="#FFF0BF"/>
+      <stop offset="100%" stop-color="#A47A21"/>
+    </linearGradient>
+    <linearGradient id="oa-head" x1="37" y1="32" x2="89" y2="84" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".2"/>
+      <stop offset="45%" stop-color="#C0D6F0" stop-opacity=".12"/>
+      <stop offset="100%" stop-color="#506888" stop-opacity=".06"/>
+    </linearGradient>
+    <radialGradient id="oa-face" cx="50%" cy="46%" r="40%">
+      <stop offset="0%" stop-color="#80C0FF" stop-opacity=".55"/>
+      <stop offset="40%" stop-color="#4A90D0" stop-opacity=".25"/>
+      <stop offset="100%" stop-color="#1A4A80" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="oa-lens" x1="0" y1="0" x2=".3" y2="1">
+      <stop offset="0%" stop-color="#2A2A3E"/>
+      <stop offset="50%" stop-color="#18182A"/>
+      <stop offset="100%" stop-color="#101020"/>
+    </linearGradient>
+    <linearGradient id="oa-shine" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity=".25"/>
+      <stop offset="40%" stop-color="#FFFFFF" stop-opacity=".05"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="oa-vignette" cx="50%" cy="50%" r="52%">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="68%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="85%" stop-color="#000000" stop-opacity=".12"/>
+      <stop offset="93%" stop-color="#000000" stop-opacity=".24"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity=".4"/>
+    </radialGradient>
+    <filter id="oa-glow"><feGaussianBlur stdDeviation="3"/></filter>
+    <clipPath id="oa-clip"><circle cx="60" cy="60" r="58.5"/></clipPath>
+  </defs>
+  <circle cx="60" cy="60" r="58.5" fill="url(#oa-bg)" stroke="url(#oa-gold)" stroke-width="2.8"/>
+  <g clip-path="url(#oa-clip)">
+    <g transform="translate(60,58) scale(1.15) translate(-60,-58)">
+      <ellipse cx="63" cy="57" rx="26" ry="23" fill="url(#oa-face)" filter="url(#oa-glow)"/>
+      <path d="M45 36H76C82 36 87 41 87 47V68C87 74 82 79 76 79H67L62 84.5C60.8 86 58.3 85 58.3 83V79H45C39 79 34 74 34 68V47C34 41 39 36 45 36Z" fill="url(#oa-head)" stroke="url(#oa-gold)" stroke-width="1.8" stroke-linejoin="round"/>
+      <path d="M39 53C39 51 40 50 42 50H57C58.5 50 59 50.5 60.5 51.5C62 50.5 62.5 50 64 50H79C81 50 82 51 82 53V58C82 61.5 79 63.5 76 63.5H67C64 63.5 62 61.5 62 58V55C61 55.5 60 55.5 59 55V58C59 61.5 57 63.5 54 63.5H45C42 63.5 39 61.5 39 58Z" fill="#1A1A2A" stroke="url(#oa-gold)" stroke-width="1.3" stroke-linejoin="round"/>
+      <rect x="40.5" y="51" width="17" height="11.5" rx="3" fill="url(#oa-lens)"/>
+      <rect x="40.5" y="51" width="17" height="11.5" rx="3" fill="url(#oa-shine)"/>
+      <rect x="63" y="51" width="17" height="11.5" rx="3" fill="url(#oa-lens)"/>
+      <rect x="63" y="51" width="17" height="11.5" rx="3" fill="url(#oa-shine)"/>
+      <path d="M57.5 54C59 52.5 62 52.5 63.5 54" fill="none" stroke="url(#oa-gold)" stroke-width="1.3" stroke-linecap="round"/>
+      <path d="M53 67C56 69.2 63 69.2 66 67" fill="none" stroke="#D0E4F5" stroke-opacity=".4" stroke-width="1.5" stroke-linecap="round"/>
+    </g>
+    <circle cx="60" cy="60" r="56" fill="url(#oa-vignette)"/>
+  </g>
+</svg>

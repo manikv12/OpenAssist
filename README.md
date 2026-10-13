@@ -2,6 +2,30 @@
 
 OpenAssist is a voice-first personal AI assistant for macOS and iPhone. It keeps daily tasks, reminders, notes, projects, and AI agent work in one place.
 
+## Daily Workspace and WebMCP
+
+**Public judge demo:** [openassist-daily-workspace.developingadventures.chatgpt.site](https://openassist-daily-workspace.developingadventures.chatgpt.site/)
+
+**Public source:** [github.com/manikv12/OpenAssist](https://github.com/manikv12/OpenAssist)
+
+The new [`apps/workspace-site`](apps/workspace-site) is a professional browser workspace for Gmail, Tasks, Calendar, notes, memory, accounts, activity, and a synthetic Shopify supply catalog. Its private judge demo gives each judge a separate 24-hour synthetic Cloudflare workspace and cart pointer that they can safely edit through the UI or WebMCP. Owner-only Live mode remains connected to the existing OpenAssist Workspace MCP and Composio; private Google data is never copied into Demo mode.
+
+It exposes 29 judge-visible WebMCP tools that ChatGPT's in-app browser and the same-page voice agent can use. Live owner mode registers 14 additional Second Brain tools, for 43 shared definitions in the Site/voice contract. Every user or external write opens an exact, two-minute preview; destructive actions always require an on-screen tap. Private Google content is not copied into the Site database. The Shopify showcase can search products, return their images, inspect policies, and prepare a judge-isolated cart, but it never exposes checkout, payment, or order tools.
+
+### Owner Second Brain
+
+The owner-only **Work** view keeps durable projects, research, decisions, future work, and agent results as indexed Markdown in the selected Google Drive. New content is organized under `OpenAssist/Second Brain`, while Cloudflare D1 stores only pointers, hashes, leases, policies, and sync status. Quick Capture can send an idea to the general Inbox or directly to a project; it does not create a Google Task until the work becomes an active personal action.
+
+After one approved assignment, an owner-controlled runner can discover queued work, claim it with a short lease, perform one isolated tool-free Codex analysis pass with bounded Second Brain search, and submit a context-based result. It can analyze, draft, and organize, but it cannot edit a repository or browse yet. Agent IDs are routing labels for one trusted owner orchestrator, not separate security identities.
+
+The voice gateway lives in [`apps/workspace-voice-gateway`](apps/workspace-voice-gateway). The Site opens on a private access screen; judge credentials are supplied only in the Devpost review instructions. A judge never needs Google access or an API key. When the owner enables it, judges can use a short project-funded synthetic voice session. ChatGPT subscription voice and Live mode remain owner-only. The server API key never enters the browser or a Container.
+
+See [the architecture and security boundaries](docs/workspace-architecture.md), [the judge testing guide](docs/webmcp-judge-guide.md), [the complete under-three-minute video script](docs/webmcp-challenge-demo.md), [the Devpost submission draft](docs/webmcp-devpost-submission.md), [the validation report](docs/webmcp-test-report.md), and [the official-requirements readiness map](docs/webmcp-challenge-readiness.md).
+
+### What was added for the WebMCP Challenge
+
+OpenAssist existed before the challenge. The Daily Workspace is a new extension built after the August 25, 2026 challenge start. Starting with commit [`aff7044`](https://github.com/manikv12/OpenAssist/commit/aff7044), it added the ChatGPT Site, 29 real `document.modelContext.registerTool` tools, a separate synthetic judge workspace, visible approval previews, the live Workspace bridge, a safe Shopify catalog/cart showcase, and same-page voice-to-WebMCP control. The earlier desktop and Google Workspace features remain separate and unchanged.
+
 > **Primary app:** The supported desktop app is now the React + Electron app in [`apps/desktop`](apps/desktop). The old Swift app is archived in [`legacy/swift`](legacy/swift).
 
 ## Why I Built It
