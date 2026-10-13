@@ -4,15 +4,21 @@ import ts from "typescript";
 import {
   classifyCodexSubscriptionFailure,
   codexSubscriptionAutomaticFallbackProvider,
+  codexSubscriptionCallIDFromLocation,
   codexSubscriptionCompatibilityDescriptors,
   codexSubscriptionConnectionHeaders,
+  codexSubscriptionDirectCallHeaders,
+  codexSubscriptionRealtimeCallURL,
   codexSubscriptionReadiness,
   findCodexSubscriptionEndpoint,
   findCodexSubscriptionWebRTCCompatibility,
   normalizeCodexSubscriptionOfferSdp,
   providerUsesCodexSubscription,
   redactCodexSubscriptionValue,
+  compareCodexVersions,
+  pickNewestCodexRuntime,
   selectCodexSubscriptionRuntime,
+  validateCodexSubscriptionRealtimeCallURL,
   validateCodexSubscriptionEndpointDescriptor,
   verifiedCodexSubscriptionEndpoints,
   verifiedCodexSubscriptionWebRTC,
@@ -26,6 +32,72 @@ const rendererWebRTCModuleSource = ts.transpileModule(rendererWebRTCSource, {
 const rendererWebRTCModule = await import(`data:text/javascript;base64,${Buffer.from(rendererWebRTCModuleSource).toString("base64")}`);
 const normalizeSessionDescriptionSdp = rendererWebRTCModule.normalizeCodexSubscriptionSessionDescriptionSdp;
 
+const bridgeSource = fs.readFileSync(new URL("../electron/openassistBridge.ts", import.meta.url), "utf8");
+const subscriptionStartParams = bridgeSource.match(
+  /const realtimeStartParams:[\s\S]*?realtimeVoiceProvider === "codexSubscription"[\s\S]*?\? \{([\s\S]*?)\n\s*\}\n\s*: \{/
+)?.[1] || "";
+assert.ok(subscriptionStartParams, "Codex Voice realtime start parameters should remain discoverable.");
+assert.doesNotMatch(
+  subscriptionStartParams,
+  /\bmodel\s*:/,
+  "Codex Voice realtime start must omit the model field because the subscription endpoint rejects session.model."
+);
+assert.match(
+  subscriptionStartParams,
+  /transport:\s*\{\s*type:\s*"webrtc",\s*sdp:\s*codexSubscriptionOfferSdp\s*\}/,
+  "Codex Voice must send the renderer SDP offer through the current app-server WebRTC transport."
+);
+assert.doesNotMatch(
+  subscriptionStartParams,
+  /existingCall|callId|subscriptionCall/,
+  "Codex Voice must not use the removed existingCall transport."
+);
+for (const forbiddenField of ["prompt", "includeStartupContext", "initialItems", "delegationAckFiller"]) {
+  assert.doesNotMatch(
+    subscriptionStartParams,
+    new RegExp(`\\b${forbiddenField}\\s*:`),
+    `Codex Voice WebRTC start must not include ${forbiddenField}.`
+  );
+}
+// `voice` IS supported on the WebRTC transport (validate_realtime_voice, v3 →
+// engine v1 voice list) — but only as a validated, conditional field: an
+// unknown voice ID makes the engine reject the whole session start.
+assert.match(
+  subscriptionStartParams,
+  /\.\.\.\(normalizedCodexSubscriptionVoice\(settings\.realtimeCodexVoice\) \? \{ voice: normalizedCodexSubscriptionVoice\(settings\.realtimeCodexVoice\) \} : \{\}\),/,
+  "Codex Voice must send the user's voice pick only when it passes the allowed-voice check."
+);
+assert.match(
+  bridgeSource,
+  /const codexSubscriptionRealtimeVoiceIDs = \["cove", "juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol"\];/,
+  "The allowed Codex realtime voice list must match RealtimeVoicesList::builtin() v1."
+);
+assert.match(
+  subscriptionStartParams,
+  /realtimeStartInstructions:\s*realtimeStartPrompt/,
+  "Codex Voice should preserve OpenAssist controller instructions."
+);
+assert.doesNotMatch(
+  bridgeSource,
+  /async function createCodexSubscriptionRealtimeCall\(/,
+  "The production bridge must let app-server negotiate the subscription WebRTC call."
+);
+assert.match(
+  bridgeSource,
+  /eventSink\?\.\(\{ type: method, payload \}\)/,
+  "The bridge should forward app-server realtime notifications, including the SDP answer."
+);
+
+const threadStartParams = bridgeSource.match(
+  /function codexThreadStartParams\([\s\S]*?\n}\n\nfunction codexThreadResumeParams/
+)?.[0] || "";
+assert.ok(threadStartParams, "Codex controller thread start parameters should remain discoverable.");
+assert.match(
+  threadStartParams,
+  /if\s*\(options\.controllerOnly\)\s*params\.model\s*=\s*null/,
+  "The hidden Codex Voice controller must explicitly clear the worker model before realtime starts."
+);
+
 const descriptor = {
   id: "codex-0.145.0-test",
   websocketURL: "wss://chatgpt.com/backend-api/codex/realtime",
@@ -36,7 +108,7 @@ const descriptor = {
   codexVersion: "0.145.0",
   chatGPTBuild: "2026.190",
   verifiedAt: "2026-07-23T00:00:00.000Z",
-  expiresAt: "2026-08-23T00:00:00.000Z"
+  expiresAt: "2099-08-23T00:00:00.000Z"
 };
 const now = Date.parse("2026-07-24T00:00:00.000Z");
 
@@ -51,10 +123,51 @@ assert.equal(
   "0.146.0",
   "An unlisted Codex version should try the latest verified WebRTC transport."
 );
-assert.equal(selectCodexSubscriptionRuntime({
-  chatGPTBundled: "/Applications/ChatGPT.app/Contents/Resources/codex",
-  regular: "/Users/test/.npm-global/bin/codex"
-}), "/Applications/ChatGPT.app/Contents/Resources/codex");
+assert.equal(
+  selectCodexSubscriptionRuntime({
+    chatGPTBundled: "/Applications/ChatGPT.app/Contents/Resources/codex",
+    regular: "/Users/test/.npm-global/bin/codex"
+  }),
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+  "Static fallback order (used only when version probing fails) prefers the ChatGPT-bundled runtime."
+);
+// Version-aware selection: the NEWEST installed build speaks the live server
+// protocol. Stable outranks the same base version's alphas; missing versions lose.
+assert.ok(compareCodexVersions("codex-cli 0.150.1", "codex-cli 0.149.0-alpha.4.3") > 0);
+assert.ok(compareCodexVersions("0.149.0", "0.149.0-alpha.4.3") > 0, "A stable release must outrank its own alphas.");
+assert.ok(compareCodexVersions("0.151.0-alpha.4", "0.150.1") > 0);
+assert.ok(compareCodexVersions("0.149.0-alpha.4.3", "0.149.0-alpha.4") > 0);
+assert.equal(compareCodexVersions("0.150.1", "codex-cli 0.150.1"), 0);
+assert.ok(compareCodexVersions("", "0.1.0") < 0, "An unprobeable version must lose to any real version.");
+assert.equal(
+  pickNewestCodexRuntime([
+    { path: "/Applications/ChatGPT.app/Contents/Resources/codex", version: "codex-cli 0.149.0-alpha.4.3" },
+    { path: "/Users/test/.npm-global/bin/codex", version: "codex-cli 0.150.1" }
+  ]),
+  "/Users/test/.npm-global/bin/codex",
+  "The newest-version runtime must win regardless of install location."
+);
+assert.equal(
+  pickNewestCodexRuntime([{ path: "/only/codex", version: "" }]),
+  "/only/codex",
+  "A single candidate wins even when its version probe failed."
+);
+const bridgeResolver = bridgeSource.match(/function resolveCodexSubscriptionExecutable\(\)[\s\S]*?\n}/)?.[0] || "";
+assert.match(
+  bridgeResolver,
+  /pickNewestCodexRuntime/,
+  "The bridge must resolve the subscription runtime by newest probed version, not a fixed order."
+);
+assert.match(
+  bridgeResolver,
+  /codexExecutableCandidatePaths\(\)/,
+  "The subscription resolver must probe EVERY codex install location — resolveCodexExecutable()'s first hit hid a newer npm install and re-broke voice."
+);
+assert.match(
+  bridgeResolver,
+  /realpathSync/,
+  "Candidates must be deduped by realpath (~/.local/bin/codex symlinks to the standalone binary)."
+);
 assert.equal(selectCodexSubscriptionRuntime({
   override: "/tmp/test-codex",
   chatGPTBundled: "/Applications/ChatGPT.app/Contents/Resources/codex",
@@ -74,6 +187,33 @@ assert.equal(
   "v=0\r\na=ice-pwd:test-password\r\n"
 );
 assert.equal(normalizeSessionDescriptionSdp("  "), "");
+
+assert.equal(validateCodexSubscriptionRealtimeCallURL(), true);
+assert.equal(
+  validateCodexSubscriptionRealtimeCallURL("https://evil.example/backend-api/codex/realtime/calls"),
+  false
+);
+assert.match(codexSubscriptionRealtimeCallURL, /^https:\/\/chatgpt\.com\/backend-api\/codex\/realtime\/calls\?/);
+assert.equal(
+  codexSubscriptionCallIDFromLocation("https://chatgpt.com/backend-api/codex/realtime/calls/rtc_test-call?x=1"),
+  "rtc_test-call"
+);
+const testCallUUID = "123e4567-e89b-12d3-a456-426614174000";
+assert.equal(
+  codexSubscriptionCallIDFromLocation(`https://chatgpt.com/backend-api/codex/realtime/calls/${testCallUUID}`),
+  testCallUUID
+);
+assert.equal(
+  codexSubscriptionCallIDFromLocation("https://evil.example/backend-api/codex/realtime/calls/rtc_test-call"),
+  ""
+);
+const directCallHeaders = codexSubscriptionDirectCallHeaders({
+  accessToken: "secret-token",
+  accountID: "account-123"
+});
+assert.equal(directCallHeaders.Authorization, "Bearer secret-token");
+assert.equal(directCallHeaders["ChatGPT-Account-Id"], "account-123");
+assert.equal(directCallHeaders["Content-Type"], "application/sdp");
 
 const nativeReady = codexSubscriptionReadiness({
   codexVersion: "codex-cli 0.146.0-alpha.3",
@@ -139,7 +279,7 @@ assert.equal(unsupported.ok, false);
 assert.equal(unsupported.status, "unsupported_version");
 
 const expired = validateCodexSubscriptionEndpointDescriptor(descriptor, {
-  now: Date.parse("2026-09-01T00:00:00.000Z"),
+  now: Date.parse("2100-09-01T00:00:00.000Z"),
   codexVersion: "0.145.0",
   chatGPTBuild: "2026.190"
 });

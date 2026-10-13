@@ -225,6 +225,17 @@ export type RealtimeProxyConfig = {
 	    findTools: (args: JsonObject) => Promise<unknown>;
 	    callTool: (args: JsonObject) => Promise<unknown>;
 	  };
+	  workspaceMCP?: {
+	    enabled: boolean;
+	    findTools: (args: JsonObject) => Promise<unknown>;
+	    callTool: (args: JsonObject) => Promise<unknown>;
+	  };
+	  pluginMCP?: {
+	    enabled: boolean;
+	    findTools: (args: JsonObject) => Promise<unknown>;
+	    callTool: (args: JsonObject) => Promise<unknown>;
+	    connect: (args: JsonObject) => Promise<unknown>;
+	  };
   directWork?: {
     onEvent: (event: {
       callID: string;
@@ -1980,6 +1991,83 @@ function liveVoiceCapabilityDescriptors(configProvider: () => RealtimeProxyConfi
       enabled: () => Boolean(configProvider().localMCP?.enabled)
     },
     {
+      id: "workspace_mcp_discover",
+      description: "Discover the exact authenticated OpenAssist Workspace tool for Gmail, Google Calendar, Google Tasks, Google Drive notes, connected Google accounts, or durable user memory. Discovery is internal and cannot be the final answer.",
+      operations: ["discover", "search"],
+      source: "openassist_workspace_mcp",
+      sourceAliases: ["OpenAssist Workspace", "Google Workspace", "Gmail", "Google Mail", "Google Calendar", "Google Tasks", "connected Google account", "MCP plugin"],
+      keywords: ["gmail", "google mail", "google calendar", "google tasks", "workspace", "connected accounts", "mcp"],
+      inputSchema: realtimeLocalMCPToolSpecs[0].parameters,
+      risk: "read",
+      executionMode: "blocking",
+      timeoutMs: 30_000,
+      idempotency: "turn",
+      enabled: () => Boolean(configProvider().workspaceMCP?.enabled)
+    },
+    {
+      id: "workspace_mcp_execute",
+      description: "Execute one exact authenticated OpenAssist Workspace tool selected from workspace_mcp_discover. Read-only calls run immediately; writes require explicit confirmation.",
+      operations: ["read", "search", "create", "update", "move", "delete", "execute"],
+      source: "openassist_workspace_mcp",
+      sourceAliases: ["OpenAssist Workspace", "Google Workspace", "Gmail", "Google Mail", "Google Calendar", "Google Tasks", "connected Google account", "MCP plugin"],
+      keywords: ["gmail", "google mail", "google calendar", "google tasks", "workspace", "connected accounts", "mcp"],
+      inputSchema: realtimeLocalMCPToolSpecs[1].parameters,
+      risk: "reversible_write",
+      executionMode: "blocking",
+      timeoutMs: 75_000,
+      idempotency: "required",
+      enabled: () => Boolean(configProvider().workspaceMCP?.enabled)
+    },
+    {
+      id: "plugin_mcp_connect",
+      description: "Open the official Codex connection or sign-in page for a plugin or connector the user explicitly asks to connect. Use only for an explicit connect, link, install, or sign-in request. The user must finish any OAuth consent themselves.",
+      operations: ["execute"],
+      source: "connected_plugin",
+      sourceAliases: ["plugin", "connector", "extension", "connected app", "MCP", "Codex plugin"],
+      keywords: ["connect", "link", "install", "sign in", "authorize", "plugin", "connector"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          plugin: { type: "string", description: "Exact plugin or connector name requested by the user." }
+        },
+        required: ["plugin"],
+        additionalProperties: false
+      },
+      risk: "reversible_write",
+      executionMode: "blocking",
+      timeoutMs: 45_000,
+      idempotency: "required",
+      enabled: () => Boolean(configProvider().pluginMCP?.enabled)
+    },
+    {
+      id: "plugin_mcp_discover",
+      description: "Discover exact tools from any installed and connected Codex plugin or connector the user names. Use this for services such as Spotify, Trello, Cloudflare, Gmail, or another installed plugin. Discovery is internal and cannot be the final answer.",
+      operations: ["discover", "search"],
+      source: "connected_plugin",
+      sourceAliases: ["plugin", "connector", "extension", "connected app", "MCP", "Codex plugin"],
+      keywords: ["plugin", "connector", "connected service", "external app", "mcp"],
+      inputSchema: realtimeLocalMCPToolSpecs[0].parameters,
+      risk: "read",
+      executionMode: "blocking",
+      timeoutMs: 30_000,
+      idempotency: "turn",
+      enabled: () => Boolean(configProvider().pluginMCP?.enabled)
+    },
+    {
+      id: "plugin_mcp_execute",
+      description: "Execute one exact tool selected from plugin_mcp_discover. Read-only calls run immediately; plugin writes require the user's explicit confirmation.",
+      operations: ["read", "search", "create", "update", "move", "delete", "execute"],
+      source: "connected_plugin",
+      sourceAliases: ["plugin", "connector", "extension", "connected app", "MCP", "Codex plugin"],
+      keywords: ["plugin", "connector", "connected service", "external app", "mcp"],
+      inputSchema: realtimeLocalMCPToolSpecs[1].parameters,
+      risk: "reversible_write",
+      executionMode: "blocking",
+      timeoutMs: 75_000,
+      idempotency: "required",
+      enabled: () => Boolean(configProvider().pluginMCP?.enabled)
+    },
+    {
       id: "codex_image_generation",
       description: "Create or edit an image through the hidden Codex image worker.",
       operations: ["create", "update", "execute"],
@@ -2071,7 +2159,7 @@ function coordinatorRealtimeInstructions(
     "",
     "# One coordinator",
     "You have exactly five OpenAssist tools. Do not invent other tool names.",
-    "Use assistant_capability for OpenAssist notes, planner, projects, general to-do questions, Apple data, personal recall, local MCP services, and Codex image generation.",
+    "Use assistant_capability for OpenAssist notes, planner, projects, general to-do questions, Apple data, personal recall, installed Codex plugins and connectors, OpenAssist Workspace MCP, local MCP services, and Codex image generation.",
     "Use assistant_delegate_work for current web research and genuine agent work such as code, terminal, browser, Computer Use, file editing, or Codex skills.",
     "For every delegated task, supply an executionProfile from the meaning and risk of the request. Use simple/read_only/normal unless the work clearly needs more. Use complex for multi-part or difficult work, high stakes for decisions where a wrong answer could seriously harm the user, and sensitive_write for consequential or hard-to-reverse changes.",
     "When the user asks to send, add, correct, refine, or change instructions for Agent Work that is already running, call assistant_delegate_work with mode=follow_up. This continues the same task; it must not create another agent. Include taskID when more than one task is running. If you cannot tell which running task they mean, ask one short question.",
@@ -2097,11 +2185,17 @@ function coordinatorRealtimeInstructions(
     "Never say you will retry or apply a change unless the matching write capability returns completed in that turn.",
     "",
     "# Source rules",
+    "If the user explicitly names OpenAssist Workspace, MCP/MCO plugin, Gmail/Google Mail, Google Calendar, Google Tasks, or a connected Google account, use the OpenAssist Workspace MCP capabilities. Never answer that request from the local OpenAssist Today/Backlog planner, Apple Reminders, Apple Calendar, or local MCP tools.",
+    "If the user explicitly asks to connect, link, install, sign in to, or authorize a plugin, use plugin_mcp_connect with the exact plugin name. If a setup page opens, tell the user to finish its sign-in or permission step. Never claim OAuth completed before the plugin becomes accessible.",
+    "If the user names another installed plugin, connector, extension, or connected service for an action, use plugin_mcp_discover with that plugin name in server, then execute the exact returned tool with plugin_mcp_execute. Never replace a failed named-plugin request with a local tool or a different service.",
+    "Google Tasks means the remote Google Tasks account. A plain task or OpenAssist Today request means the local OpenAssist planner. Apple Reminders is used only when the user explicitly names Apple Reminders or the Reminders app.",
     "For a general to-do question, use the aggregated task capability so enabled task sources are labeled. If the user names one source, use only that source.",
     "For writes, a plain task, to-do, planner item, or 'remind me' request means the OpenAssist planner. Use Apple Reminders write capabilities only when the user explicitly says Apple Reminders or the Reminders app.",
     "Move one named OpenAssist task with knowledge_move_daily_item. Bind the named source (for example backlog) and destination (for example today) in the same call. Never copy it to the destination and then separately delete the source.",
     "For saved memory or past-agent questions, use personal recall. It searches memory first and sessions second. Do not replace a failed recall with another search or a worker.",
     "For local MCP work, discovery is only an internal step. Select and execute the exact returned tool before answering.",
+    "For OpenAssist Workspace MCP work, discovery is only an internal step. Select and execute the exact returned workspace tool before answering.",
+    "For any other connected plugin, discovery is only an internal step. Select and execute the exact returned plugin tool before answering. If the plugin is not connected, say which connection is needed; do not claim the service is unsupported.",
     "For image requests, use the Codex image capability. Do not delegate image generation.",
     "",
     "# Voice behavior",
@@ -3032,6 +3126,92 @@ class RealtimeProxySession {
             result = {
               __voiceCapabilityStatus: "approval_required",
               message: stringValue(calledObject.message, calledObject.error) || "This local MCP write needs your confirmation.",
+              output: called
+            };
+          } else {
+            result = called;
+          }
+        }
+      } else if (descriptor.id === "workspace_mcp_discover") {
+        const workspaceMCP = this.configProvider().workspaceMCP;
+        if (!workspaceMCP?.enabled) throw new Error("OpenAssist Workspace MCP is not available to Live Voice.");
+        const discovered = await workspaceMCP.findTools({
+          ...args,
+          query: stringValue(args.query, request.goal),
+          limit: Number(args.limit) || 5
+        });
+        const matches = localMCPMatches(discovered);
+        if (!matches.length) {
+          const error = stringValue(jsonObject(discovered)?.error) || "No compatible OpenAssist Workspace tool was found.";
+          throw new Error(error);
+        }
+        result = {
+          __voiceCapabilityStatus: "selection_required",
+          message: "Select one exact OpenAssist Workspace toolID from the result, then call workspace_mcp_execute. Do not report the candidate count as the answer.",
+          output: { matches, originalRequest: request.goal }
+        };
+      } else if (descriptor.id === "workspace_mcp_execute") {
+        const workspaceMCP = this.configProvider().workspaceMCP;
+        if (!workspaceMCP?.enabled) throw new Error("OpenAssist Workspace MCP is not available to Live Voice.");
+        const toolID = stringValue(args.toolID);
+        if (!toolID) {
+          result = {
+            __voiceCapabilityStatus: "clarification_required",
+            message: "Select the exact OpenAssist Workspace toolID before execution."
+          };
+        } else {
+          const callArgs = request.confirmationToken ? { ...args, confirmed: true } : args;
+          const called = await workspaceMCP.callTool(callArgs);
+          const calledObject = jsonObject(called);
+          if (calledObject?.confirmationRequired === true || calledObject?.status === "approval_required") {
+            result = {
+              __voiceCapabilityStatus: "approval_required",
+              message: stringValue(calledObject.message, calledObject.error) || "This OpenAssist Workspace change needs your confirmation.",
+              output: called
+            };
+          } else {
+            result = called;
+          }
+        }
+      } else if (descriptor.id === "plugin_mcp_connect") {
+        const pluginMCP = this.configProvider().pluginMCP;
+        if (!pluginMCP?.enabled) throw new Error("Plugin connection access is not available to Live Voice.");
+        result = await pluginMCP.connect(args);
+      } else if (descriptor.id === "plugin_mcp_discover") {
+        const pluginMCP = this.configProvider().pluginMCP;
+        if (!pluginMCP?.enabled) throw new Error("Connected plugin access is not available to Live Voice.");
+        const discovered = await pluginMCP.findTools({
+          ...args,
+          query: stringValue(args.query, request.goal),
+          limit: Number(args.limit) || 5
+        });
+        const matches = localMCPMatches(discovered);
+        if (!matches.length) {
+          const error = stringValue(jsonObject(discovered)?.error) || "No compatible connected plugin tool was found.";
+          throw new Error(error);
+        }
+        result = {
+          __voiceCapabilityStatus: "selection_required",
+          message: "Select one exact plugin toolID from the result, then call plugin_mcp_execute. Do not report the candidate count as the answer.",
+          output: { matches, originalRequest: request.goal }
+        };
+      } else if (descriptor.id === "plugin_mcp_execute") {
+        const pluginMCP = this.configProvider().pluginMCP;
+        if (!pluginMCP?.enabled) throw new Error("Connected plugin access is not available to Live Voice.");
+        const toolID = stringValue(args.toolID);
+        if (!toolID) {
+          result = {
+            __voiceCapabilityStatus: "clarification_required",
+            message: "Select the exact connected plugin toolID before execution."
+          };
+        } else {
+          const callArgs = request.confirmationToken ? { ...args, confirmed: true } : args;
+          const called = await pluginMCP.callTool(callArgs);
+          const calledObject = jsonObject(called);
+          if (calledObject?.confirmationRequired === true || calledObject?.status === "approval_required") {
+            result = {
+              __voiceCapabilityStatus: "approval_required",
+              message: stringValue(calledObject.message, calledObject.error) || "This plugin change needs your confirmation.",
               output: called
             };
           } else {

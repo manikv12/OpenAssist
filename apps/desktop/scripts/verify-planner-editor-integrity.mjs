@@ -12,8 +12,10 @@ import { EditorState, Plugin, PluginKey, TextSelection } from "prosemirror-state
 
 const appPath = path.resolve("src/App.tsx");
 const bridgePath = path.resolve("electron/openassistBridge.ts");
+const stylesPath = path.resolve("src/styles.css");
 const appSource = fs.readFileSync(appPath, "utf8");
 const bridgeSource = fs.readFileSync(bridgePath, "utf8");
+const stylesSource = fs.readFileSync(stylesPath, "utf8");
 
 function sourceFile(source, fileName, scriptKind) {
   return ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, scriptKind);
@@ -862,6 +864,14 @@ assert.match(appSource, /isolating:\s*true/, "planner item nodes must isolate th
 assert.match(appSource, /draggable:\s*false/, "planner item nodes must not be split by dragging");
 assert.match(appSource, /plannerStepID/, "planner steps must retain permanent IDs");
 assert.match(appSource, /OpenAssistPlannerIdentity/, "new planner steps must receive IDs in the editor");
+assert.match(appSource, /OpenAssistPlannerTaskCollapse/, "long planner tasks need a compact details presentation");
+assert.match(appSource, /stepCount\s*>=\s*3\s*\|\|\s*extraTextLength\s*>\s*180/, "only genuinely long planner tasks should collapse by default");
+assert.match(appSource, /dataset\.plannerTaskToggle/, "the compact task control must retain its stable planner item ID");
+assert.match(appSource, /function PlannerTaskDetailDrawer/, "long planner tasks need an integrated task details drawer");
+assert.match(appSource, /onOpenTask\?\.\(itemID\)/, "the compact task control must open the matching drawer item");
+assert.match(stylesSource, /planner-collapsible-task\.is-collapsed/, "collapsed planner tasks must hide their long body without changing Markdown");
+assert.match(stylesSource, /planner-task-expand-toggle/, "collapsed planner tasks need a visible details control");
+assert.match(stylesSource, /planner-task-detail-drawer/, "the task drawer needs a stable integrated layout");
 assert.match(
   appSource,
   /content:\s*plannerEditorMarkdown\(value,\s*plannerSourceKind\)/,

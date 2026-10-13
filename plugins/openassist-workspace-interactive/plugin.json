@@ -1,0 +1,36 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dev-6a7c8e7769008191ad8bc9ae253cb2ee",
+  "version": "1.2.1",
+  "description": "An interactive daily workspace and project library inside ChatGPT, powered by your existing OpenAssist connections.",
+  "author": {
+    "name": "Developing Adventures",
+    "url": "https://developingadventures.com"
+  },
+  "homepage": "https://mail-mcp.developingadventures.com",
+  "keywords": ["productivity", "workspace", "email", "projects", "research"],
+  "extensions": {
+    "com.openai": {
+      "apps": "./.app.json",
+      "interface": {
+        "displayName": "OpenAssist Workspace",
+        "shortDescription": "Your daily workspace, in chat",
+        "longDescription": "Review current email, tasks and calendar events. Browse and edit project sections, compare retained revisions, save separate research sources, search your knowledge, and inspect account access. Every change has a clear confirmation. Existing Google connections and Markdown storage are preserved.",
+        "developerName": "Developing Adventures",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://mail-mcp.developingadventures.com",
+        "privacyPolicyURL": "https://mail-mcp.developingadventures.com/privacy",
+        "termsOfServiceURL": "https://mail-mcp.developingadventures.com/terms",
+        "brandColor": "#0E8A86",
+        "composerIcon": "./assets/openassist-menu-icon.png",
+        "logo": "./assets/openassist-logo.png",
+        "defaultPrompt": [
+          "Open my interactive workspace and show what needs attention today.",
+          "Open my projects so I can review and update a project log.",
+          "Search my saved research and show the original sources."
+        ]
+      }
+    }
+  }
+}

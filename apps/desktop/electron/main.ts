@@ -1,9 +1,9 @@
-import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, shell, systemPreferences, Tray, type ContextMenuParams, type OpenDialogOptions, type WebContents } from "electron";
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, screen, session, shell, systemPreferences, Tray, type ContextMenuParams, type OpenDialogOptions, type WebContents } from "electron";
 import fs from "node:fs";
 import { execFileSync, spawn, spawnSync, execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   buildGoogleCommandPlan,
@@ -35,6 +35,11 @@ import {
   type NativePermissionID,
   type NativePermissionState
 } from "./nativeAccess.js";
+import { shouldSuppressLiveVoiceHUD } from "./voiceHUDVisibility.js";
+import { registerMemorySourceSyncIPC } from "./memorySourceSyncIPC.js";
+import { MemorySourceWorkspaceCoordinator } from "./memorySourceWorkspaceCoordinator.js";
+import { SecondBrainOwnerCodexHost } from "./secondBrainOwnerCodexHost.js";
+import { SecondBrainOwnerRunnerService } from "./secondBrainOwnerRunnerService.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -91,6 +96,7 @@ let voiceHUDInteractiveApplied: boolean | null = null;
 // no live payload arrives within the grace window.
 let voiceHUDLiveHideTimer: NodeJS.Timeout | null = null;
 let lastLiveVoiceHUDSnapshot: VoiceHUDPayload | null = null;
+let voiceHUDVisibilitySyncTimer: NodeJS.Timeout | null = null;
 let voiceCaptureHUDKeepAliveTimer: NodeJS.Timeout | null = null;
 // The live HUD pill is draggable. Remember where the user parked it (anchored
 // at its bottom-left so height changes grow upward) and stop re-centering it.
@@ -226,6 +232,9 @@ let frontmostTrackerTimer: NodeJS.Timeout | null = null;
 let frontmostSnapshotInFlight: Promise<FrontmostApplicationSnapshot | null> | null = null;
 let lastExternalApplication: FrontmostApplicationSnapshot | null = null;
 let lastFrontmostSnapshot: FrontmostApplicationSnapshot | null = null;
+let pendingTranscriptTargetApplication: FrontmostApplicationSnapshot | null = null;
+let transcriptInsertionRequestSequence = 0;
+const pendingRendererTranscriptInsertions = new Map<string, (handled: boolean) => void>();
 const frontmostTrackerIntervalMs = 5_000;
 type AssistantWindowMode = "full" | "sidebar" | "notch";
 
@@ -258,6 +267,7 @@ let voiceCapture: {
   whisperModelID?: string;
   whisperModelPath?: string;
   whisperUseCoreML?: boolean;
+  targetApplication?: FrontmostApplicationSnapshot;
 } | null = null;
 type WakeWordStatusState = "idle" | "starting" | "listening" | "detected" | "error" | "stopped";
 type WakeWordStatusPayload = {
@@ -391,6 +401,35 @@ type TranscriptInsertionResult = {
   debugStatus?: string;
   method?: string;
 };
+
+function ownApplicationSnapshot(): FrontmostApplicationSnapshot {
+  return {
+    pid: process.pid,
+    bundleIdentifier: "com.developingadventures.openassist",
+    name: "Open Assist",
+    capturedAt: Date.now()
+  };
+}
+
+async function insertTranscriptInOpenAssistRenderer(text: string): Promise<boolean> {
+  const requestID = `transcript-${Date.now()}-${++transcriptInsertionRequestSequence}`;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const finish = (handled: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      pendingRendererTranscriptInsertions.delete(requestID);
+      resolve(handled);
+    };
+    timer = setTimeout(() => finish(false), 1_500);
+    pendingRendererTranscriptInsertions.set(requestID, finish);
+    if (!safeSendWindow(mainWindow, "openassist:insert-transcript-in-app", { requestID, text })) {
+      finish(false);
+    }
+  });
+}
 type ShortcutTarget = "holdToTalk" | "continuousToggle" | "assistantLiveVoice" | "assistantCompact" | "screenAnalysis";
 type ShortcutPhase = "trigger" | "down" | "up";
 type ShortcutSettingsSnapshot = {
@@ -451,6 +490,11 @@ const pasteLastTranscriptAccelerator = process.platform === "darwin" ? "Command+
 const menuBarPopoverSize = { width: 320, height: 510 };
 let shortcutMonitorProcess: ChildProcess | null = null;
 let shortcutMonitorGeneration = 0;
+let shortcutMonitorNeedsInputAccess = false;
+let shortcutMonitorPermissionPromptShown = false;
+let shortcutMonitorPermissionPromptOpen = false;
+let shortcutMonitorPermissionRegistrationAttempted = false;
+let shortcutMonitorHelperAppPath: string | null = null;
 const noDictationSoundName = "None";
 const dictationSoundOptions = new Set([
   noDictationSoundName,
@@ -612,14 +656,33 @@ const openAssistDefaultsDomain = "com.developingadventures.OpenAssist";
 const liquidGlassChromeStyle = "Liquid Glass";
 const liquidGlassDefaultMigrationKey = "OpenAssist.liquidGlassDefaultMigrated";
 
+// Each read spawns /usr/bin/defaults SYNCHRONOUSLY on the main process
+// (50-200ms, worse under load). The dictation start/stop sound cues resolved
+// 2-3 keys per press this way, which was a visible chunk of shortcut latency.
+// Values in this domain are written by this app, so a short cache is safe;
+// every writeNative* call clears it.
+const nativeDefaultsReadCache = new Map<string, { value: string; readAt: number }>();
+const nativeDefaultsReadCacheTTLMs = 5_000;
+
+function invalidateNativeDefaultsReadCache() {
+  nativeDefaultsReadCache.clear();
+}
+
 function readNativeDefaultSync(key: string, fallback: string) {
+  const cached = nativeDefaultsReadCache.get(key);
+  if (cached && Date.now() - cached.readAt < nativeDefaultsReadCacheTTLMs) {
+    return cached.value || fallback;
+  }
   try {
     const stdout = execFileSync("defaults", ["read", openAssistDefaultsDomain, key], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
     });
-    return stdout.trim() || fallback;
+    const value = stdout.trim();
+    nativeDefaultsReadCache.set(key, { value, readAt: Date.now() });
+    return value || fallback;
   } catch {
+    nativeDefaultsReadCache.set(key, { value: "", readAt: Date.now() });
     return fallback;
   }
 }
@@ -638,12 +701,14 @@ function readNativeBoolDefaultSync(key: string, fallback: boolean) {
 
 function writeNativeStringDefaultSync(key: string, value: string) {
   execFileSync("defaults", ["write", openAssistDefaultsDomain, key, "-string", value], { stdio: "ignore" });
+  invalidateNativeDefaultsReadCache();
 }
 
 function writeNativeBoolDefaultSync(key: string, value: boolean) {
   execFileSync("defaults", ["write", openAssistDefaultsDomain, key, "-bool", value ? "true" : "false"], {
     stdio: "ignore"
   });
+  invalidateNativeDefaultsReadCache();
 }
 
 function synchronizeNativeDefaultsSync() {
@@ -821,6 +886,66 @@ function openAssistBridge() {
   return bridgeModule;
 }
 
+let memorySourceWorkspaceCoordinator: MemorySourceWorkspaceCoordinator | null = null;
+async function loadMemorySourceWorkspaceCoordinator() {
+  if (memorySourceWorkspaceCoordinator) return memorySourceWorkspaceCoordinator;
+  const bridge = await openAssistBridge();
+  memorySourceWorkspaceCoordinator = new MemorySourceWorkspaceCoordinator({
+    statePath: path.join(app.getPath("userData"), "SecondBrain", "MemorySources", "sync-state.json"),
+    machineID: bridge.remoteAccessMachineID(),
+    machineName: os.hostname(),
+    homeDir: os.homedir(),
+    callWorkspaceTool: (toolName, args) => bridge.callAuthenticatedOpenAssistWorkspaceTool(toolName, args)
+  });
+  return memorySourceWorkspaceCoordinator;
+}
+
+let secondBrainOwnerRunnerService: SecondBrainOwnerRunnerService | null = null;
+
+function secondBrainOwnerRunnerPreferencePath() {
+  return path.join(app.getPath("userData"), "SecondBrain", "owner-runner.json");
+}
+
+function secondBrainOwnerRunnerEnabled() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(secondBrainOwnerRunnerPreferencePath(), "utf8")) as { enabled?: unknown };
+    return stored.enabled !== false;
+  } catch {
+    return true;
+  }
+}
+
+function saveSecondBrainOwnerRunnerEnabled(enabled: boolean) {
+  const target = secondBrainOwnerRunnerPreferencePath();
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, `${JSON.stringify({ enabled, updatedAt: Date.now() }, null, 2)}\n`, { mode: 0o600 });
+  try { fs.chmodSync(target, 0o600); } catch { /* Best-effort permissions hardening. */ }
+}
+
+function loadSecondBrainOwnerRunnerService() {
+  if (secondBrainOwnerRunnerService) return secondBrainOwnerRunnerService;
+  secondBrainOwnerRunnerService = new SecondBrainOwnerRunnerService({
+    enabled: secondBrainOwnerRunnerEnabled(),
+    pollIntervalMs: 60_000,
+    // An empty queue backs off to this ceiling instead of claiming every minute.
+    idlePollIntervalMs: 900_000,
+    createHost: async () => {
+      const bridge = await openAssistBridge();
+      return new SecondBrainOwnerCodexHost({
+        workspaceToolCaller: {
+          callNamedTool: (name, args) => bridge.callAuthenticatedOpenAssistWorkspaceTool(name, args),
+        },
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+      });
+    },
+    onStatus: (status) => {
+      debugLog(`Second Brain runner enabled=${status.enabled} running=${status.running} paused=${status.paused} reason=${status.reason} outcome=${status.lastOutcome?.status ?? "none"}${status.poll ? ` nextPollMs=${status.poll.nextPollMs}` : ""}${status.lastError ? ` error=${status.lastError}` : ""}`);
+    },
+  });
+  return secondBrainOwnerRunnerService;
+}
+
 function stopAssistantVoiceOutputForSessionEnd(reason: string) {
   void openAssistBridge()
     .then((bridge) => bridge.stopAssistantVoiceOutput())
@@ -831,6 +956,25 @@ function stopAssistantVoiceOutputForSessionEnd(reason: string) {
 
 function isVisibleWindow(window: BrowserWindow | null) {
   return Boolean(window && !window.isDestroyed() && window.isVisible());
+}
+
+function isVisibleUserWindow(window: BrowserWindow | null) {
+  return Boolean(window && !window.isDestroyed() && window.isVisible() && !window.isMinimized());
+}
+
+function hasVisibleOpenAssistUserSurface() {
+  return isVisibleUserWindow(mainWindow)
+    || isVisibleUserWindow(settingsWindow)
+    || isVisibleUserWindow(transcriptHistoryWindow)
+    || isVisibleUserWindow(menuBarPopoverWindow)
+    || isVisibleUserWindow(screenSelectionWindow)
+    || isVisibleUserWindow(screenAnalysisWindow)
+    || isVisibleUserWindow(screenAnalysisFrameWindow);
+}
+
+function openAssistAppIsActive() {
+  const focused = BrowserWindow.getFocusedWindow();
+  return Boolean(focused && focused !== voiceHUDWindow);
 }
 
 function isScreenAnalysisSurfaceActive() {
@@ -4956,20 +5100,35 @@ function restoreLiveVoiceHUDAfterCaptureEnd() {
 }
 
 function shouldSuppressFloatingVoiceHUD(payload: VoiceHUDPayload) {
-  if (payload.suppressForAppFocus) return true;
-  // Only suppress the floating live pill while the main window is actually
-  // focused (its in-app voice UI is on screen). "Visible somewhere behind
-  // other apps" used to count, which flapped the pill in and out while the
-  // user worked elsewhere during a delegated task.
-  if (
-    isLiveVoiceHUDStatus(payload.status)
-    && mainWindow
-    && !mainWindow.isDestroyed()
-    && mainWindow.isVisible()
-    && !mainWindow.isMinimized()
-    && mainWindow.isFocused()
-  ) return true;
-  return false;
+  return shouldSuppressLiveVoiceHUD({
+    liveVoice: isLiveVoiceHUDStatus(payload.status),
+    rendererRequestedSuppression: payload.suppressForAppFocus === true,
+    appActive: openAssistAppIsActive(),
+    visibleOpenAssistSurface: hasVisibleOpenAssistUserSurface()
+  });
+}
+
+function scheduleLiveVoiceHUDVisibilitySync(reason: string, delayMs = 30) {
+  if (voiceHUDVisibilitySyncTimer) clearTimeout(voiceHUDVisibilitySyncTimer);
+  voiceHUDVisibilitySyncTimer = setTimeout(() => {
+    voiceHUDVisibilitySyncTimer = null;
+    const payload = isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)
+      ? pendingVoiceHUDPayload
+      : isLiveVoiceHUDStatus(lastLiveVoiceHUDSnapshot?.status)
+        ? lastLiveVoiceHUDSnapshot
+        : null;
+    if (!payload) return;
+    debugLog(
+      `live HUD visibility sync reason=${reason}`
+      + ` appActive=${String(openAssistAppIsActive())}`
+      + ` visibleSurface=${String(hasVisibleOpenAssistUserSurface())}`
+    );
+    // Clear the renderer hint. The main process now makes the decision from
+    // native app/window state, so a stale page-focus event cannot re-show or
+    // hide the window in a loop.
+    void updateVoiceHUD({ ...payload, visible: true, suppressForAppFocus: false });
+  }, delayMs);
+  voiceHUDVisibilitySyncTimer.unref?.();
 }
 
 function isInteractiveVoiceHUDStatus(status: VoiceHUDPayload["status"]) {
@@ -5056,8 +5215,11 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     && payload.tone === undefined
     && payload.source === undefined
     && payload.replacement === undefined;
-  // A live payload without focus-suppression cancels any pending live hide.
-  if (voiceHUDLiveHideTimer && isLiveVoiceHUDStatus(payload.status) && !payload.suppressForAppFocus) {
+  // Any valid live payload proves the session is still active, even when the
+  // outside window is suppressed because the user is inside OpenAssist.
+  // Otherwise an idle update from an auxiliary renderer can let this timer
+  // erase the real session and make the orb disappear/reappear.
+  if (voiceHUDLiveHideTimer && isLiveVoiceHUDStatus(payload.status)) {
     clearTimeout(voiceHUDLiveHideTimer);
     voiceHUDLiveHideTimer = null;
   }
@@ -5190,8 +5352,10 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     const presentationKey = `${isInteractiveVoiceHUDStatus(nextPayload.status) ? "i" : "p"}|${nextPayload.status === "analyzing-input" ? "focus" : "plain"}|${nextPayload.dictationCapture ? "dict" : "plain"}|${size.width}x${size.height}`;
     const alreadyPresented = window.isVisible() && voiceHUDPresentationKey === presentationKey;
     if (!alreadyPresented) {
+      const presentBeganAt = Date.now();
       voiceHUDPresentationKey = presentationKey;
       positionVoiceHUDWindow(window, nextPayload);
+      const positionedAt = Date.now();
       // setFocusable/setIgnoreMouseEvents rebuild the NSPanel style mask on
       // macOS, which makes the window blink out and back in. Only touch them
       // when interactivity actually changes.
@@ -5201,12 +5365,22 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
         window.setIgnoreMouseEvents(!interactiveHUD);
         window.setFocusable(interactiveHUD);
       }
+      const maskAppliedAt = Date.now();
       if (nextPayload.status === "analyzing-input") {
         window.show();
         window.focus();
         window.moveTop();
       } else if (!window.isVisible()) {
         window.showInactive();
+      }
+      const shownAt = Date.now();
+      // Each of these is a synchronous native window call; log any slow
+      // present so the latency breakdown points at the exact culprit.
+      if (shownAt - presentBeganAt > 60) {
+        debugLog(
+          `voice HUD present timing status=${String(nextPayload.status ?? "")}`
+          + ` positionMs=${positionedAt - presentBeganAt} maskMs=${maskAppliedAt - positionedAt} showMs=${shownAt - maskAppliedAt}`
+        );
       }
     }
   }
@@ -5223,6 +5397,10 @@ async function updateVoiceHUD(payload: VoiceHUDPayload) {
     }
   };
   if (isLevelOnlyUpdate) {
+    if (voiceHUDLiveHideTimer && isLiveVoiceHUDStatus(pendingVoiceHUDPayload?.status)) {
+      clearTimeout(voiceHUDLiveHideTimer);
+      voiceHUDLiveHideTimer = null;
+    }
     await runHUDScript(
       `window.updateOpenAssistVoiceHUDLevel(${JSON.stringify(nextPayload.level ?? 0)}, ${JSON.stringify(nextPayload.dictationLevel ?? 0)})`
     );
@@ -5470,8 +5648,7 @@ function registerConfiguredShortcuts(settings: ShortcutSettingsSnapshot) {
 function shouldUseShortcutMonitor(shortcut: { target: ShortcutTarget; keyCode: number; modifiers: number }) {
   if (process.platform !== "darwin") return false;
   return shortcut.keyCode === manualModifierOnlyKeyCode
-    || shortcut.target === "holdToTalk"
-    || shortcut.target === "assistantLiveVoice";
+    || shortcut.target === "holdToTalk";
 }
 
 function isShortcutTarget(value: unknown): value is ShortcutTarget {
@@ -5487,7 +5664,68 @@ function shortcutMonitorHelperSourcePath() {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
-async function ensureShortcutMonitorHelper() {
+type ShortcutMonitorHelperLocation = {
+  executablePath: string;
+  appBundlePath?: string;
+};
+
+function shortcutMonitorFileHash(filePath: string) {
+  return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+async function installPackagedShortcutMonitorHelper(): Promise<ShortcutMonitorHelperLocation> {
+  const sourceAppPath = path.join(
+    process.resourcesPath,
+    "native-helpers",
+    "Open Assist Shortcut Monitor.app"
+  );
+  const sourceExecutablePath = path.join(
+    sourceAppPath,
+    "Contents",
+    "MacOS",
+    "shortcut-monitor-helper"
+  );
+  if (!fs.existsSync(sourceExecutablePath)) {
+    throw new Error("Signed shortcut monitor helper is missing from the installed app.");
+  }
+
+  // Keep the permission owner at a stable, visible location. macOS does not
+  // reliably list a helper that is launched from inside another app bundle.
+  const userApplicationsDirectory = path.join(app.getPath("home"), "Applications");
+  const installedAppPath = path.join(userApplicationsDirectory, "Open Assist Shortcut Monitor.app");
+  const installedExecutablePath = path.join(
+    installedAppPath,
+    "Contents",
+    "MacOS",
+    "shortcut-monitor-helper"
+  );
+  const needsInstall = !fs.existsSync(installedExecutablePath)
+    || shortcutMonitorFileHash(installedExecutablePath) !== shortcutMonitorFileHash(sourceExecutablePath);
+  if (needsInstall) {
+    fs.mkdirSync(userApplicationsDirectory, { recursive: true });
+    const stagingPath = `${installedAppPath}.installing`;
+    fs.rmSync(stagingPath, { recursive: true, force: true });
+    fs.cpSync(sourceAppPath, stagingPath, { recursive: true, preserveTimestamps: true });
+    fs.rmSync(installedAppPath, { recursive: true, force: true });
+    fs.renameSync(stagingPath, installedAppPath);
+  }
+
+  const launchServicesRegister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+  if (fs.existsSync(launchServicesRegister)) {
+    try {
+      await runProcess(launchServicesRegister, ["-f", installedAppPath]);
+    } catch (error) {
+      debugLog(`shortcut monitor registration failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  shortcutMonitorHelperAppPath = installedAppPath;
+  return { executablePath: installedExecutablePath, appBundlePath: installedAppPath };
+}
+
+async function ensureShortcutMonitorHelper(): Promise<ShortcutMonitorHelperLocation> {
+  if (app.isPackaged) {
+    return installPackagedShortcutMonitorHelper();
+  }
   const sourcePath = shortcutMonitorHelperSourcePath();
   if (!sourcePath) throw new Error("Shortcut monitor helper source was not found.");
   const helperDirectory = path.join(app.getPath("userData"), "helpers", "Open Assist Shortcut Monitor");
@@ -5504,7 +5742,30 @@ async function ensureShortcutMonitorHelper() {
       // The shortcut monitor can still run ad-hoc during local development.
     }
   }
-  return helperPath;
+  shortcutMonitorHelperAppPath = null;
+  return { executablePath: helperPath };
+}
+
+async function requestShortcutMonitorInputAccess() {
+  if (
+    !app.isPackaged
+    || !shortcutMonitorHelperAppPath
+    || shortcutMonitorPermissionRegistrationAttempted
+  ) return;
+  shortcutMonitorPermissionRegistrationAttempted = true;
+  try {
+    // Launching the registered app bundle once gives macOS a stable identity
+    // to display in Privacy & Security > Input Monitoring.
+    await runProcess("/usr/bin/open", [
+      "-n",
+      "-g",
+      shortcutMonitorHelperAppPath,
+      "--args",
+      "--request-permission"
+    ]);
+  } catch (error) {
+    debugLog(`shortcut monitor permission request failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function stopShortcutMonitor() {
@@ -5519,16 +5780,90 @@ function handleShortcutMonitorLine(line: string) {
   const trimmed = line.trim();
   if (!trimmed) return;
   try {
-    const payload = JSON.parse(trimmed) as { target?: unknown; phase?: unknown; status?: unknown; error?: unknown };
+    const payload = JSON.parse(trimmed) as {
+      target?: unknown;
+      phase?: unknown;
+      status?: unknown;
+      error?: unknown;
+      application?: unknown;
+    };
     if (payload.status) {
-      debugLog(`shortcut monitor status=${String(payload.status)}`);
+      const status = String(payload.status);
+      debugLog(`shortcut monitor status=${status}`);
+      if (status === "ready") {
+        shortcutMonitorNeedsInputAccess = false;
+        shortcutMonitorPermissionPromptShown = false;
+        shortcutMonitorPermissionRegistrationAttempted = false;
+      } else if (status === "input-monitoring-required") {
+        shortcutMonitorNeedsInputAccess = true;
+        void requestShortcutMonitorInputAccess()
+          .finally(() => { void showShortcutMonitorPermissionHelp(); });
+      }
       return;
     }
     if (!isShortcutTarget(payload.target)) return;
+    const application = shortcutPayloadApplicationSnapshot(payload.application);
+    if (application) {
+      lastFrontmostSnapshot = application;
+      if (!isOwnApplicationSnapshot(application)) lastExternalApplication = application;
+    }
     const phase: ShortcutPhase = payload.phase === "down" || payload.phase === "up" ? payload.phase : "trigger";
+    debugLog(`shortcut monitor event target=${payload.target} phase=${phase}`);
     handleConfiguredShortcut(payload.target, phase);
   } catch (error) {
     debugLog(`shortcut monitor parse failed: ${error instanceof Error ? error.message : String(error)} line=${trimmed}`);
+  }
+}
+
+function shortcutPayloadApplicationSnapshot(value: unknown): FrontmostApplicationSnapshot | null {
+  if (!value || typeof value !== "object") return null;
+  const payload = value as Record<string, unknown>;
+  const pid = Number(payload.pid);
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  return {
+    pid,
+    bundleIdentifier: typeof payload.bundleIdentifier === "string" ? payload.bundleIdentifier : "",
+    name: typeof payload.name === "string" ? payload.name : "",
+    capturedAt: Date.now()
+  };
+}
+
+async function showShortcutMonitorPermissionHelp() {
+  if (
+    process.platform !== "darwin"
+    || shortcutMonitorPermissionPromptOpen
+    || shortcutMonitorPermissionPromptShown
+    || isQuitting
+  ) return;
+
+  shortcutMonitorPermissionPromptOpen = true;
+  shortcutMonitorPermissionPromptShown = true;
+  try {
+    const options: Electron.MessageBoxOptions = {
+      type: "info",
+      title: "Allow OpenAssist shortcuts",
+      message: "Allow Open Assist Shortcut Monitor in Input Monitoring.",
+      detail: "macOS requires you to turn this on. OpenAssist added Open Assist Shortcut Monitor to the list; enable its switch. If the list has not refreshed yet, close and reopen System Settings.",
+      buttons: ["Open System Settings", "Retry", "Not now"],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true
+    };
+    const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const result = owner
+      ? await dialog.showMessageBox(owner, options)
+      : await dialog.showMessageBox(options);
+    if (result.response === 0) {
+      await shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
+    } else if (result.response === 1) {
+      shortcutMonitorPermissionPromptShown = false;
+      shortcutMonitorPermissionRegistrationAttempted = false;
+      setTimeout(() => { void refreshConfiguredShortcuts(); }, 250);
+    }
+  } catch (error) {
+    debugLog(`shortcut monitor permission help failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    shortcutMonitorPermissionPromptOpen = false;
   }
 }
 
@@ -5542,7 +5877,7 @@ async function refreshShortcutMonitor(shortcuts: Array<{ target: ShortcutTarget;
   if (monitoredShortcuts.length === 0) return;
 
   try {
-    const helperPath = await ensureShortcutMonitorHelper();
+    const helperLocation = await ensureShortcutMonitorHelper();
     if (generation !== shortcutMonitorGeneration) return;
     const helperDirectory = path.join(app.getPath("userData"), "helpers", "Open Assist Shortcut Monitor");
     const configPath = path.join(helperDirectory, "shortcut-monitor-config.json");
@@ -5552,7 +5887,17 @@ async function refreshShortcutMonitor(shortcuts: Array<{ target: ShortcutTarget;
       JSON.stringify({ shortcuts: monitoredShortcuts }, null, 2),
       "utf8"
     );
-    const child = spawn(helperPath, [configPath], { stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      await runProcess("/usr/bin/pkill", ["-f", helperLocation.executablePath]);
+      await delay(80);
+    } catch {
+      // No stale shortcut helper was running.
+    }
+    const child = spawn(
+      helperLocation.executablePath,
+      [configPath, "--parent-pid", String(process.pid)],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
     shortcutMonitorProcess = child;
     let stdoutBuffer = "";
     child.stdout.setEncoding("utf8");
@@ -9240,8 +9585,7 @@ async function ensureTextInserterHelper() {
 function typingStrategyForTarget(target: FrontmostApplicationSnapshot | null | undefined): TextTypingStrategy {
   const targetBundle = target?.bundleIdentifier?.trim().toLowerCase() ?? "";
   if (targetBundle === "com.microsoft.rdc.macos") return "applescript-keystroke-preferred";
-  if (!targetBundle || targetBundle === "missing value") return "accessibility-direct-preferred";
-  return "unicode-events";
+  return "accessibility-direct-preferred";
 }
 
 async function typeTextByNativeHelper(text: string, strategy: TextTypingStrategy) {
@@ -9293,15 +9637,29 @@ async function typeTextForTarget(text: string, target: FrontmostApplicationSnaps
   return { ok: false, method: strategy };
 }
 
-async function pasteTextWithTransientClipboard(text: string, target: FrontmostApplicationSnapshot | null | undefined) {
+async function pasteTextWithTransientClipboard(
+  text: string,
+  target: FrontmostApplicationSnapshot | null | undefined
+): Promise<{ ok: boolean; method: string; error?: string }> {
   const targetBundle = target?.bundleIdentifier?.trim().toLowerCase() ?? "";
   const canTrustNativePasteSignal = Boolean(targetBundle && targetBundle !== "missing value");
+  let helperError: string | undefined;
   if (canTrustNativePasteSignal) {
     try {
       const nativeResult = await pasteTextByNativeHelper(text);
       if (nativeResult.ok) return nativeResult;
     } catch (error) {
-      debugLog(`native transient paste failed: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      debugLog(`native transient paste failed: ${message}`);
+      // The helper reports failures as a JSON payload on its last stdout line;
+      // surface its error (e.g. the missing-Accessibility explanation) to the
+      // user instead of a generic "could not paste".
+      try {
+        const parsed = JSON.parse(message) as { error?: string };
+        if (parsed.error?.trim()) helperError = parsed.error.trim();
+      } catch {
+        // Not a JSON payload — keep the generic error.
+      }
     }
   }
 
@@ -9321,7 +9679,7 @@ async function pasteTextWithTransientClipboard(text: string, target: FrontmostAp
       // Best-effort clipboard restore, same privacy-first shape as the native app.
     }
   }, 450);
-  return { ok: didPaste, method: "electron-transient-clipboard" };
+  return { ok: didPaste, method: "electron-transient-clipboard", error: helperError };
 }
 
 // Shown when an assistant turn finishes while the user is elsewhere (another
@@ -9485,8 +9843,29 @@ async function insertTranscriptText(text: string): Promise<TranscriptInsertionRe
 
   // Reuse the snapshot captured when dictation stopped (fired in
   // stopConfiguredVoiceInput) instead of paying another osascript round-trip.
+  const capturedTarget = pendingTranscriptTargetApplication;
+  pendingTranscriptTargetApplication = null;
   const frontmost = await frontmostApplicationSnapshotWithMaxAge(2_500);
-  const target = frontmost && !isOwnApplicationSnapshot(frontmost) ? frontmost : lastExternalApplication;
+  const ownTarget = capturedTarget && isOwnApplicationSnapshot(capturedTarget)
+    ? capturedTarget
+    : !capturedTarget && (mainWindow?.isFocused() || (frontmost && isOwnApplicationSnapshot(frontmost)))
+      ? frontmost && isOwnApplicationSnapshot(frontmost) ? frontmost : ownApplicationSnapshot()
+      : null;
+  if (ownTarget) {
+    const inserted = await insertTranscriptInOpenAssistRenderer(trimmed);
+    if (inserted) {
+      return { ok: true, result: "typed", target: ownTarget, method: "renderer" };
+    }
+    return {
+      ok: false,
+      result: "not-inserted",
+      target: ownTarget,
+      error: "Could not insert into the Open Assist composer.",
+      debugStatus: "renderer-insertion-failed"
+    };
+  }
+  const target = capturedTarget
+    ?? (frontmost && !isOwnApplicationSnapshot(frontmost) ? frontmost : lastExternalApplication);
   const resultTarget = target ?? undefined;
 
   // Only re-activate (and pay the 180ms settle delay) when the target is NOT
@@ -9497,14 +9876,9 @@ async function insertTranscriptText(text: string): Promise<TranscriptInsertionRe
     if (activated) await delay(180);
   }
 
-  const targetBundle = target?.bundleIdentifier?.trim().toLowerCase() ?? "";
-  const shouldTypeFirst = targetBundle === "com.microsoft.rdc.macos";
-
-  if (shouldTypeFirst) {
-    const typed = await typeTextForTarget(trimmed, target);
-    if (typed.ok) {
-      return { ok: true, result: "typed", target: resultTarget, method: typed.method };
-    }
+  const typed = await typeTextForTarget(trimmed, target);
+  if (typed.ok) {
+    return { ok: true, result: "typed", target: resultTarget, method: typed.method };
   }
 
   const pasted = await pasteTextWithTransientClipboard(trimmed, target);
@@ -9512,19 +9886,12 @@ async function insertTranscriptText(text: string): Promise<TranscriptInsertionRe
     return { ok: true, result: "pasted", target: resultTarget, method: pasted.method };
   }
 
-  if (!shouldTypeFirst) {
-    const typed = await typeTextForTarget(trimmed, target);
-    if (typed.ok) {
-      return { ok: true, result: "typed", target: resultTarget, method: typed.method };
-    }
-  }
-
   return {
     ok: false,
     result: "not-inserted",
     target: resultTarget,
-    error: "Could not paste into the focused app.",
-    debugStatus: shouldTypeFirst ? "typing-first-and-paste-failed" : "paste-and-typing-failed"
+    error: pasted.error?.trim() || "Could not insert into the focused app.",
+    debugStatus: "typing-and-paste-failed"
   };
 }
 
@@ -10343,20 +10710,36 @@ function waitForVoiceFile(sessionDirectory: string, names: string[], timeoutMs: 
     name: string;
     payload: { type?: string; text?: string; message?: string; audioPath?: string; fileName?: string; mimeType?: string };
   } | null>((resolve) => {
-    const timer = setInterval(() => {
+    let done = false;
+    let timer: NodeJS.Timeout | null = null;
+    let watcher: fs.FSWatcher | null = null;
+    const finish = (value: { name: string; payload: { type?: string; text?: string; message?: string } } | null) => {
+      if (done) return;
+      done = true;
+      if (timer) clearInterval(timer);
+      try { watcher?.close(); } catch { /* watcher already gone */ }
+      resolve(value);
+    };
+    const check = () => {
       for (const name of names) {
         const payload = readJsonFile<{ type?: string; text?: string; message?: string }>(path.join(sessionDirectory, name));
         if (payload) {
-          clearInterval(timer);
-          resolve({ name, payload });
+          finish({ name, payload });
           return;
         }
       }
-      if (Date.now() - startedAt > timeoutMs) {
-        clearInterval(timer);
-        resolve(null);
-      }
-    }, 25);
+      if (Date.now() - startedAt > timeoutMs) finish(null);
+    };
+    // The directory watch fires the moment the helper writes its file; the
+    // 25ms interval stays as a fallback (fs.watch can drop events) and owns
+    // the timeout. Checking immediately also removes the fixed first-poll wait.
+    try {
+      watcher = fs.watch(sessionDirectory, () => check());
+    } catch {
+      watcher = null;
+    }
+    timer = setInterval(check, 25);
+    check();
   });
 }
 
@@ -10487,6 +10870,13 @@ async function cleanupStaleVoiceHelpers(reason: string, keepPid?: number) {
   if (killed > 0) {
     debugLog(`voice helper cleanup reason="${reason}" killed=${killed}`);
   }
+}
+
+// Old-session pruning is synchronous disk work (readdir + stat + rmSync).
+// Running it inline on the shortcut press added jank exactly when the machine
+// was already busy, so every start path defers it until after listening began.
+function deferVoiceCaptureDirectoryCleanup(delayMs = 2_000) {
+  setTimeout(() => cleanupOldVoiceCaptureDirectories(), delayMs).unref?.();
 }
 
 function cleanupOldVoiceCaptureDirectories() {
@@ -11134,7 +11524,7 @@ async function startAppleVoiceInput(options?: VoiceStartOptions) {
     return { ok: false, error: "Native voice input is only available on macOS." };
   }
   await cleanupStaleVoiceHelpers("before Apple Speech start", voiceCapture?.helperPid);
-  cleanupOldVoiceCaptureDirectories();
+  deferVoiceCaptureDirectoryCleanup();
   clearMismatchedVoiceCapture("appleSpeech");
   if (voiceCapture) {
     return { ok: true };
@@ -11235,7 +11625,7 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   if (process.platform !== "darwin") {
     return { ok: false, error: "Cloud voice capture is only available on macOS in this Electron port." };
   }
-  cleanupOldVoiceCaptureDirectories();
+  deferVoiceCaptureDirectoryCleanup();
   clearMismatchedVoiceCapture("cloudProviders");
   if (voiceCapture) {
     return { ok: true };
@@ -11261,6 +11651,7 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   } else {
     await cleanupStaleVoiceHelpers("before cold cloud voice start");
   }
+  const adoptedAt = Date.now();
   let sessionDirectory: string;
   let helperProcess: ChildProcess;
   let helperAppPath: string;
@@ -11274,6 +11665,7 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
     fs.mkdirSync(sessionDirectory, { recursive: true });
     helperProcess = launchVoiceHelperApp(helperAppPath, sessionDirectory, "recording", configuration);
   }
+  const helperEnsuredAt = Date.now();
   voiceCapture = {
     sessionDirectory,
     appPath: helperAppPath,
@@ -11285,7 +11677,9 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   };
   ensureVoiceCaptureHUDKeepAlive();
   showActiveVoiceCaptureHUD();
+  const hudShownAt = Date.now();
   const ready = await waitForVoiceFile(sessionDirectory, ["ready.json", "error.json"], 12000);
+  const readyDetectedAt = Date.now();
   if (!ready) {
     requestVoiceHelperStop(sessionDirectory);
     terminateVoiceHelperCapture(voiceCapture, "cloud voice startup timeout");
@@ -11299,7 +11693,15 @@ async function startCloudVoiceInput(configuration?: VoiceStartOptions) {
   startVoiceLevelPolling(sessionDirectory);
   showActiveVoiceCaptureHUD();
   playDictationFeedbackSound("startListening", configuration);
-  debugLog(`voice start timing engine=cloudProviders warm=${warmStart} readyMs=${Date.now() - startBeganAt}`);
+  // Stage breakdown: adopt = warm-helper handoff (+ cold-path process scan),
+  // ensure = helper build check (+ cold-path spawn), hud = HUD show, wait =
+  // ready-file wait; helper* fields are measured inside the Swift helper.
+  const helperTiming = ready.payload as { prepareMs?: string; recordMs?: string; goToReadyMs?: string; prewarmed?: string };
+  debugLog(
+    `voice start timing engine=cloudProviders warm=${warmStart} readyMs=${Date.now() - startBeganAt}`
+    + ` adoptMs=${adoptedAt - startBeganAt} ensureMs=${helperEnsuredAt - adoptedAt} hudMs=${hudShownAt - helperEnsuredAt} waitMs=${readyDetectedAt - hudShownAt} postMs=${Date.now() - readyDetectedAt}`
+    + ` helperPrepareMs=${helperTiming.prepareMs ?? "-"} helperRecordMs=${helperTiming.recordMs ?? "-"} helperGoToReadyMs=${helperTiming.goToReadyMs ?? "-"} helperPrewarmed=${helperTiming.prewarmed ?? "-"}`
+  );
   // Park a fresh helper for the NEXT press while this one records.
   setTimeout(() => {
     void armVoiceRecordingHelper("re-arm after start");
@@ -11480,7 +11882,7 @@ async function startWhisperVoiceInput(configuration?: VoiceStartOptions) {
     return { ok: false, error: "whisper.cpp voice input is only available on macOS in this Electron port." };
   }
   await cleanupStaleVoiceHelpers("before whisper voice start", voiceCapture?.helperPid);
-  cleanupOldVoiceCaptureDirectories();
+  deferVoiceCaptureDirectoryCleanup();
   clearMismatchedVoiceCapture("whisperCpp");
   if (voiceCapture) {
     return { ok: true };
@@ -11611,6 +12013,12 @@ async function performConfiguredVoiceInputStart(options?: VoiceStartOptions): Pr
       };
     }
   }
+  pendingTranscriptTargetApplication = null;
+  const targetApplication = mainWindow?.isFocused()
+    ? ownApplicationSnapshot()
+    : lastFrontmostSnapshot && Date.now() - lastFrontmostSnapshot.capturedAt < 2_500
+      ? lastFrontmostSnapshot
+      : lastExternalApplication;
   void refreshFrontmostApplicationSnapshot();
   const configuration = options?.transcriptionEngine
     ? options
@@ -11620,6 +12028,12 @@ async function performConfiguredVoiceInputStart(options?: VoiceStartOptions): Pr
   else if (configuration.transcriptionEngine === "Cloud Providers") result = await startCloudVoiceInput(configuration);
   else if (configuration.transcriptionEngine === "whisper.cpp") result = await startWhisperVoiceInput(configuration);
   else result = { ok: false, error: `Unsupported transcription engine: ${configuration.transcriptionEngine}` };
+  if (result.ok && voiceCapture && targetApplication) {
+    voiceCapture.targetApplication = targetApplication;
+    debugLog(
+      `dictation target captured pid=${targetApplication.pid} bundle=${targetApplication.bundleIdentifier || "unknown"}`
+    );
+  }
   // A capture that never started must hand the mic back to Live Voice now —
   // the capture-end restore path will not run for it.
   if (!result.ok) restoreLiveVoiceMuteAfterDictation();
@@ -11647,6 +12061,8 @@ async function stopConfiguredVoiceInput() {
   //   step doesn't need its own ~100-400ms osascript round-trip;
   // - open the TLS connection to the cloud transcription provider so the
   //   upload that follows reuses it instead of doing a cold handshake.
+  const targetApplication = voiceCapture?.targetApplication;
+  if (targetApplication) pendingTranscriptTargetApplication = targetApplication;
   void refreshFrontmostApplicationSnapshot();
   if (voiceCapture?.engine === "cloudProviders") {
     void openAssistBridge()
@@ -11689,6 +12105,25 @@ function openAssistTargetPath(target: string) {
 
 app.whenReady().then(() => {
   debugLog("app ready");
+  // Reconcile from native window/app activation events. The renderer also
+  // reports focus, but page visibility can change during Settings navigation,
+  // Spaces transitions, and HUD presentation. Those competing reports caused
+  // the outside orb to repeatedly hide and reappear.
+  app.on("browser-window-created", (_event, window) => {
+    window.on("show", () => scheduleLiveVoiceHUDVisibilitySync("window show"));
+    window.on("hide", () => scheduleLiveVoiceHUDVisibilitySync("window hide", 60));
+    window.on("minimize", () => scheduleLiveVoiceHUDVisibilitySync("window minimize", 60));
+    window.on("restore", () => scheduleLiveVoiceHUDVisibilitySync("window restore"));
+  });
+  app.on("browser-window-focus", (_event, window) => {
+    if (window === voiceHUDWindow) return;
+    scheduleLiveVoiceHUDVisibilitySync("OpenAssist window focus");
+  });
+  app.on("browser-window-blur", (_event, window) => {
+    if (window === voiceHUDWindow) return;
+    // Let macOS finish changing the focused application before deciding to re-show.
+    scheduleLiveVoiceHUDVisibilitySync("OpenAssist window blur", 80);
+  });
   void cleanupStaleVoiceHelpers("app ready")
     .then(() => cleanupOldVoiceCaptureDirectories())
     .catch((error) => {
@@ -11795,11 +12230,20 @@ app.whenReady().then(() => {
     .catch((error) => {
       debugLog(`Remote Access startup restore failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  // Retitle old chats whose title is still the raw first message. A few per
+  // launch, delayed so it never competes with startup work.
+  void openAssistBridge()
+    .then((bridge) => bridge.backfillThreadTitlesOnStartup())
+    .catch((error) => {
+      debugLog(`thread title backfill failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
     const requestDetails = details as { mediaTypes?: string[] };
     const mediaTypes = Array.isArray(requestDetails.mediaTypes) ? requestDetails.mediaTypes : [];
     callback(permission === "media" && mediaTypes.includes("audio"));
   });
+
+  registerMemorySourceSyncIPC(ipcMain, loadMemorySourceWorkspaceCoordinator);
 
   ipcMain.handle("open-external", async (_event, url: string) => {
     if (typeof url === "string" && /^(https?:\/\/|mailto:|tel:|x-apple\.systempreferences:)/i.test(url)) {
@@ -11920,6 +12364,14 @@ app.whenReady().then(() => {
     }
   });
   ipcMain.handle("openassist:insert-transcript-text", async (_event, text: string) => insertTranscriptText(text));
+  ipcMain.on("openassist:insert-transcript-in-app-result", (_event, payload?: { requestID?: string; handled?: boolean }) => {
+    const requestID = String(payload?.requestID ?? "").trim();
+    const finish = pendingRendererTranscriptInsertions.get(requestID);
+    if (finish) finish(Boolean(payload?.handled));
+  });
+  ipcMain.on("openassist:transcript-inserted-in-renderer", () => {
+    pendingTranscriptTargetApplication = null;
+  });
   ipcMain.handle("openassist:notify-thread-complete", (_event, payload: { threadID?: string; title?: string; body?: string }) => {
     return showThreadCompletionNotification(payload ?? {});
   });
@@ -12686,6 +13138,17 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:knowledge-status", async () =>
     (await openAssistBridge()).loadKnowledgeStatus()
   );
+  ipcMain.handle("openassist:second-brain-owner-runner-status", async () =>
+    loadSecondBrainOwnerRunnerService().status()
+  );
+  ipcMain.handle("openassist:start-second-brain-owner-runner", async () => {
+    saveSecondBrainOwnerRunnerEnabled(true);
+    return loadSecondBrainOwnerRunnerService().setEnabled(true);
+  });
+  ipcMain.handle("openassist:stop-second-brain-owner-runner", async () => {
+    saveSecondBrainOwnerRunnerEnabled(false);
+    return loadSecondBrainOwnerRunnerService().setEnabled(false);
+  });
   ipcMain.handle("openassist:list-knowledge-requests", async (_event, status?: "pending" | "applied" | "rejected") =>
     (await openAssistBridge()).listKnowledgeWriteRequests(status)
   );
@@ -13092,7 +13555,20 @@ app.whenReady().then(() => {
   ipcMain.handle("openassist:realtime-list-voices", async () =>
     (await openAssistBridge()).listCodexRealtimeVoices()
   );
-  ipcMain.handle("openassist:update-voice-hud", async (_event, payload: VoiceHUDPayload) => updateVoiceHUD(payload ?? { visible: false }));
+  ipcMain.handle("openassist:update-voice-hud", async (event, payload: VoiceHUDPayload) => {
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    const normalizedPayload = payload ?? { visible: false };
+    if (
+      senderWindow
+      && senderWindow !== mainWindow
+      && liveVoiceHUDSessionActive()
+      && !isLiveVoiceHUDStatus(normalizedPayload.status)
+    ) {
+      debugLog(`ignored auxiliary voice HUD update during live session title=${senderWindow.getTitle()}`);
+      return { ok: true, ignored: true, visible: Boolean(voiceHUDWindow?.isVisible()) };
+    }
+    return updateVoiceHUD(normalizedPayload);
+  });
   // Manual drag for the live HUD's click surfaces (orb + caption). The HUD
   // sends absolute screen coordinates at most once per animation frame. This
   // is intentionally fire-and-forget: waiting for an IPC reply made the
@@ -13224,6 +13700,15 @@ app.whenReady().then(() => {
       .then((bridge) => bridge.prewarmLiveVoiceTransport("startup"))
       .catch(() => undefined);
   }, 6_000);
+  // Poll the private owner queue after app startup. The isolated Codex process
+  // remains unstarted until the Workspace actually returns a claimed item.
+  setTimeout(() => {
+    void loadSecondBrainOwnerRunnerService().start("app-ready");
+  }, 10_000);
+  powerMonitor.on("suspend", () => { void secondBrainOwnerRunnerService?.pause("sleep"); });
+  powerMonitor.on("lock-screen", () => { void secondBrainOwnerRunnerService?.pause("lock"); });
+  powerMonitor.on("resume", () => { void loadSecondBrainOwnerRunnerService().resume("wake"); });
+  powerMonitor.on("unlock-screen", () => { void loadSecondBrainOwnerRunnerService().resume("unlock"); });
   setTimeout(installApplicationMenu, 800);
   setTimeout(prewarmSettingsWindow, 2200);
   if (process.platform === "darwin") {
@@ -13237,6 +13722,9 @@ app.whenReady().then(() => {
   app.on("activate", () => {
     nativePermissionBroker.invalidate();
     void nativePermissionBroker.getSnapshot().catch(() => undefined);
+    if (shortcutMonitorNeedsInputAccess && !shortcutMonitorProcess) {
+      setTimeout(() => { void refreshConfiguredShortcuts(); }, 350);
+    }
     ensureRegularDockPresence("app activate");
     if (isScreenAnalysisSurfaceActive()) {
       debugLog("app activate ignored while screen analysis surface is active");
@@ -13253,6 +13741,7 @@ app.whenReady().then(() => {
 
 app.on("before-quit", (event) => {
   isQuitting = true;
+  void secondBrainOwnerRunnerService?.stop("app-quit");
   disarmVoiceHelper("app quitting");
   if (!ollamaQuitCleanupStarted && !ollamaQuitCleanupFinished) {
     event.preventDefault();
@@ -13327,4 +13816,10 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+// Curated Drive memory sync also has a compact native menu.
+app.whenReady().then(async () => {
+  const { startMemorySourceSyncRuntime } = await import("./memorySourceSyncRuntime.js");
+  startMemorySourceSyncRuntime();
 });

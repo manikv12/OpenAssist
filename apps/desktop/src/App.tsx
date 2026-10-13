@@ -68,6 +68,7 @@ import {
   FileDown,
   FilePlus2,
   FolderMinus,
+  FolderSync,
   Gauge,
   GitBranch,
   Globe2,
@@ -82,6 +83,7 @@ import {
   Info,
   Italic,
   Keyboard,
+  Laptop,
   Layers3,
   LayoutGrid,
   List,
@@ -1883,6 +1885,14 @@ function normalizeRendererAppState(state: OpenAssistAppState): OpenAssistAppStat
   };
 }
 
+function mergePartialThreadList(current: ThreadItem[], incoming: ThreadItem[]): ThreadItem[] {
+  const incomingIDs = new Set(incoming.map((thread) => thread.id.toLowerCase()));
+  return [
+    ...incoming,
+    ...current.filter((thread) => !incomingIDs.has(thread.id.toLowerCase()))
+  ].sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+}
+
 function parseCodexThemeShare(value: string): CodexThemeShare {
   const trimmed = value.trim();
   if (!trimmed.startsWith(codexThemeSharePrefix)) {
@@ -2594,6 +2604,17 @@ const realtimeGeminiVoiceOptions = [
   { value: "Fenrir", label: "Fenrir" },
   { value: "Kore", label: "Kore" },
   { value: "Puck", label: "Puck" }
+];
+const realtimeCodexVoiceOptions = [
+  { value: "cove", label: "cove · default" },
+  { value: "juniper", label: "juniper" },
+  { value: "maple", label: "maple" },
+  { value: "spruce", label: "spruce" },
+  { value: "ember", label: "ember" },
+  { value: "vale", label: "vale" },
+  { value: "breeze", label: "breeze" },
+  { value: "arbor", label: "arbor" },
+  { value: "sol", label: "sol" }
 ];
 const realtimeOpenAIVoiceOptions = [
   { value: "marin", label: "marin · recommended" },
@@ -3698,6 +3719,104 @@ const OpenAssistPlannerTaskItem = TaskItem.extend({
   renderMarkdown(node: JSONContent, helpers: MarkdownRendererHelpers) {
     const checkedChar = node.attrs?.checked ? "x" : " ";
     return renderNestedMarkdownContent(node, helpers, `- [${checkedChar}] `);
+  }
+});
+
+function plannerTaskCollapseDetails(node: ProseMirrorNode, position: number) {
+  const metadata = plannerItemMetadata(node.attrs?.metadata);
+  const itemID = String(metadata.id ?? "").trim() || `planner-item-${position}`;
+  let title = "";
+  let titleEndPosition: number | null = null;
+  let stepCount = 0;
+
+  node.descendants((child, relativePosition) => {
+    if (child.type.name === "paragraph" && titleEndPosition == null) {
+      title = child.textContent.trim();
+      titleEndPosition = position + 1 + relativePosition + child.nodeSize - 1;
+      return false;
+    }
+    if (child.type.name === "taskItem" && String(child.attrs?.plannerStepID ?? "").trim()) {
+      stepCount += 1;
+      return false;
+    }
+    return true;
+  });
+
+  const extraTextLength = Math.max(0, node.textContent.trim().length - title.length);
+  const collapsible = stepCount >= 3 || extraTextLength > 180;
+  return { itemID, titleEndPosition, stepCount, collapsible };
+}
+
+function plannerTaskCollapseDecorations(doc: ProseMirrorNode) {
+  const decorations: Decoration[] = [];
+  doc.descendants((node, position) => {
+    if (node.type.name !== "oaPlannerItem") return true;
+    const details = plannerTaskCollapseDetails(node, position);
+    if (!details.collapsible || details.titleEndPosition == null) return false;
+    decorations.push(Decoration.node(position, position + node.nodeSize, {
+      class: "planner-collapsible-task is-collapsed",
+      "data-planner-collapsible-task": "true"
+    }));
+    decorations.push(Decoration.widget(details.titleEndPosition, () => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.contentEditable = "false";
+      button.className = "planner-task-expand-toggle";
+      button.dataset.plannerTaskToggle = details.itemID;
+      button.setAttribute("aria-haspopup", "dialog");
+      button.setAttribute("aria-label", "Open task details");
+
+      const label = document.createElement("span");
+      label.textContent = details.stepCount
+        ? `${details.stepCount} ${details.stepCount === 1 ? "step" : "steps"}`
+        : "Details";
+      button.append(label);
+      return button;
+    }, {
+      side: 1,
+      key: `planner-task-collapse:${details.itemID}:${details.stepCount}`
+    }));
+    return false;
+  });
+  return DecorationSet.create(doc, decorations);
+}
+
+const OpenAssistPlannerTaskCollapse = Extension.create<{
+  enabled: boolean;
+  onOpenTask?: (itemID: string) => void;
+}>({
+  name: "openAssistPlannerTaskCollapse",
+  addOptions() {
+    return { enabled: false, onOpenTask: undefined };
+  },
+  addProseMirrorPlugins() {
+    if (!this.options.enabled) return [];
+    const onOpenTask = this.options.onOpenTask;
+    return [new Plugin({
+      props: {
+        decorations: (editorState) => plannerTaskCollapseDecorations(editorState.doc),
+        handleDOMEvents: {
+          mousedown: (_view, event) => {
+            const target = event.target instanceof HTMLElement
+              ? event.target.closest<HTMLButtonElement>("button[data-planner-task-toggle]")
+              : null;
+            if (!target) return false;
+            event.preventDefault();
+            return true;
+          },
+          click: (_view, event) => {
+            const target = event.target instanceof HTMLElement
+              ? event.target.closest<HTMLButtonElement>("button[data-planner-task-toggle]")
+              : null;
+            const itemID = target?.dataset.plannerTaskToggle;
+            if (!itemID) return false;
+            event.preventDefault();
+            onOpenTask?.(itemID);
+            return true;
+          }
+        }
+      }
+    })];
   }
 });
 
@@ -7613,6 +7732,119 @@ function textWordAtOffset(text: string, rawOffset: number) {
   return word ? { word, start, end } : null;
 }
 
+function PlannerTaskDetailDrawer({
+  item,
+  dayLabel,
+  category,
+  onClose,
+  onToggleStep
+}: {
+  item: DailyItem;
+  dayLabel?: string;
+  category?: PlannerCategory;
+  onClose: () => void;
+  onToggleStep?: (stepID: string) => void | Promise<void>;
+}) {
+  const completedSteps = item.steps.filter((step) => step.checked).length;
+  const stepProgress = item.steps.length ? Math.round((completedSteps / item.steps.length) * 100) : 0;
+  const reminderLabel = reminderTimeLabel(item.reminderAt);
+  const completedLabel = completionTimeLabel(item.completedAt);
+  const listLabel = item.projectName || item.folderName;
+
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return createPortal(
+    <div className="planner-task-drawer-layer" role="presentation">
+      <motion.aside
+        className="planner-task-detail-drawer"
+        role="dialog"
+        aria-modal="false"
+        aria-labelledby="planner-task-detail-title"
+        initial={{ opacity: 0, x: 28 }}
+        animate={{ opacity: 1, x: 0 }}
+        exit={{ opacity: 0, x: 20 }}
+        transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+      >
+        <header className="planner-task-detail-head">
+          <span className="planner-task-detail-symbol" aria-hidden="true"><ListChecks size={17} /></span>
+          <div>
+            <strong>Task details</strong>
+            <small>{dayLabel || "Planner"}</small>
+          </div>
+          <button type="button" className="planner-task-detail-close" onClick={onClose} title="Close" aria-label="Close task details">
+            <X size={16} />
+          </button>
+        </header>
+
+        <div className="planner-task-detail-scroll">
+          <section className="planner-task-detail-summary">
+            <div className="planner-task-detail-context">
+              {category?.name ? <span style={{ "--scope-color": category.color } as CSSProperties}>{category.name}</span> : null}
+              {listLabel ? <span><Folder size={12} />{listLabel}</span> : null}
+              {item.section ? <span>{item.section}</span> : null}
+            </div>
+            <h2 id="planner-task-detail-title">{item.title}</h2>
+            {item.steps.length ? (
+              <div className="planner-task-detail-progress">
+                <span>{completedSteps} of {item.steps.length} steps complete</span>
+                <strong>{stepProgress}%</strong>
+                <div aria-hidden="true"><i style={{ width: `${stepProgress}%` }} /></div>
+              </div>
+            ) : null}
+          </section>
+
+          {item.detailsMarkdown.trim() ? (
+            <section className="planner-task-detail-section">
+              <h3>Details</h3>
+              <MarkdownPreview
+                markdown={item.detailsMarkdown}
+                className="planner-task-detail-markdown"
+                emptyText=""
+              />
+            </section>
+          ) : null}
+
+          {item.steps.length ? (
+            <section className="planner-task-detail-section planner-task-detail-steps">
+              <h3>Steps <span>{item.steps.length}</span></h3>
+              <div>
+                {item.steps.map((step) => (
+                  <button
+                    key={step.id}
+                    type="button"
+                    className={cx("planner-task-detail-step", step.checked && "is-done")}
+                    onClick={() => { void onToggleStep?.(step.id); }}
+                    disabled={!onToggleStep}
+                  >
+                    <span className="planner-task-detail-step-check" aria-hidden="true">
+                      {step.checked ? <Check size={12} /> : null}
+                    </span>
+                    <span>{step.text}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+
+        {(reminderLabel || completedLabel) ? (
+          <footer className="planner-task-detail-foot">
+            {reminderLabel ? <span><AlarmClock size={14} />Reminds {reminderLabel}</span> : null}
+            {completedLabel ? <span><CheckCircle2 size={14} />Completed {completedLabel}</span> : null}
+          </footer>
+        ) : null}
+      </motion.aside>
+    </div>,
+    document.querySelector(".app-shell") ?? document.body
+  );
+}
+
 function MarkdownEditorSurface({
   value,
   onChange,
@@ -7645,6 +7877,7 @@ function MarkdownEditorSurface({
   onScheduleSelectionToPlanner,
   onMovePlannerTaskToDay,
   onPlannerTaskReminder,
+  onUpsertPlannerItem,
   onToolbarMoreOpenChange,
   readOnly = false,
   readOnlyMessage
@@ -7680,11 +7913,34 @@ function MarkdownEditorSurface({
   onScheduleSelectionToPlanner?: (request: PlannerScheduleRequest) => void;
   onMovePlannerTaskToDay?: (dayID: string, itemID: string, targetDayID: string) => void | Promise<void>;
   onPlannerTaskReminder?: (itemID: string, x: number, y: number) => void;
+  onUpsertPlannerItem?: (item: DailyItemInput) => Promise<void>;
   onToolbarMoreOpenChange?: (open: boolean) => void;
   readOnly?: boolean;
   readOnlyMessage?: string;
 }) {
   const [mode, setMode] = useState<NoteEditorMode>(initialMode);
+  const [plannerTaskDrawerItemID, setPlannerTaskDrawerItemID] = useState<string | null>(null);
+  const plannerTaskDrawerItem = useMemo(
+    () => dailyItems.find((item) => item.id === plannerTaskDrawerItemID) ?? null,
+    [dailyItems, plannerTaskDrawerItemID]
+  );
+  const plannerTaskDrawerCategory = useMemo(
+    () => plannerTaskDrawerItem?.area
+      ? dailyCategories.find((category) => category.name.toLowerCase() === plannerTaskDrawerItem.area?.toLowerCase())
+      : undefined,
+    [dailyCategories, plannerTaskDrawerItem]
+  );
+  const closePlannerTaskDrawer = useCallback(() => setPlannerTaskDrawerItemID(null), []);
+  const togglePlannerTaskDrawerStep = useCallback(async (stepID: string) => {
+    if (!plannerTaskDrawerItem || !onUpsertPlannerItem) return;
+    await onUpsertPlannerItem({
+      ...plannerTaskDrawerItem,
+      steps: plannerTaskDrawerItem.steps.map((step) => step.id === stepID ? { ...step, checked: !step.checked } : step)
+    });
+  }, [onUpsertPlannerItem, plannerTaskDrawerItem]);
+  useEffect(() => {
+    if (plannerTaskDrawerItemID && !plannerTaskDrawerItem) setPlannerTaskDrawerItemID(null);
+  }, [plannerTaskDrawerItem, plannerTaskDrawerItemID]);
   const [richLocked, setRichLocked] = useState(false);
   const [calloutMenuOpen, setCalloutMenuOpen] = useState(false);
   const [chartMenuOpen, setChartMenuOpen] = useState(false);
@@ -7826,6 +8082,10 @@ function MarkdownEditorSurface({
       OpenAssistDailyTagDecorations,
       OpenAssistDailyTaskFilterDecorations,
       OpenAssistDailyReminderDecorations,
+      OpenAssistPlannerTaskCollapse.configure({
+        enabled: plannerSourceKind === "planner",
+        onOpenTask: (itemID) => setPlannerTaskDrawerItemID(itemID)
+      }),
       OpenAssistPlannerCompletedSteps.configure({
         enabled: plannerSourceKind === "planner"
       }),
@@ -11028,6 +11288,18 @@ function MarkdownEditorSurface({
           </div>
         </div>
       ) : null}
+      <AnimatePresence>
+        {plannerTaskDrawerItem ? (
+          <PlannerTaskDetailDrawer
+            key={plannerTaskDrawerItem.id}
+            item={plannerTaskDrawerItem}
+            dayLabel={plannerSourceTitle}
+            category={plannerTaskDrawerCategory}
+            onClose={closePlannerTaskDrawer}
+            onToggleStep={onUpsertPlannerItem ? togglePlannerTaskDrawerStep : undefined}
+          />
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
@@ -11677,14 +11949,50 @@ function isEditableTextInput(element: Element | null): element is HTMLInputEleme
   return editableTypes.has(element.type);
 }
 
-function insertTextIntoFocusedAppField(text: string) {
+type EditableTargetSnapshot =
+  | { kind: "text"; element: HTMLInputElement | HTMLTextAreaElement; start: number; end: number }
+  | { kind: "contenteditable"; element: HTMLElement; range: Range };
+
+function captureFocusedAppField(): EditableTargetSnapshot | null {
+  if (!document.hasFocus()) return null;
   const activeElement = document.activeElement;
   if (isEditableTextInput(activeElement)) {
-    const start = activeElement.selectionStart ?? activeElement.value.length;
-    const end = activeElement.selectionEnd ?? activeElement.value.length;
+    return {
+      kind: "text",
+      element: activeElement,
+      start: activeElement.selectionStart ?? activeElement.value.length,
+      end: activeElement.selectionEnd ?? activeElement.value.length
+    };
+  }
+  if (activeElement instanceof HTMLElement && activeElement.isContentEditable) {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || !activeElement.contains(selection.anchorNode)) return null;
+    return { kind: "contenteditable", element: activeElement, range: selection.getRangeAt(0).cloneRange() };
+  }
+  return null;
+}
+
+function connectedEditableTargetSnapshot(snapshot: EditableTargetSnapshot | null | undefined) {
+  if (!snapshot || !snapshot.element.isConnected) return null;
+  if (snapshot.kind === "text") {
+    return snapshot.element.disabled || snapshot.element.readOnly ? null : snapshot;
+  }
+  return snapshot.element.isContentEditable ? snapshot : null;
+}
+
+function insertTextIntoAppFieldSnapshot(text: string, snapshot: EditableTargetSnapshot | null) {
+  if (!snapshot || !snapshot.element.isConnected) return false;
+  const normalizedText = text.trim();
+  if (!normalizedText) return false;
+
+  if (snapshot.kind === "text") {
+    const activeElement = snapshot.element;
+    if (activeElement.disabled || activeElement.readOnly) return false;
+    activeElement.focus({ preventScroll: true });
+    const start = Math.min(snapshot.start, activeElement.value.length);
+    const end = Math.min(Math.max(snapshot.end, start), activeElement.value.length);
     const before = activeElement.value.slice(0, start);
     const after = activeElement.value.slice(end);
-    const normalizedText = text.trim();
     const leadingSpace = before && !/\s$/.test(before) ? " " : "";
     const trailingSpace = after && !/^\s/.test(after) ? " " : "";
     const insertedText = `${leadingSpace}${normalizedText}${trailingSpace}`;
@@ -11705,22 +12013,31 @@ function insertTextIntoFocusedAppField(text: string) {
     return true;
   }
 
-  if (activeElement instanceof HTMLElement && activeElement.isContentEditable) {
+  if (snapshot.element.isContentEditable) {
+    const activeElement = snapshot.element;
+    activeElement.focus({ preventScroll: true });
     const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0 || !activeElement.contains(selection.anchorNode)) return false;
-    const range = selection.getRangeAt(0);
+    if (!selection) return false;
+    const range = snapshot.range.cloneRange();
+    if (!activeElement.contains(range.commonAncestorContainer)) return false;
+    selection.removeAllRanges();
+    selection.addRange(range);
     range.deleteContents();
-    const textNode = document.createTextNode(text.trim());
+    const textNode = document.createTextNode(normalizedText);
     range.insertNode(textNode);
     range.setStartAfter(textNode);
     range.setEndAfter(textNode);
     selection.removeAllRanges();
     selection.addRange(range);
-    activeElement.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text.trim() }));
+    activeElement.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: normalizedText }));
     return true;
   }
 
   return false;
+}
+
+function insertTextIntoFocusedAppField(text: string) {
+  return insertTextIntoAppFieldSnapshot(text, captureFocusedAppField());
 }
 
 function withTimeout<T>(promise: Promise<T> | undefined, timeoutMs: number, message: string) {
@@ -15394,11 +15711,16 @@ function TopBar({
   openTargetKind = "workspace",
   leadingAccessory,
   actionsAccessory,
-  showAssistantActions = true
+  showAssistantActions = true,
+  titleRevealKey
 }: {
   title: string;
   subtitle?: string;
   centerTitle?: boolean;
+  // When set (e.g. thread ID), a title change while the key stays the same
+  // replays a reveal animation — the AI-generated title "arriving". A key
+  // change (switching threads) swaps the text silently.
+  titleRevealKey?: string;
   compact: boolean;
   compactSurface?: CompactSurfaceMode;
   onToggleCompact: () => void;
@@ -15414,6 +15736,19 @@ function TopBar({
 }) {
   const [editorOpen, setEditorOpen] = useState(false);
   const editorMenuRef = useRef<HTMLDivElement | null>(null);
+  const lastRevealTitleRef = useRef(title);
+  const lastRevealKeyRef = useRef(titleRevealKey);
+  const [titleRevealTick, setTitleRevealTick] = useState(0);
+  useEffect(() => {
+    const titleChanged = title !== lastRevealTitleRef.current;
+    const sameThread = Boolean(titleRevealKey) && titleRevealKey === lastRevealKeyRef.current;
+    const hadRealTitle = Boolean(lastRevealTitleRef.current?.trim());
+    lastRevealTitleRef.current = title;
+    lastRevealKeyRef.current = titleRevealKey;
+    if (titleChanged && sameThread && hadRealTitle && title.trim()) {
+      setTitleRevealTick((tick) => tick + 1);
+    }
+  }, [title, titleRevealKey]);
   const [workspaceTargets, setWorkspaceTargets] = useState<WorkspaceLaunchTargetSnapshot[]>(fallbackWorkspaceTargets);
   const [preferredWorkspaceTargetID, setPreferredWorkspaceTargetID] = useState(() =>
     window.localStorage.getItem("openassist.workspaceLaunchTargetID") || "vscode"
@@ -15465,7 +15800,7 @@ function TopBar({
   return (
     <header className={cx("topbar", centerTitle && "topbar-centered")}>
       <div className="topbar-title">
-        <strong>{title}</strong>
+        <strong key={titleRevealTick} className={cx(titleRevealTick > 0 && "title-goo-reveal")}>{title}</strong>
         {subtitle && <span>{subtitle}</span>}
       </div>
       {leadingAccessory && <div className="topbar-leading">{leadingAccessory}</div>}
@@ -19988,6 +20323,7 @@ function Composer({
           {hasRichMentions && <ComposerRichDraftPreview cursor={mentionCursor} tokens={composerDraftTokens} />}
           <textarea
             ref={textareaRef}
+            data-openassist-composer="true"
             className={cx("composer-input", hasRichMentions && "rich-mention-input")}
             value={value}
             onChange={(event) => {
@@ -20772,6 +21108,7 @@ function ThreadsView({
     <main className="assistant-main">
       <TopBar
         title={title}
+        titleRevealKey={threadID ?? undefined}
         workspaceRootPath={workspaceRootPath}
         compact={compact}
         compactSurface={compactSurface}
@@ -25303,6 +25640,7 @@ function PlannerView({
                   const item = dailyItems.find((candidate) => candidate.id === itemID);
                   if (item) openCanvasReminder(item, x, y);
                 }}
+                onUpsertPlannerItem={plannerMigrationWarning ? undefined : onUpsertDailyItem}
                 toolbarAccessory={plannerMigrationWarning ? undefined : (
                   <div className="planner-toolbar-actions">
                     <DailyItemsPanel
@@ -27083,6 +27421,15 @@ function formatOllamaCatalogOptionLabel(option: OllamaCatalogModelOption): strin
   return parts.join(" · ");
 }
 
+type MemorySourceSyncPreviewState = {
+  device: { id: string; name: string; previousNames: string[] };
+  changed: Array<{ source: "codex" | "claude"; relativePath: string; size: number }>;
+  removedLocally: Array<{ source: "codex" | "claude"; relativePath: string; size: number }>;
+  unchangedCount: number;
+  counts: { codex: number; claude: number };
+  note: string;
+};
+
 function SettingsContent({
   section,
   onOpenAssistant,
@@ -27167,6 +27514,9 @@ function SettingsContent({
   const [knowledgeActionMessage, setKnowledgeActionMessage] = useState<string | undefined>(undefined);
   const [memoryDreamActionMessage, setMemoryDreamActionMessage] = useState<string | undefined>(undefined);
   const [memoryDreamBusy, setMemoryDreamBusy] = useState(false);
+  const [memorySourcePreview, setMemorySourcePreview] = useState<MemorySourceSyncPreviewState | null>(null);
+  const [memorySourceBusy, setMemorySourceBusy] = useState<"preview" | "sync" | null>(null);
+  const [memorySourceMessage, setMemorySourceMessage] = useState<string | undefined>(undefined);
   const [junkCleanupPreview, setJunkCleanupPreview] = useState<StorageCleanupPreview | null>(null);
   const [junkCleanupResult, setJunkCleanupResult] = useState<StorageCleanupResult | null>(null);
   const [junkCleanupBusy, setJunkCleanupBusy] = useState<"preview" | "cleanup" | null>(null);
@@ -27282,6 +27632,47 @@ function SettingsContent({
       setMemoryDreamBusy(false);
     }
   }, []);
+
+  const previewMemorySourceSync = useCallback(async () => {
+    if (!window.openAssistElectron?.previewMemorySourceSync) {
+      setMemorySourceMessage("Memory source sync is not available in this build.");
+      return;
+    }
+    setMemorySourceBusy("preview");
+    setMemorySourceMessage(undefined);
+    try {
+      const preview = await window.openAssistElectron.previewMemorySourceSync();
+      setMemorySourcePreview(preview);
+      setMemorySourceMessage(preview.changed.length
+        ? `${preview.changed.length} changed file${preview.changed.length === 1 ? " is" : "s are"} ready to sync.`
+        : "Memory sources are already current.");
+    } catch (error) {
+      setMemorySourceMessage(error instanceof Error ? error.message : "Could not preview memory sources.");
+    } finally {
+      setMemorySourceBusy(null);
+    }
+  }, []);
+
+  const syncMemorySources = useCallback(async () => {
+    const syncSources = window.openAssistElectron?.syncMemorySources;
+    const previewSources = window.openAssistElectron?.previewMemorySourceSync;
+    if (!syncSources || !previewSources || !memorySourcePreview) return;
+    setMemorySourceBusy("sync");
+    setMemorySourceMessage(undefined);
+    try {
+      const result = await syncSources();
+      const firstIssue = result.failed[0]?.error ?? result.statusErrors[0]?.error;
+      setMemorySourceMessage(result.ok
+        ? `Synced ${result.uploaded} file${result.uploaded === 1 ? "" : "s"}. ${result.skipped} unchanged.`
+        : `Sync finished with ${result.failed.length + result.statusErrors.length} issue${result.failed.length + result.statusErrors.length === 1 ? "" : "s"}${firstIssue ? `: ${firstIssue}` : "."}`);
+      const nextPreview = await previewSources();
+      setMemorySourcePreview(nextPreview);
+    } catch (error) {
+      setMemorySourceMessage(error instanceof Error ? error.message : "Memory source sync failed.");
+    } finally {
+      setMemorySourceBusy(null);
+    }
+  }, [memorySourcePreview]);
 
   const refreshIntegrationStatus = useCallback(async () => {
     try {
@@ -28291,6 +28682,64 @@ function SettingsContent({
             </button>
           </div>
           {memoryDreamActionMessage ? <p className="ready-line">{memoryDreamActionMessage}</p> : null}
+          <div className="settings-subsection">
+            <div className="card-heading">
+              <FolderSync size={20} />
+              <span>
+                <strong>Memory Sources</strong>
+                <small>Preview and sync curated Codex and Claude Markdown into your private Second Brain.</small>
+              </span>
+            </div>
+            <p className="settings-helper-line">
+              Conversations, sessions, credentials, raw histories, rollout summaries, tasks, and skills are always excluded.
+            </p>
+            {memorySourcePreview ? (
+              <>
+                <p className="account-line">
+                  <Laptop size={15} /> {memorySourcePreview.device.name} · {memorySourcePreview.counts.codex} Codex · {memorySourcePreview.counts.claude} Claude
+                </p>
+                {memorySourcePreview.device.previousNames.length ? (
+                  <p className="settings-helper-line">Previously named {memorySourcePreview.device.previousNames.join(", ")}.</p>
+                ) : null}
+                {memorySourcePreview.changed.slice(0, 6).map((file) => (
+                  <p className="account-line" key={`${file.source}:${file.relativePath}`}>
+                    <FileText size={14} /> {file.source === "codex" ? "Codex" : "Claude"} · {file.relativePath}
+                  </p>
+                ))}
+                {memorySourcePreview.changed.length > 6 ? (
+                  <p className="settings-helper-line">And {memorySourcePreview.changed.length - 6} more changed files.</p>
+                ) : null}
+                {memorySourcePreview.removedLocally.length ? (
+                  <p className="settings-helper-line">
+                    {memorySourcePreview.removedLocally.length} local removal{memorySourcePreview.removedLocally.length === 1 ? "" : "s"} will be recorded. Drive files will not be deleted.
+                  </p>
+                ) : null}
+              </>
+            ) : null}
+            <div className="settings-inline-actions">
+              <button
+                className="secondary-action"
+                disabled={memorySourceBusy !== null}
+                onClick={() => void previewMemorySourceSync()}
+              >
+                {memorySourceBusy === "preview" ? "Checking..." : "Preview files"}
+              </button>
+              <button
+                className="primary-action"
+                disabled={
+                  memorySourceBusy !== null
+                  || !memorySourcePreview
+                  || memorySourcePreview.changed.length + memorySourcePreview.removedLocally.length === 0
+                }
+                onClick={() => void syncMemorySources()}
+              >
+                {memorySourceBusy === "sync"
+                  ? "Syncing..."
+                  : `Sync ${memorySourcePreview ? memorySourcePreview.changed.length + memorySourcePreview.removedLocally.length : 0} changes`}
+              </button>
+            </div>
+            {memorySourceMessage ? <p className="ready-line">{memorySourceMessage}</p> : null}
+          </div>
           <Checkbox
             checked={settings?.realtimeLocalMCPEnabled ?? true}
             label="Allow GPT Realtime to use approved local MCP tools"
@@ -28759,7 +29208,13 @@ function SettingsContent({
               </span>
               <SelectRow label="Plan" value={settings?.codexSubscriptionPlanName || "Managed by Codex"} tone="ready" />
               <SelectRow label="Codex version" value={settings?.codexSubscriptionCodexVersion || "Unknown"} />
-              <SelectRow label="Voice model" value="Managed by Codex" />
+              <SettingsSelect
+                label="Voice"
+                value={settings?.realtimeCodexVoice || "cove"}
+                options={realtimeCodexVoiceOptions}
+                onChange={(value) => onUpdateSetting("realtimeCodexVoice", value || "cove")}
+              />
+              <small>Voice changes apply to the next Live session (stop and start Live again).</small>
               <div className="inline-actions">
                 {settings?.codexSubscriptionVoiceStatus === "signed_out" && (
                   <button onClick={() => void onOpenTarget("codexLogin")}>Sign in</button>
@@ -33084,7 +33539,14 @@ function FeatureRouter({
           onOpenSkills={onOpenSkills}
           onOpenPlugins={onOpenPlugins}
           onCloseThreadNotePanel={onCloseThreadNotePanel}
-          title={threadDetail?.title || appState.threads.find((thread) => thread.id === selectedThreadID)?.title || "Ok"}
+          title={
+            // The thread-list title refreshes on every threads-updated event
+            // (AI retitle, rename), while threadDetail is a one-time load —
+            // prefer the live one so the top bar matches the sidebar.
+            usableThreadTitle(appState.threads.find((thread) => thread.id === selectedThreadID)?.title)
+            || threadDetail?.title
+            || "Ok"
+          }
           providerName={activeProviderName}
           providerKey={activeProviderKey}
           providerOptions={providerOptions}
@@ -33435,6 +33897,7 @@ function AppInner() {
       realtimeMaskedOpenAIAPIKey: "Not configured",
       realtimeOpenAIModel: defaultOpenAIRealtimeModel,
       realtimeOpenAIVoice: "marin",
+      realtimeCodexVoice: "cove",
       realtimeVoiceProvider: "openaiRealtime",
       codexSubscriptionVoiceAvailable: false,
       codexSubscriptionVoiceStatus: "not_available",
@@ -33615,6 +34078,54 @@ function AppInner() {
     composerTextRef.current = nextValue;
     setComposerTextState(nextValue);
   }, [clearComposerTextSyncTimer]);
+  const insertTranscriptIntoComposer = useCallback((text: string, snapshot?: EditableTargetSnapshot | null) => {
+    const normalizedText = text.trim();
+    if (!normalizedText) return false;
+
+    const rememberedComposer = snapshot?.kind === "text"
+      && snapshot.element instanceof HTMLTextAreaElement
+      && snapshot.element.dataset.openassistComposer === "true"
+      ? snapshot.element
+      : null;
+    if (snapshot && !rememberedComposer) return false;
+    const composer = rememberedComposer ?? Array.from(
+      document.querySelectorAll<HTMLTextAreaElement>('textarea[data-openassist-composer="true"]')
+    ).find((element) => element.getClientRects().length > 0 && !element.disabled && !element.readOnly) ?? null;
+    if (!composer) return false;
+
+    const currentValue = composerTextRef.current;
+    const rememberedSelection = snapshot?.kind === "text" && snapshot.element === composer;
+    const requestedStart = rememberedSelection
+      ? snapshot.start
+      : document.activeElement === composer
+        ? composer.selectionStart ?? currentValue.length
+        : currentValue.length;
+    const requestedEnd = rememberedSelection
+      ? snapshot.end
+      : document.activeElement === composer
+        ? composer.selectionEnd ?? requestedStart
+        : requestedStart;
+    const start = Math.min(Math.max(requestedStart, 0), currentValue.length);
+    const end = Math.min(Math.max(requestedEnd, start), currentValue.length);
+    const before = currentValue.slice(0, start);
+    const after = currentValue.slice(end);
+    const leadingSpace = before && !/\s$/.test(before) ? " " : "";
+    const trailingSpace = after && !/^\s/.test(after) ? " " : "";
+    const insertedText = `${leadingSpace}${normalizedText}${trailingSpace}`;
+    const nextValue = `${before}${insertedText}${after}`;
+    const nextCursor = before.length + insertedText.length;
+
+    setComposerText(nextValue);
+    window.requestAnimationFrame(() => {
+      const liveComposer = composer.isConnected
+        ? composer
+        : document.querySelector<HTMLTextAreaElement>('textarea[data-openassist-composer="true"]');
+      if (!liveComposer || liveComposer.disabled || liveComposer.readOnly) return;
+      liveComposer.focus({ preventScroll: true });
+      liveComposer.setSelectionRange(nextCursor, nextCursor);
+    });
+    return true;
+  }, [setComposerText]);
   const updateComposerDraft = useCallback((nextValue: string) => {
     composerTextRef.current = nextValue;
     const draftVersion = composerTextDraftVersionRef.current + 1;
@@ -33752,6 +34263,8 @@ function AppInner() {
   const nativeVoiceActiveRef = useRef(false);
   const nativeVoiceOperationRef = useRef(false);
   const nativeVoiceStopAfterStartRef = useRef(false);
+  const dictationTargetRef = useRef<EditableTargetSnapshot | null>(null);
+  const lastEditableTargetRef = useRef<EditableTargetSnapshot | null>(null);
   const voiceBaseTextRef = useRef("");
   const voiceFinalTextRef = useRef("");
   const liveVoiceStreamRef = useRef<MediaStream | null>(null);
@@ -33836,6 +34349,29 @@ function AppInner() {
       // Persistence is best-effort.
     }
   }, [unreadThreadIDs]);
+  useEffect(() => {
+    const rememberEditableTarget = () => {
+      const snapshot = captureFocusedAppField();
+      if (snapshot) lastEditableTargetRef.current = snapshot;
+    };
+    document.addEventListener("focusin", rememberEditableTarget, true);
+    document.addEventListener("selectionchange", rememberEditableTarget, true);
+    document.addEventListener("select", rememberEditableTarget, true);
+    document.addEventListener("keyup", rememberEditableTarget, true);
+    document.addEventListener("mouseup", rememberEditableTarget, true);
+    document.addEventListener("pointerup", rememberEditableTarget, true);
+    document.addEventListener("input", rememberEditableTarget, true);
+    rememberEditableTarget();
+    return () => {
+      document.removeEventListener("focusin", rememberEditableTarget, true);
+      document.removeEventListener("selectionchange", rememberEditableTarget, true);
+      document.removeEventListener("select", rememberEditableTarget, true);
+      document.removeEventListener("keyup", rememberEditableTarget, true);
+      document.removeEventListener("mouseup", rememberEditableTarget, true);
+      document.removeEventListener("pointerup", rememberEditableTarget, true);
+      document.removeEventListener("input", rememberEditableTarget, true);
+    };
+  }, []);
   const markThreadUnread = (threadID?: string) => {
     if (!usableOpenAssistThreadID(threadID)) return;
     setUnreadThreadIDs((current) => current.some((id) => sameID(id, threadID)) ? current : [...current, threadID as string]);
@@ -34947,7 +35483,15 @@ function AppInner() {
   const refreshAppState = async () => {
     const nextState = await window.openAssistElectron?.loadAppState();
     if (!nextState) return;
-    const normalizedState = normalizeRendererAppState(nextState);
+    const loadedState = normalizeRendererAppState(nextState);
+    // loadAppState paints quickly with only the newest threads. Keep the
+    // already-loaded older threads until the complete background list arrives.
+    const normalizedState = loadedState.threadListComplete === false
+      ? {
+        ...loadedState,
+        threads: mergePartialThreadList(appState.threads, loadedState.threads)
+      }
+      : loadedState;
     const currentSelectedThreadID = usableOpenAssistThreadID(selectedThreadIDRef.current);
     const shouldPreserveLiveThread = Boolean(
       !isSettingsWindow
@@ -35544,12 +36088,31 @@ function AppInner() {
         );
         nativeVoiceActiveRef.current = false;
         nativeVoiceStopAfterStartRef.current = false;
+        const dictationTarget = dictationTargetRef.current;
+        dictationTargetRef.current = null;
         if (result?.text?.trim()) {
           const transcript = result.text.trim();
           // Fire-and-forget: saving history must not delay the paste.
           void Promise.resolve(window.openAssistElectron?.addTranscriptHistory?.(transcript))
             .catch((error) => console.error("Could not save transcript history", error));
-          if (insertTranscriptIntoCurrentNote(transcript)) {
+          // With no captured in-app target and our window blurred, the user
+          // dictated into another app — the composer/note defaults must not
+          // swallow the transcript before the external paste gets a chance.
+          const inAppDefaultAllowed = Boolean(dictationTarget) || document.hasFocus();
+          if (
+            (inAppDefaultAllowed && insertTranscriptIntoComposer(transcript, dictationTarget))
+            || insertTextIntoAppFieldSnapshot(transcript, dictationTarget)
+          ) {
+            window.openAssistElectron?.transcriptInsertedInRenderer?.();
+            playDictationSound("pasted");
+            setVoiceError(undefined);
+            setVoiceStatus("idle");
+            setVoiceStatusText(undefined);
+            hideFloatingVoiceHUDForAppFocus();
+            return;
+          }
+          if (inAppDefaultAllowed && insertTranscriptIntoCurrentNote(transcript)) {
+            window.openAssistElectron?.transcriptInsertedInRenderer?.();
             playDictationSound("pasted");
             setVoiceError(undefined);
             setVoiceStatus("idle");
@@ -35559,6 +36122,7 @@ function AppInner() {
           }
           const insertedInFocusedAppField = document.hasFocus() && insertTextIntoFocusedAppField(transcript);
           if (insertedInFocusedAppField) {
+            window.openAssistElectron?.transcriptInsertedInRenderer?.();
             playDictationSound("pasted");
             setVoiceError(undefined);
             setVoiceStatus("idle");
@@ -35612,6 +36176,7 @@ function AppInner() {
       } catch (error) {
         nativeVoiceActiveRef.current = false;
         nativeVoiceStopAfterStartRef.current = false;
+        dictationTargetRef.current = null;
         setVoiceStatus("error");
         setVoiceError(error instanceof Error ? error.message : "Voice transcription failed.");
         setVoiceStatusText(undefined);
@@ -35719,6 +36284,12 @@ function AppInner() {
 
     if (window.openAssistElectron?.platform === "darwin" && window.openAssistElectron.startVoiceInput) {
       if (nativeVoiceOperationRef.current) return;
+      // Only remember an in-app field as the paste target while our window is
+      // actually focused. When dictation starts from the global hotkey with
+      // another app in front, the remembered composer must NOT win — the main
+      // process captures the external app and pastes there instead.
+      dictationTargetRef.current = captureFocusedAppField()
+        ?? (document.hasFocus() ? connectedEditableTargetSnapshot(lastEditableTargetRef.current) : null);
       const engine = appState.settings.transcriptionEngine || "Apple Speech";
       const provider = appState.settings.cloudTranscriptionProvider || "OpenAI";
       const cloudProviderNeedsKey = engine === "Cloud Providers" && provider !== "ChatGPT / Codex Session";
@@ -35789,6 +36360,7 @@ function AppInner() {
         }
         nativeVoiceActiveRef.current = false;
         nativeVoiceStopAfterStartRef.current = false;
+        dictationTargetRef.current = null;
         setVoiceStatus("error");
         const message = result?.error ?? "Could not start native voice input.";
         setVoiceError(message);
@@ -35798,6 +36370,7 @@ function AppInner() {
       } catch (error) {
         nativeVoiceActiveRef.current = false;
         nativeVoiceStopAfterStartRef.current = false;
+        dictationTargetRef.current = null;
         setVoiceStatus("error");
         const message = error instanceof Error ? error.message : "Could not start native voice input.";
         setVoiceError(message);
@@ -37778,7 +38351,7 @@ function AppInner() {
     const handler = (raw: unknown) => {
       const update = raw as
         | { type: "projects"; projects: OpenAssistAppState["projects"]; hiddenProjects: OpenAssistAppState["hiddenProjects"]; plannerLists?: OpenAssistAppState["plannerLists"] }
-        | { type: "threads"; threads: OpenAssistAppState["threads"] }
+        | { type: "threads"; threads: OpenAssistAppState["threads"]; complete: true }
         | { type: "automations"; automations: OpenAssistAppState["automations"] }
         | { type: "plugins"; plugins: OpenAssistAppState["plugins"] }
         | { type: "knowledgeRequests"; requests: KnowledgeWriteRequest[] }
@@ -37794,7 +38367,23 @@ function AppInner() {
         | undefined;
       if (!update || typeof update.type !== "string") return;
       if (update.type === "threads") {
-        setAppState((current) => ({ ...current, threads: update.threads }));
+        setAppState((current) => {
+          const activeThreadIDs = new Set(
+            Object.keys(activeThreadRunsRef.current)
+              .filter((id) => !id.startsWith("pending-thread-"))
+              .map((id) => id.toLowerCase())
+          );
+          const fullThreadIDs = new Set(update.threads.map((thread) => thread.id.toLowerCase()));
+          const missingRunningThreads = current.threads.filter((thread) =>
+            activeThreadIDs.has(thread.id.toLowerCase())
+            && !fullThreadIDs.has(thread.id.toLowerCase())
+          );
+          return {
+            ...current,
+            threads: [...missingRunningThreads, ...update.threads],
+            threadListComplete: update.complete
+          };
+        });
       } else if (update.type === "projects") {
         setAppState((current) => ({
           ...current,
@@ -37975,6 +38564,20 @@ function AppInner() {
       if (compact && sidebarOpen) collapseSidebar();
     });
   }, [compact, sidebarOpen, appState.settings.compactEdge]);
+
+  useEffect(() => {
+    return window.openAssistElectron?.onInsertTranscriptInApp?.(({ requestID, text }) => {
+      const rememberedTarget = connectedEditableTargetSnapshot(dictationTargetRef.current);
+      const focusedField = captureFocusedAppField();
+      const targetField = rememberedTarget
+        ?? focusedField
+        ?? connectedEditableTargetSnapshot(lastEditableTargetRef.current);
+      const handled = insertTranscriptIntoComposer(text, targetField)
+        || insertTextIntoAppFieldSnapshot(text, targetField);
+      if (handled) dictationTargetRef.current = null;
+      window.openAssistElectron?.completeInsertTranscriptInApp?.(requestID, handled);
+    });
+  }, [insertTranscriptIntoComposer]);
 
   useEffect(() => {
     return window.openAssistElectron?.onVoiceShortcut?.((target, phase: ShortcutPhase = "trigger") => {

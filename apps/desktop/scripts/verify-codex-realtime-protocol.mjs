@@ -3,8 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+const standaloneCodexPath = path.join(os.homedir(), ".codex/packages/standalone/current/codex");
 const bundledCodexPath = "/Applications/Codex.app/Contents/Resources/codex";
-const codexExecutable = fs.existsSync(bundledCodexPath) ? bundledCodexPath : "codex";
+const codexExecutable = fs.existsSync(standaloneCodexPath)
+  ? standaloneCodexPath
+  : fs.existsSync(bundledCodexPath)
+    ? bundledCodexPath
+    : "codex";
 const outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-realtime-protocol-"));
 
 const requiredMethods = [
@@ -17,7 +22,9 @@ const requiredMethods = [
 
 const requiredTypeFiles = [
   "v2/ThreadRealtimeStartParams.ts",
-  "v2/ThreadRealtimeAppendAudioParams.ts"
+  "v2/ThreadRealtimeAppendAudioParams.ts",
+  "v2/ThreadRealtimeStartTransport.ts",
+  "v2/ThreadRealtimeSdpNotification.ts"
 ];
 
 const notificationTypeCandidates = [
@@ -100,6 +107,28 @@ function verifyTypeFiles() {
   assert(
     missingTypeFiles.length === 0,
     `Missing realtime type files: ${missingTypeFiles.join(", ")}`
+  );
+
+  const transportSource = fs.readFileSync(
+    path.join(outputDirectory, "v2/ThreadRealtimeStartTransport.ts"),
+    "utf8"
+  );
+  assert(
+    transportSource.includes('{ "type": "webrtc"') && /\bsdp:\s*string/.test(transportSource),
+    "Codex WebRTC transport must accept the browser SDP offer."
+  );
+  assert(
+    !transportSource.includes("existingCall"),
+    "The removed existingCall transport must not return unnoticed."
+  );
+
+  const sdpNotificationSource = fs.readFileSync(
+    path.join(outputDirectory, "v2/ThreadRealtimeSdpNotification.ts"),
+    "utf8"
+  );
+  assert(
+    /\bthreadId:\s*string/.test(sdpNotificationSource) && /\bsdp:\s*string/.test(sdpNotificationSource),
+    "Codex SDP notification must expose the thread ID and answer SDP."
   );
 
   const hasOutputAudioDeltaNotification = notificationTypeCandidates.some((filePath) => generatedRelativePaths.has(filePath))

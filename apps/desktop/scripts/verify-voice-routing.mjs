@@ -9,7 +9,7 @@ if (!fs.existsSync(routingPath)) {
   process.exit(1);
 }
 
-const { classifyVoiceRoute, todayTaskSourceSelection } = await import(path.toNamespacedPath(routingPath));
+const { classifyVoiceRoute, isWorkspaceMCPRequest, todayTaskSourceSelection } = await import(path.toNamespacedPath(routingPath));
 
 const cases = [
   ["Add buy milk to my Today list.", "write"],
@@ -63,6 +63,14 @@ assert.deepEqual(todayTaskSourceSelection("Show my Apple Reminders for today."),
 assert.deepEqual(todayTaskSourceSelection("What is on my OpenAssist Today list?"), {
   matches: true,
   includeOpenAssist: true,
+  includeAppleReminders: false
+});
+assert.equal(isWorkspaceMCPRequest("Check my Google Tasks through OpenAssist Workspace MCP."), true);
+assert.equal(isWorkspaceMCPRequest("Check Gmail with the OpenAssist plugin."), true);
+assert.equal(isWorkspaceMCPRequest("Check MCO for my tasks."), true);
+assert.deepEqual(todayTaskSourceSelection("Check my Google Tasks through OpenAssist Workspace MCP."), {
+  matches: false,
+  includeOpenAssist: false,
   includeAppleReminders: false
 });
 

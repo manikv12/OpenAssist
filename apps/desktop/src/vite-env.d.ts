@@ -369,6 +369,24 @@ interface Window {
     plannerDailyDigest?: (dayID?: string) => Promise<import("./types").PlannerDailyDigestResult>;
     applyPlannerDailyDigest?: (plan: import("./types").PlannerDailyDigestPlan) => Promise<{ ok: boolean; error?: string; moved: number; created: number }>;
 	    memoryDreamNow?: () => Promise<{ ok: boolean; message: string; memoriesSaved: number; profileWritten: boolean }>;
+    previewMemorySourceSync?: () => Promise<{
+      device: { id: string; name: string; previousNames: string[] };
+      changed: Array<{ source: "codex" | "claude"; relativePath: string; size: number }>;
+      removedLocally: Array<{ source: "codex" | "claude"; relativePath: string; size: number }>;
+      unchangedCount: number;
+      counts: { codex: number; claude: number };
+      note: string;
+    }>;
+    syncMemorySources?: () => Promise<{
+      ok: boolean;
+      uploaded: number;
+      skipped: number;
+      removedLocally: number;
+      failed: Array<{ source: "codex" | "claude"; relativePath: string; error: string }>;
+      statusErrors: Array<{ source: "codex" | "claude"; error: string }>;
+      lastSuccessfulAt?: string;
+      destinationRoot: string;
+    }>;
 		    openMarkdownFileForImport: () => Promise<import("./types").MarkdownImportFile | null>;
 		    createNote: (projectID: string) => Promise<{ note: import("./types").NoteItem; detail: import("./types").NoteDetail }>;
 		    renameNote: (projectID: string, noteID: string, title: string) => Promise<import("./types").NoteDetail>;
@@ -413,6 +431,9 @@ interface Window {
 		    runJunkCleanup: (retentionDays?: number, confirmationToken?: string) => Promise<import("./types").StorageCleanupResult>;
 		    previewColorTheme: (theme: string | null) => Promise<{ ok: boolean }>;
 		    knowledgeStatus: () => Promise<import("./types").KnowledgeStatus>;
+		    secondBrainOwnerRunnerStatus: () => Promise<import("./types").SecondBrainOwnerRunnerStatus>;
+		    startSecondBrainOwnerRunner: () => Promise<import("./types").SecondBrainOwnerRunnerStatus>;
+		    stopSecondBrainOwnerRunner: () => Promise<import("./types").SecondBrainOwnerRunnerStatus>;
 	    listKnowledgeRequests: (
 	      status?: "pending" | "applied" | "rejected"
 	    ) => Promise<import("./types").KnowledgeWriteRequest[]>;
@@ -665,6 +686,11 @@ interface Window {
         phase?: "trigger" | "down" | "up"
       ) => void
     ) => () => void;
+    onInsertTranscriptInApp: (
+      callback: (payload: { requestID: string; text: string }) => void
+    ) => () => void;
+    completeInsertTranscriptInApp: (requestID: string, handled: boolean) => void;
+    transcriptInsertedInRenderer: () => void;
     onNavigationCommand: (callback: (direction: "back" | "forward") => void) => () => void;
     onMenuBarCommand: (
       callback: (

@@ -233,6 +233,8 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   plannerDailyDigest: (dayID?: string) => ipcRenderer.invoke("openassist:planner-daily-digest", dayID),
   applyPlannerDailyDigest: (plan: unknown) => ipcRenderer.invoke("openassist:planner-daily-digest-apply", plan),
   memoryDreamNow: () => ipcRenderer.invoke("openassist:memory-dream-now"),
+  previewMemorySourceSync: () => ipcRenderer.invoke("openassist:memory-sources-preview"),
+  syncMemorySources: () => ipcRenderer.invoke("openassist:memory-sources-sync"),
   openMarkdownFileForImport: () => ipcRenderer.invoke("openassist:open-markdown-file-for-import"),
   createNote: (projectID: string) => ipcRenderer.invoke("openassist:create-note", projectID),
   renameNote: (projectID: string, noteID: string, title: string) =>
@@ -290,6 +292,9 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
   previewColorTheme: (theme: string | null) =>
     ipcRenderer.invoke("openassist:preview-color-theme", theme),
   knowledgeStatus: () => ipcRenderer.invoke("openassist:knowledge-status"),
+  secondBrainOwnerRunnerStatus: () => ipcRenderer.invoke("openassist:second-brain-owner-runner-status"),
+  startSecondBrainOwnerRunner: () => ipcRenderer.invoke("openassist:start-second-brain-owner-runner"),
+  stopSecondBrainOwnerRunner: () => ipcRenderer.invoke("openassist:stop-second-brain-owner-runner"),
   listKnowledgeRequests: (status?: "pending" | "applied" | "rejected") =>
     ipcRenderer.invoke("openassist:list-knowledge-requests", status),
   applyKnowledgePreview: (requestID: string) =>
@@ -512,6 +517,14 @@ contextBridge.exposeInMainWorld("openAssistElectron", {
     ipcRenderer.on("openassist:voice-shortcut", listener);
     return () => ipcRenderer.removeListener("openassist:voice-shortcut", listener);
   },
+  onInsertTranscriptInApp: (callback: (payload: { requestID: string; text: string }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: { requestID: string; text: string }) => callback(payload);
+    ipcRenderer.on("openassist:insert-transcript-in-app", listener);
+    return () => ipcRenderer.removeListener("openassist:insert-transcript-in-app", listener);
+  },
+  completeInsertTranscriptInApp: (requestID: string, handled: boolean) =>
+    ipcRenderer.send("openassist:insert-transcript-in-app-result", { requestID, handled }),
+  transcriptInsertedInRenderer: () => ipcRenderer.send("openassist:transcript-inserted-in-renderer"),
   onNavigationCommand: (callback: (direction: "back" | "forward") => void) => {
     const listener = (_event: Electron.IpcRendererEvent, direction: "back" | "forward") => callback(direction);
     ipcRenderer.on("openassist:navigation-command", listener);

@@ -20,10 +20,24 @@ export type TodayTaskSourceSelection = {
   includeAppleReminders: boolean;
 };
 
+export function isWorkspaceMCPRequest(text: string) {
+  const normalized = normalizeVoiceRouteText(text);
+  if (!normalized) return false;
+  if (/\b(gmail|google mail|google tasks?|google calendar|connected google accounts?|openassist workspace|open assist workspace)\b/.test(normalized)) {
+    return true;
+  }
+  return /\b(mcp|mco|plugin|connector)\b/.test(normalized)
+    && /\b(check|use|through|via|open|openassist|open assist|workspace|google|mail|calendar|tasks?)\b/.test(normalized);
+}
+
 export function todayTaskSourceSelection(text: string): TodayTaskSourceSelection {
   const normalized = normalizeVoiceRouteText(text);
   const noMatch = { matches: false, includeOpenAssist: false, includeAppleReminders: false };
   if (!normalized) return noMatch;
+  // Google Workspace/MCP requests must reach the authenticated cloud plugin.
+  // Never satisfy them from OpenAssist Today or Apple Reminders just because
+  // the request also contains the word "tasks".
+  if (isWorkspaceMCPRequest(normalized)) return noMatch;
   if (/\b(add|create|put|save|insert|append|delete|remove|move|schedule|rename|update|change|complete|finish|mark|check off|cross off|re-?open|restart|un-?complete)\b/.test(normalized)) {
     return noMatch;
   }

@@ -14,6 +14,7 @@ BUILD_VERSION="${OPENASSIST_BUILD_VERSION:-$(git -C "${PROJECT_ROOT}/../.." rev-
 APP_PATH="${OUT_DIR}/${APP_NAME}-darwin-arm64/${APP_NAME}.app"
 DMG_FINAL="${DIST_DIR}/${APP_NAME}.dmg"
 SKIP_DMG="${OPENASSIST_SKIP_DMG:-0}"
+SKIP_TIMESTAMP="${OPENASSIST_SKIP_TIMESTAMP:-0}"
 
 SIGN_ID="${OPENASSIST_SIGN_IDENTITY:-}"
 if [ -z "$SIGN_ID" ] && [ -n "${DEVELOPER_ID:-}" ]; then
@@ -80,7 +81,11 @@ bash "${PROJECT_ROOT}/scripts/build-native-helpers.sh" \
 sign_target() {
   local target="$1"
   if [ "$SIGN_ID" != "-" ]; then
-    codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$target"
+    if [ "$SKIP_TIMESTAMP" = "1" ]; then
+      codesign --force --options runtime --sign "$SIGN_ID" "$target"
+    else
+      codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$target"
+    fi
   else
     codesign --force --options runtime --sign - "$target"
   fi
@@ -132,7 +137,11 @@ if [ -d "$APP_PATH" ]; then
 fi
 
 if [ "$SIGN_ID" != "-" ]; then
-  codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_PATH"
+  if [ "$SKIP_TIMESTAMP" = "1" ]; then
+    codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_PATH"
+  else
+    codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_PATH"
+  fi
 else
   codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign - "$APP_PATH"
 fi
